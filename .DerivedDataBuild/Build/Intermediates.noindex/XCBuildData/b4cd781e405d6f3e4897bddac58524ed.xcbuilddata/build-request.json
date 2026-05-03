@@ -1,0 +1,71 @@
+{
+  "buildCommand" : {
+    "command" : "build",
+    "skipDependencies" : false,
+    "style" : "buildOnly"
+  },
+  "configuredTargets" : [
+    {
+      "guid" : "c2d6bda8cc55f561a372c69c94f3cdff06a68a2dd0e7ce1580d23d1fe6a5778b"
+    }
+  ],
+  "containerPath" : "/Users/ekki/Library/CloudStorage/Dropbox/Programmator/GITHUB/pic-to-map/PicToMap.xcodeproj",
+  "continueBuildingAfterErrors" : false,
+  "dependencyScope" : "workspace",
+  "enableIndexBuildArena" : false,
+  "hideShellScriptEnvironment" : false,
+  "parameters" : {
+    "action" : "build",
+    "activeArchitecture" : "undefined_arch",
+    "activeRunDestination" : {
+      "disableOnlyActiveArch" : true,
+      "hostTargetedPlatform" : null,
+      "platform" : "iphoneos",
+      "sdk" : "iphoneos26.4",
+      "sdkVariant" : "iphoneos",
+      "supportedArchitectures" : [
+        "armv4t",
+        "armv5",
+        "armv6",
+        "armv7",
+        "armv7f",
+        "armv7s",
+        "armv7k",
+        "arm64",
+        "arm64e"
+      ],
+      "targetArchitecture" : "undefined_arch"
+    },
+    "arenaInfo" : {
+      "buildIntermediatesPath" : "/Users/ekki/Library/CloudStorage/Dropbox/Programmator/GITHUB/pic-to-map/.DerivedDataBuild/Build/Intermediates.noindex",
+      "buildProductsPath" : "/Users/ekki/Library/CloudStorage/Dropbox/Programmator/GITHUB/pic-to-map/.DerivedDataBuild/Build/Products",
+      "derivedDataPath" : "/Users/ekki/Library/CloudStorage/Dropbox/Programmator/GITHUB/pic-to-map/.DerivedDataBuild",
+      "indexDataStoreFolderPath" : "/Users/ekki/Library/CloudStorage/Dropbox/Programmator/GITHUB/pic-to-map/.DerivedDataBuild/Index.noindex/DataStore",
+      "indexEnableDataStore" : true,
+      "indexPCHPath" : "/Users/ekki/Library/CloudStorage/Dropbox/Programmator/GITHUB/pic-to-map/.DerivedDataBuild/Index.noindex/PrecompiledHeaders",
+      "pchPath" : "/Users/ekki/Library/CloudStorage/Dropbox/Programmator/GITHUB/pic-to-map/.DerivedDataBuild/Build/Intermediates.noindex/PrecompiledHeaders"
+    },
+    "configurationName" : "Debug",
+    "overrides" : {
+      "commandLine" : {
+        "table" : {
+
+        }
+      },
+      "synthesized" : {
+        "table" : {
+          "ACTION" : "build",
+          "ENABLE_PREVIEWS" : "NO",
+          "ENABLE_XOJIT_PREVIEWS" : "YES",
+          "ONLY_ACTIVE_ARCH" : "YES"
+        }
+      }
+    }
+  },
+  "schemeCommand" : "launch",
+  "showNonLoggedProgress" : true,
+  "useDryRun" : false,
+  "useImplicitDependencies" : true,
+  "useLegacyBuildLocations" : false,
+  "useParallelTargets" : true
+}

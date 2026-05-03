@@ -1,0 +1,31 @@
+name: PicToMap
+options:
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.example.pictomap
+    SWIFT_VERSION: 5.10
+targets:
+  PicToMap:
+    type: application
+    platform: iOS
+    sources:
+      - PicToMap
+    resources:
+      - PicToMap/Assets.xcassets
+      - PicToMap/Preview Content/Preview Assets.xcassets
+    settings:
+      base:
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Select an image to overlay on the map.
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Show your current position on the map.
+    info:
+      path: PicToMap/Info.plist
+      properties:
+        UILaunchScreen:
+          UIColorName: ""
+          UIImageName: ""
+        UIApplicationSupportsIndirectInputEvents: YES

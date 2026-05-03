@@ -1,0 +1,347 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		20EAB3348E0989157B9DEDF0 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 48945E7DD0BC77ACA3CFD532 /* Preview Assets.xcassets */; };
+		3DCCF6C5240F9D01F612BA5A /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7644E56B7A369762FE2677EA /* ContentView.swift */; };
+		99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73FB23DC65473206083E68C0 /* OverlayModels.swift */; };
+		9A5972EAC9706CDA48CB9D9A /* MapViewBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0152501D7FD80FEE395C167 /* MapViewBridge.swift */; };
+		B75CE877AA783FF5FF55098E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2B288C6F420232C2216E201E /* Assets.xcassets */; };
+		C1A2F3E4D5C6B798AABBCCDD /* ImageRasterMapOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B199887766554433221100FF /* ImageRasterMapOverlay.swift */; };
+		DB4E6DB74BFE6E53EA8D431C /* MapViewRepresentable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */; };
+		E3C3B002F002D002B002C002 /* MapControlChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C2B001F001D001A001B001 /* MapControlChrome.swift */; };
+		E59CACAD388ECE0E6EBF9E77 /* PicToMapApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9498F353B016CE0333FC7F4A /* PicToMapApp.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		2B288C6F420232C2216E201E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		3DDE5DDB3AC19296B55D593C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		48945E7DD0BC77ACA3CFD532 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
+		4A8B14F76DF5F5D3F8473B86 /* SnapToMap.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SnapToMap.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		73FB23DC65473206083E68C0 /* OverlayModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayModels.swift; sourceTree = "<group>"; };
+		7644E56B7A369762FE2677EA /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewRepresentable.swift; sourceTree = "<group>"; };
+		9498F353B016CE0333FC7F4A /* PicToMapApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PicToMapApp.swift; sourceTree = "<group>"; };
+		A0152501D7FD80FEE395C167 /* MapViewBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewBridge.swift; sourceTree = "<group>"; };
+		B199887766554433221100FF /* ImageRasterMapOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageRasterMapOverlay.swift; sourceTree = "<group>"; };
+		E2C2B001F001D001A001B001 /* MapControlChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapControlChrome.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		2766BDEC738B8E90E5C57F92 /* SnapToMap */ = {
+			isa = PBXGroup;
+			children = (
+				2B288C6F420232C2216E201E /* Assets.xcassets */,
+				7644E56B7A369762FE2677EA /* ContentView.swift */,
+				B199887766554433221100FF /* ImageRasterMapOverlay.swift */,
+				3DDE5DDB3AC19296B55D593C /* Info.plist */,
+				A0152501D7FD80FEE395C167 /* MapViewBridge.swift */,
+				7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */,
+				E2C2B001F001D001A001B001 /* MapControlChrome.swift */,
+				73FB23DC65473206083E68C0 /* OverlayModels.swift */,
+				9498F353B016CE0333FC7F4A /* PicToMapApp.swift */,
+				97413E7C29CCF406980DCC60 /* Preview Content */,
+			);
+			path = SnapToMap;
+			sourceTree = "<group>";
+		};
+		6BFF154BCD7AC553C7A24B5F /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4A8B14F76DF5F5D3F8473B86 /* SnapToMap.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		97413E7C29CCF406980DCC60 /* Preview Content */ = {
+			isa = PBXGroup;
+			children = (
+				48945E7DD0BC77ACA3CFD532 /* Preview Assets.xcassets */,
+			);
+			path = "Preview Content";
+			sourceTree = "<group>";
+		};
+		F52D5BEFFCE4DC778CA6E7F0 = {
+			isa = PBXGroup;
+			children = (
+				2766BDEC738B8E90E5C57F92 /* SnapToMap */,
+				6BFF154BCD7AC553C7A24B5F /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		47D82658A2BC896185409130 /* SnapToMap */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2C1F431B0527879C2837FDE2 /* Build configuration list for PBXNativeTarget "SnapToMap" */;
+			buildPhases = (
+				B71EACA1B3233CA630ECCC1F /* Sources */,
+				7B1E7074927E7FD776C31166 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = SnapToMap;
+			packageProductDependencies = (
+			);
+			productName = PicToMap;
+			productReference = 4A8B14F76DF5F5D3F8473B86 /* SnapToMap.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		0BD368AA3A09F42006A0BEE6 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+			};
+			buildConfigurationList = CB7E98BB09F7A6D332C66CE8 /* Build configuration list for PBXProject "SnapToMap" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F52D5BEFFCE4DC778CA6E7F0;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 6BFF154BCD7AC553C7A24B5F /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				47D82658A2BC896185409130 /* SnapToMap */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		7B1E7074927E7FD776C31166 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B75CE877AA783FF5FF55098E /* Assets.xcassets in Resources */,
+				20EAB3348E0989157B9DEDF0 /* Preview Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		B71EACA1B3233CA630ECCC1F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3DCCF6C5240F9D01F612BA5A /* ContentView.swift in Sources */,
+				9A5972EAC9706CDA48CB9D9A /* MapViewBridge.swift in Sources */,
+				DB4E6DB74BFE6E53EA8D431C /* MapViewRepresentable.swift in Sources */,
+				E3C3B002F002D002B002C002 /* MapControlChrome.swift in Sources */,
+				C1A2F3E4D5C6B798AABBCCDD /* ImageRasterMapOverlay.swift in Sources */,
+				99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */,
+				E59CACAD388ECE0E6EBF9E77 /* PicToMapApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		10EAC92A859D79FC84528A47 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.pictomap;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.1;
+			};
+			name = Debug;
+		};
+		185FC7F7ACB99B8D01ECC4F6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.pictomap;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.1;
+			};
+			name = Release;
+		};
+		63B1F954E20B45B285E3BFA6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = V9M3FX97AT;
+				INFOPLIST_FILE = SnapToMap/Info.plist;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Select an image to overlay on the map.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.snaptomap;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.example.snaptomap;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		D82A354FC9C7ED804AC67B42 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = V9M3FX97AT;
+				INFOPLIST_FILE = SnapToMap/Info.plist;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Select an image to overlay on the map.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.snaptomap;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.example.snaptomap;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		2C1F431B0527879C2837FDE2 /* Build configuration list for PBXNativeTarget "SnapToMap" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				63B1F954E20B45B285E3BFA6 /* Debug */,
+				D82A354FC9C7ED804AC67B42 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		CB7E98BB09F7A6D332C66CE8 /* Build configuration list for PBXProject "SnapToMap" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				10EAC92A859D79FC84528A47 /* Debug */,
+				185FC7F7ACB99B8D01ECC4F6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 0BD368AA3A09F42006A0BEE6 /* Project object */;
+}
