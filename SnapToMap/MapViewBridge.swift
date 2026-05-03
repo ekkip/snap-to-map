@@ -30,7 +30,7 @@ final class RasterMapOpacityBag {
     }
 }
 
-final class MapViewBridge: ObservableObject {
+final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate {
     weak var mapView: MKMapView?
 
     let rasterOpacity = RasterMapOpacityBag()
@@ -161,17 +161,15 @@ final class MapViewBridge: ObservableObject {
 
     func attach(mapView: MKMapView) {
         self.mapView = mapView
+        self.locationManager.delegate = self
     }
 
     /// Ensures the system can show the user-location annotation on `MKMapView` (`showsUserLocation`).
+    /// The result of the authorization request is handled asynchronously by the delegate callback.
     func requestLocationAuthorizationIfNeeded() {
         guard CLLocationManager.locationServicesEnabled() else { return }
-        switch locationManager.authorizationStatus {
-        case .notDetermined:
-            locationManager.requestWhenInUseAuthorization()
-        default:
-            break
-        }
+        // Request authorization asynchronously; delegate will handle status changes.
+        locationManager.requestWhenInUseAuthorization()
     }
 
     func centerOnUserLocation(animated: Bool = true) {
@@ -189,5 +187,14 @@ final class MapViewBridge: ObservableObject {
         pendingEditExpectedVisibleMapRect = nil
         editHandoffDeadline = nil
         mapEditHandoff = nil
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .notDetermined:
+            manager.requestWhenInUseAuthorization()
+        default:
+            break
+        }
     }
 }

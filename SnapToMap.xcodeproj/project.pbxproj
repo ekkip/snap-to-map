@@ -102,7 +102,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 1430;
+				LastUpgradeCheck = 2640;
 			};
 			buildConfigurationList = CB7E98BB09F7A6D332C66CE8 /* Build configuration list for PBXProject "SnapToMap" */;
 			developmentRegion = en;
@@ -188,8 +188,10 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = V9M3FX97AT;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -211,6 +213,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.pictomap;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.1;
@@ -252,8 +255,10 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = V9M3FX97AT;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -268,6 +273,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.pictomap;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.1;
@@ -279,7 +285,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = V9M3FX97AT;
 				INFOPLIST_FILE = SnapToMap/Info.plist;
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Select an image to overlay on the map.";
@@ -302,7 +307,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = V9M3FX97AT;
 				INFOPLIST_FILE = SnapToMap/Info.plist;
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Select an image to overlay on the map.";
