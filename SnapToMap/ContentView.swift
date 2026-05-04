@@ -80,7 +80,7 @@ struct ContentView: View {
             }
             .overlay(alignment: .topLeading) {
                 if isEditing, editingOverlayBackup != nil {
-                    chromeIconButton(icon: "trash", fontSize: 20) {
+                    chromeIconButton(icon: "trash", fontSize: 20, hitFlushAlignment: .topLeading) {
                         collapseBrowsingOpacitySliderIfNeeded()
                         removeEditingOverlay()
                     }
@@ -89,10 +89,11 @@ struct ContentView: View {
                 }
             }
             .overlay(alignment: .topTrailing) {
-                VStack(alignment: .trailing, spacing: 12) {
+                VStack(alignment: .trailing, spacing: 8) {
                     MapCompassRepresentable(bridge: mapBridge)
-                        .fixedSize()
-                    chromeIconButton(icon: "location.fill", fontSize: 22) {
+                        .frame(width: MapControlChrome.diameter, height: MapControlChrome.diameter)
+                        .clipped()
+                    chromeIconButton(icon: "location.fill", fontSize: 22, hitFlushAlignment: .trailing) {
                         collapseBrowsingOpacitySliderIfNeeded()
                         mapBridge.centerOnUserLocation()
                     }
@@ -102,10 +103,7 @@ struct ContentView: View {
                 .padding(.trailing, 16)
             }
             .overlay(alignment: .bottom) {
-                bottomCenterControl(canvas: geometry.size, bottomInset: geometry.safeAreaInsets.bottom)
-            }
-            .overlay(alignment: .bottomTrailing) {
-                bottomTrailingEditHUD(canvas: geometry.size, bottomInset: geometry.safeAreaInsets.bottom)
+                bottomCenterControl(bottomInset: geometry.safeAreaInsets.bottom)
             }
             .overlay(alignment: .bottomLeading) {
                 if isEditing || mapBridge.isAnyRasterMapOverlayOnMap {
@@ -125,6 +123,11 @@ struct ContentView: View {
                     .padding(.leading, 16)
                     .padding(.bottom, geometry.safeAreaInsets.bottom + 8)
                 }
+            }
+            /// **`bottomLeading`** (opacity) is applied **before** this overlay so the trailing edit column stays **above** it in hit‑testing / drawing order.
+            .overlay(alignment: .bottomTrailing) {
+                bottomTrailingEditHUD(canvas: geometry.size, bottomInset: geometry.safeAreaInsets.bottom)
+                    .zIndex(10)
             }
             .animation(.easeInOut(duration: 0.2), value: isEditing)
             .animation(.easeInOut(duration: 0.2), value: mapBridge.isAnyRasterMapOverlayOnMap)
@@ -192,40 +195,47 @@ struct ContentView: View {
     }
 
     /// Center: `.primaryCTA` for Add / Done; uses `MapControlChrome.Appearance.primaryCTA`.
-    private func bottomCenterControl(canvas: CGSize, bottomInset: CGFloat) -> some View {
-        HStack {
-            Spacer(minLength: 0)
-            if isEditing {
-                if primaryCTAShowsActivity {
+    private func bottomCenterControl(bottomInset: CGFloat) -> some View {
+        let d = MapControlChrome.diameter
+        let tap = d + 2
+        return ZStack(alignment: .bottom) {
+            Circle()
+                .fill(Color.clear)
+                .frame(width: tap, height: tap)
+                .contentShape(Circle())
+            Group {
+                if isEditing {
+                    if primaryCTAShowsActivity {
+                        MapControlChrome.circularControl(.primaryCTA) {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .tint(.white)
+                        }
+                    } else {
+                        MapControlChrome.primaryCTAButton(icon: "checkmark", fontSize: 20) {
+                            collapseBrowsingOpacitySliderIfNeeded()
+                            saveDraftAsOverlay()
+                        }
+                    }
+                } else if primaryCTAShowsActivity {
                     MapControlChrome.circularControl(.primaryCTA) {
                         ProgressView()
                             .progressViewStyle(.circular)
                             .tint(.white)
                     }
                 } else {
-                    MapControlChrome.primaryCTAButton(icon: "checkmark", fontSize: 20) {
-                        collapseBrowsingOpacitySliderIfNeeded()
-                        saveDraftAsOverlay()
+                    PhotosPicker(selection: $selectedItem, matching: .images) {
+                        MapControlChrome.circularControl(.primaryCTA) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 24, weight: .regular))
+                        }
                     }
+                    .buttonStyle(.plain)
+                    .simultaneousGesture(TapGesture().onEnded { collapseBrowsingOpacitySliderIfNeeded() })
                 }
-            } else if primaryCTAShowsActivity {
-                MapControlChrome.circularControl(.primaryCTA) {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .tint(.white)
-                }
-            } else {
-                PhotosPicker(selection: $selectedItem, matching: .images) {
-                    MapControlChrome.circularControl(.primaryCTA) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 24, weight: .regular))
-                    }
-                }
-                .buttonStyle(.plain)
-                .simultaneousGesture(TapGesture().onEnded { collapseBrowsingOpacitySliderIfNeeded() })
             }
-            Spacer(minLength: 0)
         }
+        .frame(width: tap, height: tap, alignment: .bottom)
         .padding(.bottom, bottomInset + 8)
     }
 
@@ -233,14 +243,14 @@ struct ContentView: View {
     @ViewBuilder
     private func bottomTrailingEditHUD(canvas: CGSize, bottomInset: CGFloat) -> some View {
         if isEditing {
-            VStack(alignment: .trailing, spacing: 12) {
+            VStack(alignment: .trailing, spacing: 8) {
                 if hasCornerEdits {
-                    chromeIconButton(icon: "arrow.counterclockwise", fontSize: 20) {
+                    chromeIconButton(icon: "arrow.counterclockwise", fontSize: 20, hitFlushAlignment: .trailing) {
                         collapseBrowsingOpacitySliderIfNeeded()
                         resetDraftQuad(for: canvas)
                     }
                 }
-                chromeIconButton(icon: draftAnchoredToMap ? "lock.fill" : "lock.open.fill", fontSize: 20) {
+                chromeIconButton(icon: draftAnchoredToMap ? "lock.fill" : "lock.open.fill", fontSize: 20, hitFlushAlignment: .trailing) {
                     collapseBrowsingOpacitySliderIfNeeded()
                     draftAnchoredToMap.toggle()
                     if !draftAnchoredToMap {
@@ -255,7 +265,7 @@ struct ContentView: View {
                     }
                     updateWarpedDraftCache(canvas: canvas)
                 }
-                chromeIconButton(icon: "xmark", fontSize: 20) {
+                chromeIconButton(icon: "xmark", fontSize: 20, hitFlushAlignment: .trailing) {
                     collapseBrowsingOpacitySliderIfNeeded()
                     cancelEditing()
                 }
@@ -266,11 +276,19 @@ struct ContentView: View {
         }
     }
 
-    private func chromeIconButton(icon: String, fontSize: CGFloat, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            MapControlChrome.circularControl(.standard) {
-                Image(systemName: icon)
-                    .font(.system(size: fontSize, weight: .regular))
+    /// **`hitFlushAlignment`** pins the **46** pt glass flush to that corner of the **`diameter+2`** tap cell so margins match **`MapControlChrome.diameter`** neighbours (compass / opacity); the extra **1 pt** ring is **inward** only.
+    private func chromeIconButton(icon: String, fontSize: CGFloat, hitFlushAlignment: Alignment, action: @escaping () -> Void) -> some View {
+        let tap = MapControlChrome.diameter + 2
+        return Button(action: action) {
+            ZStack(alignment: hitFlushAlignment) {
+                Circle()
+                    .fill(Color.clear)
+                    .frame(width: tap, height: tap)
+                    .contentShape(Circle())
+                MapControlChrome.circularControl(.standard) {
+                    Image(systemName: icon)
+                        .font(.system(size: fontSize, weight: .regular))
+                }
             }
         }
         .buttonStyle(.plain)
@@ -313,6 +331,8 @@ struct ContentView: View {
                 path.closeSubpath()
             }
             .stroke(.yellow, style: StrokeStyle(lineWidth: 2, dash: [7, 5]))
+            /// The quad’s **axis‑aligned bounds** otherwise steal taps (e.g. near bottom‑trailing HUD); only corner **`Circle`** handles need hits.
+            .allowsHitTesting(false)
 
             ForEach(0..<4, id: \.self) { index in
                 Circle()
