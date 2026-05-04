@@ -137,6 +137,7 @@ struct MapViewRepresentable: UIViewRepresentable {
                 let mapOverlay = ImageRasterMapOverlay(
                     overlayID: item.id,
                     image: item.sourceImage,
+                    cornerCoordinates: item.corners,
                     mapBoundingRect: bbox,
                     largeImage: item.sourceImage.rasterExceedsLargeOverlayPixelThreshold,
                     opacityBag: rasterBag

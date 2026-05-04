@@ -397,7 +397,14 @@ struct ContentView: View {
         mapBridge.cancelPendingEditFit()
         finalizeDraftRasterOpacityGestureEnd()
 
-        overlays.append(OverlayItem(id: overlayID, sourceImage: draftImage, corners: corners))
+        overlays.append(
+            OverlayItem(
+                id: overlayID,
+                sourceImage: draftImage,
+                corners: corners,
+                placementCamera: persistMapCameraSnapshot()
+            )
+        )
 
         self.draftImage = nil
         draftQuad = []
@@ -449,16 +456,40 @@ struct ContentView: View {
             return
         }
 
-        let targetRect = mapRect(for: overlay.corners)
-        let padding = UIEdgeInsets(top: 100, left: 50, bottom: 120, right: 50)
-        let expectedVisibleMapRect = mapView.mapRectThatFits(targetRect, edgePadding: padding)
-
         primaryCTAShowsActivity = overlay.sourceImage.rasterExceedsLargeOverlayPixelThreshold
 
-        mapBridge.armEditTransitionAfterMapSettles(for: overlay, expectedVisibleMapRect: expectedVisibleMapRect)
+        if let cam = overlay.placementCamera {
+            mapBridge.armEditTransitionAfterMapSettles(for: overlay, expectedVisibleMapRect: nil)
+            restoreMapCameraForEdit(cam, on: mapView)
+            mapBridge.noteMapRegionChangedWhileWaitingForEdit()
+        } else {
+            let targetRect = mapRect(for: overlay.corners)
+            let padding = UIEdgeInsets(top: 100, left: 50, bottom: 120, right: 50)
+            let expectedVisibleMapRect = mapView.mapRectThatFits(targetRect, edgePadding: padding)
+            mapBridge.armEditTransitionAfterMapSettles(for: overlay, expectedVisibleMapRect: expectedVisibleMapRect)
+            mapView.setVisibleMapRect(targetRect, edgePadding: padding, animated: true)
+            mapBridge.noteMapRegionChangedWhileWaitingForEdit()
+        }
+    }
 
-        mapView.setVisibleMapRect(targetRect, edgePadding: padding, animated: true)
-        mapBridge.noteMapRegionChangedWhileWaitingForEdit()
+    private func persistMapCameraSnapshot() -> PersistedMapCamera? {
+        guard let c = mapBridge.mapView?.camera else { return nil }
+        return PersistedMapCamera(
+            centerLatitude: c.centerCoordinate.latitude,
+            centerLongitude: c.centerCoordinate.longitude,
+            heading: c.heading,
+            centerCoordinateDistance: c.centerCoordinateDistance,
+            pitch: Double(c.pitch)
+        )
+    }
+
+    private func restoreMapCameraForEdit(_ p: PersistedMapCamera, on mapView: MKMapView) {
+        let c = MKMapCamera()
+        c.centerCoordinate = CLLocationCoordinate2D(latitude: p.centerLatitude, longitude: p.centerLongitude)
+        c.centerCoordinateDistance = p.centerCoordinateDistance
+        c.pitch = CGFloat(p.pitch)
+        c.heading = p.heading
+        mapView.setCamera(c, animated: true)
     }
 
     private func applyMapEditTransition(_ handoff: MapEditHandoff, canvas: CGSize) {
@@ -503,6 +534,7 @@ struct ContentView: View {
             let id: UUID
             let imageBytes: Data?
             let corners: [PersistedCoordinate]
+            let placementCamera: PersistedMapCamera?
             let imageFileURL: URL
         }
 
@@ -527,6 +559,7 @@ struct ContentView: View {
                 id: o.id,
                 imageBytes: encoded,
                 corners: o.corners.map { PersistedCoordinate(latitude: $0.latitude, longitude: $0.longitude) },
+                placementCamera: o.placementCamera,
                 imageFileURL: imageURL
             ))
         }
@@ -550,7 +583,11 @@ struct ContentView: View {
                     if let bytes = row.imageBytes {
                         try bytes.write(to: row.imageFileURL, options: [.atomic])
                     }
-                    entries.append(PersistedOverlayEntry(id: row.id, corners: row.corners))
+                    entries.append(PersistedOverlayEntry(
+                        id: row.id,
+                        corners: row.corners,
+                        placementCamera: row.placementCamera
+                    ))
                 }
 
                 let metadataData = try JSONEncoder().encode(PersistedOverlays(entries: entries))
@@ -608,7 +645,8 @@ struct ContentView: View {
                 OverlayItem(
                     id: entry.id,
                     sourceImage: sourceImage,
-                    corners: corners
+                    corners: corners,
+                    placementCamera: entry.placementCamera
                 )
             )
         }

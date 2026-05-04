@@ -3,6 +3,12 @@ import CoreGraphics
 import CoreLocation
 import MapKit
 
+private func editHandoffHeadingDeltaDegrees(_ a: CLLocationDirection, _ b: CLLocationDirection) -> Double {
+    var d = (a - b).truncatingRemainder(dividingBy: 360)
+    if d < 0 { d += 360 }
+    return min(d, 360 - d)
+}
+
 /// Produced when **`MapViewBridge`** detects the visible map region has stabilized after a programmatic fit (`setVisibleMapRect` / animated region change).
 final class MapEditHandoff {
     let overlay: OverlayItem
@@ -27,6 +33,53 @@ final class RasterMapOpacityBag {
 
     func clearDragging() {
         dragging = nil
+    }
+}
+
+/// Snapshot of pan/zoom/tile-relevant state for “map stopped moving” detection (edit handoff).
+private struct MapVisualState {
+    let visibleOriginX: Double
+    let visibleOriginY: Double
+    let visibleWidth: Double
+    let visibleHeight: Double
+    let camLat: Double
+    let camLon: Double
+    let camDistance: CLLocationDistance
+    let camHeading: CLLocationDirection
+    let camPitch: Double
+
+    init(_ mapView: MKMapView) {
+        let r = mapView.visibleMapRect
+        visibleOriginX = r.origin.x
+        visibleOriginY = r.origin.y
+        visibleWidth = r.size.width
+        visibleHeight = r.size.height
+        let c = mapView.camera
+        camLat = c.centerCoordinate.latitude
+        camLon = c.centerCoordinate.longitude
+        camDistance = c.centerCoordinateDistance
+        camHeading = c.heading
+        camPitch = Double(c.pitch)
+    }
+
+    /// **`true`** when two samples ~25 ms apart are effectively identical (stricter than handoff “match”).
+    func isNearlyFrozen(comparedTo other: MapVisualState) -> Bool {
+        let rw = max(visibleWidth, other.visibleWidth, 1)
+        let rh = max(visibleHeight, other.visibleHeight, 1)
+        guard abs(visibleWidth - other.visibleWidth) / rw < 0.0005,
+              abs(visibleHeight - other.visibleHeight) / rh < 0.0005,
+              abs(visibleOriginX - other.visibleOriginX) / rw < 0.0005,
+              abs(visibleOriginY - other.visibleOriginY) / rh < 0.0005 else {
+            return false
+        }
+        let a = CLLocation(latitude: camLat, longitude: camLon)
+        let b = CLLocation(latitude: other.camLat, longitude: other.camLon)
+        guard a.distance(from: b) < 0.5 else { return false }
+        let dMax = max(camDistance, other.camDistance, 1)
+        guard abs(camDistance - other.camDistance) / dMax < 0.0005 else { return false }
+        guard editHandoffHeadingDeltaDegrees(camHeading, other.camHeading) < 0.05 else { return false }
+        guard abs(camPitch - other.camPitch) < 0.05 else { return false }
+        return true
     }
 }
 
@@ -62,13 +115,20 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     private var pendingEditExpectedVisibleMapRect: MKMapRect?
     private var editHandoffDeadline: Date?
 
+    /// Quiet period after the last **`regionDidChangeAnimated`** before we treat the map as idle.
     private let editHandoffDebounce: TimeInterval = 0.12
+    /// After **`expectedFitMatches`** is true, poll this often until **two** samples **25 ms** apart report the same **`visibleMapRect` / camera** (tight epsilon) — finishes as soon as animation stops, no fixed post-delay.
+    private let editHandoffStabilityPollInterval: TimeInterval = 0.025
     private let editHandoffRetryInterval: TimeInterval = 0.05
     private let editHandoffMaxWait: TimeInterval = 2.5
     private let editHandoffRectRelativeTolerance: Double = 0.035
 
-    /// Expected map rect must match **`mapView.mapRectThatFits(overlayRect, edgePadding:)`** for the same **`setVisibleMapRect`** call.
-    func armEditTransitionAfterMapSettles(for overlay: OverlayItem, expectedVisibleMapRect: MKMapRect) {
+    /// Previous **`MapVisualState`** during stability polling; **`nil`** = next tick only seeds the baseline.
+    private var editHandoffStabilityPrevious: MapVisualState?
+
+    /// When **`expectedVisibleMapRect`** is **`nil`**, handoff waits until **`MKMapCamera`** matches **`overlay.placementCamera`** (if present), or times out.
+    /// When non-**`nil`**, it must match **`mapView.mapRectThatFits(overlayRect, edgePadding:)`** for the same **`setVisibleMapRect`** used by the caller.
+    func armEditTransitionAfterMapSettles(for overlay: OverlayItem, expectedVisibleMapRect: MKMapRect?) {
         cancelPendingEditFit()
         pendingFitForEditOverlay = overlay
         pendingEditExpectedVisibleMapRect = expectedVisibleMapRect
@@ -76,6 +136,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     }
 
     /// Called from **`MKMapViewDelegate.mapView(_:regionDidChangeAnimated:)`** (and once from **`ContentView`** after **`setVisibleMapRect`**) so the handoff debounces from the **last** region delta — i.e. after the zoom animation finishes.
+    /// Cancels any in-flight stability poll so overlapping delegate callbacks do not complete handoff on a stale camera.
     func noteMapRegionChangedWhileWaitingForEdit() {
         guard pendingFitForEditOverlay != nil else { return }
         scheduleEditHandoffDebounce()
@@ -107,26 +168,87 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         }
 
         let timedOut = Date() >= (editHandoffDeadline ?? .distantFuture)
-        let visible = mapView.visibleMapRect
-        let matches: Bool
-        if let expected = pendingEditExpectedVisibleMapRect {
-            matches = Self.visibleMapRectApproximatelyEqual(visible, expected, relativeTolerance: editHandoffRectRelativeTolerance)
-        } else {
-            matches = true
-        }
+        let matches = expectedFitMatches(mapView, overlay: overlay)
 
-        if matches || timedOut {
-            pendingFitForEditOverlay = nil
-            pendingEditExpectedVisibleMapRect = nil
-            editHandoffDeadline = nil
-            let quad = overlay.corners.map { mapView.convert($0, toPointTo: mapView) }
-            mapEditHandoff = MapEditHandoff(overlay: overlay, fittedQuadScreen: quad)
+        if timedOut {
+            deliverEditHandoff(overlay: overlay, mapView: mapView)
+        } else if matches {
+            startEditHandoffStabilityPolling()
         } else {
+            editHandoffStabilityPrevious = nil
             scheduleEditHandoffRetryPoll()
         }
     }
 
+    private func startEditHandoffStabilityPolling() {
+        editHandoffStabilityPrevious = nil
+        scheduleEditHandoffStabilityTick()
+    }
+
+    private func scheduleEditHandoffStabilityTick() {
+        mapRegionIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.tickEditHandoffStabilityPoll()
+        }
+        mapRegionIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + editHandoffStabilityPollInterval, execute: work)
+    }
+
+    private func tickEditHandoffStabilityPoll() {
+        mapRegionIdleWorkItem = nil
+        guard let overlay = pendingFitForEditOverlay, let mapView else {
+            editHandoffStabilityPrevious = nil
+            clearPendingEditFitOnly()
+            return
+        }
+
+        let timedOut = Date() >= (editHandoffDeadline ?? .distantFuture)
+        if timedOut {
+            editHandoffStabilityPrevious = nil
+            deliverEditHandoff(overlay: overlay, mapView: mapView)
+            return
+        }
+
+        let matches = expectedFitMatches(mapView, overlay: overlay)
+        if !matches {
+            editHandoffStabilityPrevious = nil
+            scheduleEditHandoffRetryPoll()
+            return
+        }
+
+        let now = MapVisualState(mapView)
+        if let prev = editHandoffStabilityPrevious, prev.isNearlyFrozen(comparedTo: now) {
+            editHandoffStabilityPrevious = nil
+            deliverEditHandoff(overlay: overlay, mapView: mapView)
+            return
+        }
+
+        editHandoffStabilityPrevious = now
+        scheduleEditHandoffStabilityTick()
+    }
+
+    private func expectedFitMatches(_ mapView: MKMapView, overlay: OverlayItem) -> Bool {
+        let visible = mapView.visibleMapRect
+        if let expected = pendingEditExpectedVisibleMapRect {
+            return Self.visibleMapRectApproximatelyEqual(visible, expected, relativeTolerance: editHandoffRectRelativeTolerance)
+        } else if let saved = overlay.placementCamera {
+            return Self.cameraApproximatelyMatches(mapView.camera, saved: saved)
+        } else {
+            return true
+        }
+    }
+
+    private func deliverEditHandoff(overlay: OverlayItem, mapView: MKMapView) {
+        editHandoffStabilityPrevious = nil
+        pendingFitForEditOverlay = nil
+        pendingEditExpectedVisibleMapRect = nil
+        editHandoffDeadline = nil
+        let quad = overlay.corners.map { mapView.convert($0, toPointTo: mapView) }
+        mapEditHandoff = MapEditHandoff(overlay: overlay, fittedQuadScreen: quad)
+    }
+
     private func clearPendingEditFitOnly() {
+        editHandoffStabilityPrevious = nil
         pendingFitForEditOverlay = nil
         pendingEditExpectedVisibleMapRect = nil
         editHandoffDeadline = nil
@@ -145,6 +267,17 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         let rcx = abs(acx - bcx) / tw
         let rcy = abs(acy - bcy) / th
         return rw < relativeTolerance && rh < relativeTolerance && rcx < relativeTolerance && rcy < relativeTolerance
+    }
+
+    private static func cameraApproximatelyMatches(_ live: MKMapCamera, saved: PersistedMapCamera) -> Bool {
+        let a = CLLocation(latitude: saved.centerLatitude, longitude: saved.centerLongitude)
+        let b = CLLocation(latitude: live.centerCoordinate.latitude, longitude: live.centerCoordinate.longitude)
+        guard a.distance(from: b) < 28 else { return false }
+        guard editHandoffHeadingDeltaDegrees(live.heading, saved.heading) < 4 else { return false }
+        let denom = max(saved.centerCoordinateDistance, 1)
+        guard abs(live.centerCoordinateDistance - saved.centerCoordinateDistance) / denom < 0.09 else { return false }
+        guard abs(Double(live.pitch) - saved.pitch) < 2.5 else { return false }
+        return true
     }
 
     /// Updates each raster renderer’s compositing **`alpha`** from **`RasterMapOpacityBag`** (per-overlay **`largeImage` / committed / dragging** rules). MapKit applies this **without** necessarily invoking **`draw(_:zoomScale:in:)`** again, so browse-mode opacity tracks the slider smoothly (edit mode uses SwiftUI opacity on a separate layer).
@@ -183,6 +316,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     func cancelPendingEditFit() {
         mapRegionIdleWorkItem?.cancel()
         mapRegionIdleWorkItem = nil
+        editHandoffStabilityPrevious = nil
         pendingFitForEditOverlay = nil
         pendingEditExpectedVisibleMapRect = nil
         editHandoffDeadline = nil
