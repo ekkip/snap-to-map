@@ -3,6 +3,15 @@ import CoreGraphics
 import CoreLocation
 import MapKit
 
+/// Shared timings for “map stopped moving” (**`editHandoff`** and stick‑to‑map draft image).
+private enum MapRegionSettleTiming {
+    /// Quiet period after the last region notification before starting stability polling.
+    static let debounceAfterLastChange: TimeInterval = 0.12
+    /// Poll interval until **two** **`MapVisualState`** samples **`isNearlyFrozen`** apart are taken.
+    static let stabilityPollInterval: TimeInterval = 0.025
+    static let maxWait: TimeInterval = 2.5
+}
+
 private func editHandoffHeadingDeltaDegrees(_ a: CLLocationDirection, _ b: CLLocationDirection) -> Double {
     var d = (a - b).truncatingRemainder(dividingBy: 360)
     if d < 0 { d += 360 }
@@ -106,6 +115,22 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         }
     }
 
+    /// Bumped from **`mapView(_:regionDidChangeAnimated:)`** so **`ContentView`** can re-project the draft overlay when it is anchored to the map.
+    @Published private(set) var mapLayoutRevision: UInt64 = 0
+
+    /// Bumped after **`MapRegionSettleTiming`** debounce + **two** frozen **`MapVisualState`** samples (same idea as edit handoff) while the draft is stick‑to‑map — **`ContentView`** warps the image and fades it in.
+    @Published private(set) var draftStickToMapSettledRevision: UInt64 = 0
+
+    /// Combined “user is still physically interacting with the map” for stick‑to‑map draft hiding: **any** targeted **`UIGestureRecognizer`** in **`.began`/`.changed`** **or** the **`touchTrackingProbe`** reports fingers down ( **`UILongPressGestureRecognizer`** with **`numberOfTouches`**, not **`isDragging`** / **`isTracking`**).
+    @Published private(set) var mapScrollUserGesturePhysicallyActive: Bool = false
+
+    private var mapManipulationFromGestureRecognizers = false
+    private var mapManipulationFromDirectTouches = false
+
+    func notifyMapLayoutChanged() {
+        mapLayoutRevision &+= 1
+    }
+
     /// Set when **`armEditTransitionAfterMapSettles`** is waiting on region quiescence; **`ContentView`** applies and clears **`mapEditHandoff`**.
     @Published var mapEditHandoff: MapEditHandoff?
 
@@ -115,16 +140,21 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     private var pendingEditExpectedVisibleMapRect: MKMapRect?
     private var editHandoffDeadline: Date?
 
-    /// Quiet period after the last **`regionDidChangeAnimated`** before we treat the map as idle.
-    private let editHandoffDebounce: TimeInterval = 0.12
-    /// After **`expectedFitMatches`** is true, poll this often until **two** samples **25 ms** apart report the same **`visibleMapRect` / camera** (tight epsilon) — finishes as soon as animation stops, no fixed post-delay.
-    private let editHandoffStabilityPollInterval: TimeInterval = 0.025
     private let editHandoffRetryInterval: TimeInterval = 0.05
-    private let editHandoffMaxWait: TimeInterval = 2.5
     private let editHandoffRectRelativeTolerance: Double = 0.035
 
     /// Previous **`MapVisualState`** during stability polling; **`nil`** = next tick only seeds the baseline.
     private var editHandoffStabilityPrevious: MapVisualState?
+
+    private var draftStickSettleIdleWorkItem: DispatchWorkItem?
+    private var draftStickSettleStabilityPrevious: MapVisualState?
+    private var draftStickSettleDeadline: Date?
+    /// Map geometry is ready to show the draft, but **`mapScrollUserGesturePhysicallyActive`** blocked **`deliverDraftStickToMapSettled()`** — complete on touch end.
+    private var draftStickSettleDeferredUntilTouchEnds: Bool = false
+    /// Snapshot when deferring — **`armDraftStickToMapSettleAfterLayoutChange`** returns **`false`** if the map hasn’t moved (avoids a hide/re‑arm flash on touch-up).
+    private var draftStickSettleDeferredVisualBaseline: MapVisualState?
+    /// After a successful stick‑to‑map reveal, ignore **`mapLayoutRevision`** until the camera actually changes (dismisses spurious **`regionDidChange`** right after touch-up).
+    private var draftStickPostRevealSpuriousArmGuardBaseline: MapVisualState?
 
     /// When **`expectedVisibleMapRect`** is **`nil`**, handoff waits until **`MKMapCamera`** matches **`overlay.placementCamera`** (if present), or times out.
     /// When non-**`nil`**, it must match **`mapView.mapRectThatFits(overlayRect, edgePadding:)`** for the same **`setVisibleMapRect`** used by the caller.
@@ -132,7 +162,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         cancelPendingEditFit()
         pendingFitForEditOverlay = overlay
         pendingEditExpectedVisibleMapRect = expectedVisibleMapRect
-        editHandoffDeadline = Date().addingTimeInterval(editHandoffMaxWait)
+        editHandoffDeadline = Date().addingTimeInterval(MapRegionSettleTiming.maxWait)
     }
 
     /// Called from **`MKMapViewDelegate.mapView(_:regionDidChangeAnimated:)`** (and once from **`ContentView`** after **`setVisibleMapRect`**) so the handoff debounces from the **last** region delta — i.e. after the zoom animation finishes.
@@ -148,7 +178,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
             self?.evaluateEditHandoffIfMapMatchesExpectedFit()
         }
         mapRegionIdleWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + editHandoffDebounce, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.debounceAfterLastChange, execute: work)
     }
 
     private func scheduleEditHandoffRetryPoll() {
@@ -191,7 +221,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
             self?.tickEditHandoffStabilityPoll()
         }
         mapRegionIdleWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + editHandoffStabilityPollInterval, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.stabilityPollInterval, execute: work)
     }
 
     private func tickEditHandoffStabilityPoll() {
@@ -252,6 +282,157 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         pendingFitForEditOverlay = nil
         pendingEditExpectedVisibleMapRect = nil
         editHandoffDeadline = nil
+    }
+
+    /// Called from **`MapViewRepresentable`** for subtree **`UIGestureRecognizer`** **`.began`/`.changed`** (includes pan, pinch, rotation once targets are installed).
+    func setMapManipulationFromGestureRecognizers(_ active: Bool) {
+        guard mapManipulationFromGestureRecognizers != active else { return }
+        mapManipulationFromGestureRecognizers = active
+        publishCombinedMapManipulationActive()
+    }
+
+    /// Called from **`MapInteractionMapView`**’s zero‑delay touch probe so we track real **finger‑down** across gaps where **`UIGestureRecognizer.state`** is idle but touches are still on the glass.
+    func setMapManipulationFromDirectTouches(_ touchesDown: Bool) {
+        guard mapManipulationFromDirectTouches != touchesDown else { return }
+        mapManipulationFromDirectTouches = touchesDown
+        publishCombinedMapManipulationActive()
+    }
+
+    private func publishCombinedMapManipulationActive() {
+        let active = mapManipulationFromGestureRecognizers || mapManipulationFromDirectTouches
+        let wasActive = mapScrollUserGesturePhysicallyActive
+        if !wasActive && active {
+            draftStickPostRevealSpuriousArmGuardBaseline = nil
+        }
+        guard active != wasActive else { return }
+        mapScrollUserGesturePhysicallyActive = active
+        if wasActive && !active {
+            tryFinishDeferredDraftStickDeliver()
+        }
+    }
+
+    /// - Returns: **`true`** if this revision starts (or restarts) settle work and the draft chrome should stay hidden; **`false`** if we’re only waiting for finger-up with no camera change (no UI reset).
+    @discardableResult
+    func armDraftStickToMapSettleAfterLayoutChange() -> Bool {
+        if let guardBaseline = draftStickPostRevealSpuriousArmGuardBaseline, let mapView {
+            let now = MapVisualState(mapView)
+            // Ignore **`regionDidChange`** that fires right after reveal while the camera hasn’t moved — but **not** when the user is already touching the map again; the “frozen” check would otherwise match the first **`regionWillChange`** samples of a **new** drag and block **`draftMapMotionImageOpacity = 0`** for the whole gesture.
+            if guardBaseline.isNearlyFrozen(comparedTo: now), !mapScrollUserGesturePhysicallyActive {
+                return false
+            }
+            draftStickPostRevealSpuriousArmGuardBaseline = nil
+        }
+
+        if draftStickSettleDeferredUntilTouchEnds,
+           let mapView,
+           let baseline = draftStickSettleDeferredVisualBaseline {
+            let now = MapVisualState(mapView)
+            if baseline.isNearlyFrozen(comparedTo: now) {
+                return false
+            }
+        }
+        draftStickSettleDeferredUntilTouchEnds = false
+        draftStickSettleDeferredVisualBaseline = nil
+        draftStickPostRevealSpuriousArmGuardBaseline = nil
+        draftStickSettleDeadline = Date().addingTimeInterval(MapRegionSettleTiming.maxWait)
+        scheduleDraftStickToMapDebounce()
+        return true
+    }
+
+    func cancelDraftStickToMapSettle() {
+        draftStickSettleIdleWorkItem?.cancel()
+        draftStickSettleIdleWorkItem = nil
+        draftStickSettleStabilityPrevious = nil
+        draftStickSettleDeadline = nil
+        draftStickSettleDeferredUntilTouchEnds = false
+        draftStickSettleDeferredVisualBaseline = nil
+        draftStickPostRevealSpuriousArmGuardBaseline = nil
+    }
+
+    private func scheduleDraftStickToMapDebounce() {
+        draftStickSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.startDraftStickToMapStabilityPollingAfterDebounce()
+        }
+        draftStickSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.debounceAfterLastChange, execute: work)
+    }
+
+    private func startDraftStickToMapStabilityPollingAfterDebounce() {
+        draftStickSettleIdleWorkItem = nil
+        guard mapView != nil else {
+            cancelDraftStickToMapSettle()
+            return
+        }
+        draftStickSettleStabilityPrevious = nil
+        scheduleDraftStickToMapStabilityTick()
+    }
+
+    private func scheduleDraftStickToMapStabilityTick() {
+        draftStickSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.tickDraftStickToMapStabilityPoll()
+        }
+        draftStickSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.stabilityPollInterval, execute: work)
+    }
+
+    private func tickDraftStickToMapStabilityPoll() {
+        draftStickSettleIdleWorkItem = nil
+        guard let mapView else {
+            cancelDraftStickToMapSettle()
+            return
+        }
+
+        if Date() >= (draftStickSettleDeadline ?? .distantFuture) {
+            deliverDraftStickToMapSettled()
+            return
+        }
+
+        let now = MapVisualState(mapView)
+        if let prev = draftStickSettleStabilityPrevious, prev.isNearlyFrozen(comparedTo: now) {
+            deliverDraftStickToMapSettled()
+            return
+        }
+
+        draftStickSettleStabilityPrevious = now
+        scheduleDraftStickToMapStabilityTick()
+    }
+
+    private func deliverDraftStickToMapSettled() {
+        if mapScrollUserGesturePhysicallyActive {
+            draftStickSettleDeferredUntilTouchEnds = true
+            if let mapView {
+                draftStickSettleDeferredVisualBaseline = MapVisualState(mapView)
+            }
+            draftStickSettleIdleWorkItem?.cancel()
+            draftStickSettleIdleWorkItem = nil
+            return
+        }
+        draftStickSettleDeferredUntilTouchEnds = false
+        draftStickSettleDeferredVisualBaseline = nil
+        deliverDraftStickToMapSettledConsumingState()
+    }
+
+    private func tryFinishDeferredDraftStickDeliver() {
+        guard draftStickSettleDeferredUntilTouchEnds else { return }
+        draftStickSettleDeferredUntilTouchEnds = false
+        draftStickSettleDeferredVisualBaseline = nil
+        deliverDraftStickToMapSettledConsumingState()
+    }
+
+    private func deliverDraftStickToMapSettledConsumingState() {
+        draftStickSettleStabilityPrevious = nil
+        draftStickSettleDeadline = nil
+        draftStickSettleIdleWorkItem?.cancel()
+        draftStickSettleIdleWorkItem = nil
+        draftStickSettleDeferredVisualBaseline = nil
+        if let mapView {
+            draftStickPostRevealSpuriousArmGuardBaseline = MapVisualState(mapView)
+        } else {
+            draftStickPostRevealSpuriousArmGuardBaseline = nil
+        }
+        draftStickToMapSettledRevision &+= 1
     }
 
     private static func visibleMapRectApproximatelyEqual(_ a: MKMapRect, _ b: MKMapRect, relativeTolerance: Double) -> Bool {

@@ -3,6 +3,47 @@ import MapKit
 import SwiftUI
 import UIKit
 
+protocol MapInteractionMapViewTouchDelegate: AnyObject {
+    /// At least one touch on the map (or its subviews) is in **`.began` / `.moved` / `.stationary`** — independent of **`UIGestureRecognizer.state`** gaps during rotate / multi‑touch.
+    func mapInteractionMapView(_ mapView: MapInteractionMapView, directTouchesDownChanged touchesDown: Bool)
+}
+
+/// Subclass used so we can attach a zero‑delay long‑press **probe** that reports real **`UITouch`** phases. Internal map **`UIScrollView`** usually owns hit‑testing, so **`touchesBegan` on `MKMapView`** often never runs.
+final class MapInteractionMapView: MKMapView, UIGestureRecognizerDelegate {
+    weak var interactionTouchDelegate: MapInteractionMapViewTouchDelegate?
+
+    let touchTrackingProbe = UILongPressGestureRecognizer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        touchTrackingProbe.addTarget(self, action: #selector(directTouchProbeChanged(_:)))
+        touchTrackingProbe.minimumPressDuration = 0
+        touchTrackingProbe.cancelsTouchesInView = false
+        touchTrackingProbe.delegate = self
+        addGestureRecognizer(touchTrackingProbe)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    @objc private func directTouchProbeChanged(_ gr: UILongPressGestureRecognizer) {
+        let touchesDown: Bool
+        switch gr.state {
+        case .began, .changed:
+            touchesDown = gr.numberOfTouches > 0
+        default:
+            touchesDown = false
+        }
+        interactionTouchDelegate?.mapInteractionMapView(self, directTouchesDownChanged: touchesDown)
+    }
+}
+
 struct MapViewRepresentable: UIViewRepresentable {
     @Binding var overlays: [OverlayItem]
     var isEditing: Bool
@@ -14,7 +55,8 @@ struct MapViewRepresentable: UIViewRepresentable {
     var onLongPressOverlay: (UUID) -> Void
 
     func makeUIView(context: Context) -> MKMapView {
-        let mapView = MKMapView(frame: .zero)
+        let mapView = MapInteractionMapView(frame: .zero)
+        mapView.interactionTouchDelegate = context.coordinator
         mapView.delegate = context.coordinator
         mapView.showsUserLocation = true
         mapView.userTrackingMode = .none
@@ -51,6 +93,14 @@ struct MapViewRepresentable: UIViewRepresentable {
         context.coordinator.onRequestDismissBrowsingOpacitySlider = onRequestDismissBrowsingOpacitySlider
         context.coordinator.updateBrowsingDismissGesturesEnabled(browsingOpacitySliderExpanded)
         context.coordinator.syncMapObjectsFromBindingUpdate(on: mapView, overlays: overlays)
+        context.coordinator.excludedManipulationTrackingGestureIds = [
+            ObjectIdentifier(longPress),
+            ObjectIdentifier(dismissTap),
+            ObjectIdentifier(dismissPan),
+            ObjectIdentifier(dismissPinch),
+            ObjectIdentifier(mapView.touchTrackingProbe),
+        ]
+        context.coordinator.installMapInteractionTrackingIfNeeded(on: mapView)
         return mapView
     }
 
@@ -62,13 +112,14 @@ struct MapViewRepresentable: UIViewRepresentable {
         context.coordinator.onRequestDismissBrowsingOpacitySlider = onRequestDismissBrowsingOpacitySlider
         context.coordinator.updateBrowsingDismissGesturesEnabled(browsingOpacitySliderExpanded)
         context.coordinator.syncMapObjectsFromBindingUpdate(on: uiView, overlays: overlays)
+        context.coordinator.installMapInteractionTrackingIfNeeded(on: uiView)
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
 
-    final class Coordinator: NSObject, MKMapViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, MKMapViewDelegate, UIGestureRecognizerDelegate, MapInteractionMapViewTouchDelegate {
         weak var mapBridge: MapViewBridge?
 
         var onLongPressOverlay: ((UUID) -> Void)?
@@ -79,6 +130,10 @@ struct MapViewRepresentable: UIViewRepresentable {
 
         private var currentOverlays: [OverlayItem] = []
         private var deferredRegionSyncWorkItem: DispatchWorkItem?
+        private var installedMapInteractionGestureTargets = false
+        private var mapDirectManipRecognizerActiveIds = Set<ObjectIdentifier>()
+        private var installedManipTargetGestureIds = Set<ObjectIdentifier>()
+        var excludedManipulationTrackingGestureIds = Set<ObjectIdentifier>()
 
         func syncMapObjectsFromBindingUpdate(on mapView: MKMapView, overlays: [OverlayItem]) {
             deferredRegionSyncWorkItem?.cancel()
@@ -100,6 +155,63 @@ struct MapViewRepresentable: UIViewRepresentable {
             browsingDismissTapGesture?.isEnabled = enabled
             browsingDismissPanGesture?.isEnabled = enabled
             browsingDismissPinchGesture?.isEnabled = enabled
+        }
+
+        func mapInteractionMapView(_ mapView: MapInteractionMapView, directTouchesDownChanged touchesDown: Bool) {
+            mapBridge?.setMapManipulationFromDirectTouches(touchesDown)
+        }
+
+        /// Attaches **`mapDirectManipState`** to **all** subtree **`UIGestureRecognizer`**s (pan / pinch / rotation / etc.) except excluded app gestures. Runs on every SwiftUI update; **`installedManipTargetGestureIds`** avoids duplicate **`addTarget`**. A one-time delayed pass catches MapKit recognizers created slightly after the scroll view appears.
+        func installMapInteractionTrackingIfNeeded(on mapView: MKMapView) {
+            guard mapView.subviews.compactMap({ $0 as? UIScrollView }).first != nil else {
+                DispatchQueue.main.async { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+                    self.installMapInteractionTrackingIfNeeded(on: mapView)
+                }
+                return
+            }
+            let sel = #selector(mapDirectManipState(_:))
+            addManipTargetsRecursively(on: mapView, selector: sel)
+            refreshGestureManipulationAggregate()
+            if !installedMapInteractionGestureTargets {
+                installedMapInteractionGestureTargets = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+                    self.addManipTargetsRecursively(on: mapView, selector: sel)
+                    self.refreshGestureManipulationAggregate()
+                }
+            }
+        }
+
+        private func addManipTargetsRecursively(on mapView: MKMapView, selector: Selector) {
+            func visit(_ view: UIView) {
+                for gr in view.gestureRecognizers ?? [] {
+                    let id = ObjectIdentifier(gr)
+                    if excludedManipulationTrackingGestureIds.contains(id) { continue }
+                    if installedManipTargetGestureIds.contains(id) { continue }
+                    gr.addTarget(self, action: selector)
+                    installedManipTargetGestureIds.insert(id)
+                }
+                for sub in view.subviews {
+                    visit(sub)
+                }
+            }
+            visit(mapView)
+        }
+
+        private func refreshGestureManipulationAggregate() {
+            mapBridge?.setMapManipulationFromGestureRecognizers(!mapDirectManipRecognizerActiveIds.isEmpty)
+        }
+
+        @objc private func mapDirectManipState(_ gr: UIGestureRecognizer) {
+            let id = ObjectIdentifier(gr)
+            switch gr.state {
+            case .began, .changed:
+                mapDirectManipRecognizerActiveIds.insert(id)
+            default:
+                mapDirectManipRecognizerActiveIds.remove(id)
+            }
+            refreshGestureManipulationAggregate()
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -134,12 +246,12 @@ struct MapViewRepresentable: UIViewRepresentable {
             var anyRasterTileOnMap = false
             for item in overlays where item.corners.count == 4 {
                 let bbox = mapRect(for: item.corners)
+                let display = item.mapDisplayImage
                 let mapOverlay = ImageRasterMapOverlay(
                     overlayID: item.id,
-                    image: item.sourceImage,
-                    cornerCoordinates: item.corners,
+                    image: display,
                     mapBoundingRect: bbox,
-                    largeImage: item.sourceImage.rasterExceedsLargeOverlayPixelThreshold,
+                    largeImage: display.rasterExceedsLargeOverlayPixelThreshold,
                     opacityBag: rasterBag
                 )
                 if shouldDisplayAsMarker(item: item, rasterOverlay: mapOverlay, on: mapView) {
@@ -241,8 +353,17 @@ struct MapViewRepresentable: UIViewRepresentable {
             mapView.deselectAnnotation(marker, animated: false)
         }
 
+        /// Fires when the user **starts** panning/zooming; **`regionDidChangeAnimated`** alone is often too late to hide the stick-to-map draft during the gesture.
+        func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
+            mapBridge?.notifyMapLayoutChanged()
+        }
+
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
             mapBridge?.noteMapRegionChangedWhileWaitingForEdit()
+            mapBridge?.notifyMapLayoutChanged()
+            let sel = #selector(mapDirectManipState(_:))
+            addManipTargetsRecursively(on: mapView, selector: sel)
+            refreshGestureManipulationAggregate()
             deferSyncMapObjectsAfterRegionChange(on: mapView)
         }
 

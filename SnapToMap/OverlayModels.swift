@@ -15,7 +15,10 @@ struct PersistedMapCamera: Codable, Equatable {
 
 struct OverlayItem: Identifiable {
     let id: UUID
+    /// Original photo for re-edit (**«Done»** / lossless).
     let sourceImage: UIImage
+    /// Mercator **bounding-box** texture used by **`ImageRasterMapOverlay`** in browse mode (see **`OverlayMapBake`**).
+    let mapDisplayImage: UIImage
     let corners: [CLLocationCoordinate2D]
     /// Framing at save time; when present, edit mode restores this camera instead of fitting a north-up rect.
     let placementCamera: PersistedMapCamera?

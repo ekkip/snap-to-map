@@ -28,16 +28,13 @@ extension UIImage {
     }
 }
 
-/// Georeferenced image via `MKOverlay` / `MKOverlayRenderer` (similar consumer cost profile to tiled `MKTileOverlay` overlays).
+/// Georeferenced **pre-baked** bitmap via `MKOverlay` / `MKOverlayRenderer` — browse mode draws **`image`** axis-aligned on **`boundingMapRect`** only (no realtime projective work).
 final class ImageRasterMapOverlay: NSObject, MKOverlay {
     let overlayID: UUID
     let image: UIImage
 
-    /// `true` when the source bitmap spans more than **100 megapixels** (see `UIImage.rasterExceedsLargeOverlayPixelThreshold`).
+    /// `true` when the **display** bitmap spans more than **100 megapixels** (see `UIImage.rasterExceedsLargeOverlayPixelThreshold`).
     let largeImage: Bool
-
-    /// Screen placement order when saved: **top-left → top-right → bottom-right → bottom-left** (matches **`ContentView`** draft quad).
-    let cornerCoordinates: [CLLocationCoordinate2D]
 
     private let mapBoundingRect: MKMapRect
     weak var opacityBag: RasterMapOpacityBag?
@@ -45,14 +42,12 @@ final class ImageRasterMapOverlay: NSObject, MKOverlay {
     init(
         overlayID: UUID,
         image: UIImage,
-        cornerCoordinates: [CLLocationCoordinate2D],
         mapBoundingRect: MKMapRect,
         largeImage: Bool,
         opacityBag: RasterMapOpacityBag
     ) {
         self.overlayID = overlayID
         self.image = image
-        self.cornerCoordinates = cornerCoordinates
         self.largeImage = largeImage
         self.mapBoundingRect = mapBoundingRect
         self.opacityBag = opacityBag
@@ -71,133 +66,36 @@ final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
         guard let overlay = overlay as? ImageRasterMapOverlay else { return }
         guard let cgImage = Self.normalizedCGImage(from: overlay.image) else { return }
 
-        let geo = overlay.cornerCoordinates
-        if geo.count == 4 {
-            let mapPts = geo.map { MKMapPoint($0) }
-            guard mapPts.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
-            let cornerClip = quadBoundingMapRect(mapPts).intersection(mapRect)
-            guard !cornerClip.isNull, !cornerClip.isEmpty else { return }
+        let bbox = overlay.boundingMapRect
+        let clipped = bbox.intersection(mapRect)
+        guard !clipped.isNull, !clipped.isEmpty, clipped.size.width > 0, clipped.size.height > 0 else { return }
 
-            let p = mapPts.map { point(for: $0) }
-            guard p.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
+        let destRect = rect(for: clipped)
 
-            let iw = CGFloat(cgImage.width)
-            let ih = CGFloat(cgImage.height)
-            guard iw > 0, ih > 0 else { return }
+        let u0 = (clipped.origin.x - bbox.origin.x) / bbox.size.width
+        let u1 = (clipped.maxX - bbox.origin.x) / bbox.size.width
+        let v0 = (clipped.origin.y - bbox.origin.y) / bbox.size.height
+        let v1 = (clipped.maxY - bbox.origin.y) / bbox.size.height
 
-            ctx.saveGState()
-            defer { ctx.restoreGState() }
-            ctx.addRect(rect(for: cornerClip))
-            ctx.clip()
-            ctx.interpolationQuality = .high
+        let iw = CGFloat(cgImage.width)
+        let ih = CGFloat(cgImage.height)
+        guard iw > 0, ih > 0 else { return }
 
-            // `CGContext.draw` uses a bottom-left origin for the bitmap rect; affines map UIKit-style corners (TL, TR, BL, BR).
-            let uiFromCgBitmapRect = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: ih)
+        let srcRect = CGRect(
+            x: u0 * iw,
+            y: v0 * ih,
+            width: max(u1 - u0, 0) * iw,
+            height: max(v1 - v0, 0) * ih
+        ).integral
+        guard srcRect.width >= 1, srcRect.height >= 1 else { return }
+        guard let cropped = cgImage.cropping(to: srcRect) else { return }
 
-            let m1 = Self.affineImageTLTRBLToPoints(
-                imageWidth: iw,
-                imageHeight: ih,
-                topLeft: p[0],
-                topRight: p[1],
-                bottomLeft: p[3]
-            )
-            ctx.saveGState()
-            ctx.concatenate(m1)
-            ctx.concatenate(uiFromCgBitmapRect)
-            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: iw, height: ih))
-            ctx.restoreGState()
-
-            let m2 = Self.affineImageTRBRBLToPoints(
-                imageWidth: iw,
-                imageHeight: ih,
-                topRight: p[1],
-                bottomRight: p[2],
-                bottomLeft: p[3]
-            )
-            ctx.saveGState()
-            ctx.concatenate(m2)
-            ctx.concatenate(uiFromCgBitmapRect)
-            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: iw, height: ih))
-            ctx.restoreGState()
-        } else {
-            let bbox = overlay.boundingMapRect
-            let clipped = bbox.intersection(mapRect)
-            guard !clipped.isNull, !clipped.isEmpty, clipped.size.width > 0, clipped.size.height > 0 else { return }
-
-            let destRect = rect(for: clipped)
-
-            let u0 = (clipped.origin.x - bbox.origin.x) / bbox.size.width
-            let u1 = (clipped.maxX - bbox.origin.x) / bbox.size.width
-            let v0 = (clipped.origin.y - bbox.origin.y) / bbox.size.height
-            let v1 = (clipped.maxY - bbox.origin.y) / bbox.size.height
-
-            let iw = CGFloat(cgImage.width)
-            let ih = CGFloat(cgImage.height)
-            guard iw > 0, ih > 0 else { return }
-
-            let srcRect = CGRect(
-                x: u0 * iw,
-                y: v0 * ih,
-                width: max(u1 - u0, 0) * iw,
-                height: max(v1 - v0, 0) * ih
-            ).integral
-            guard srcRect.width >= 1, srcRect.height >= 1 else { return }
-            guard let cropped = cgImage.cropping(to: srcRect) else { return }
-
-            ctx.saveGState()
-            defer { ctx.restoreGState() }
-            // Opacity is applied via **`MKOverlayRenderer.alpha`** (see **`MapViewBridge.applyRasterOverlayRendererAlphas`**) so slider changes
-            // composite smoothly without re-running this heavyweight draw on every drag frame (unlike SwiftUI `.opacity` on the edit overlay).
-            ctx.interpolationQuality = .high
-            ctx.translateBy(x: destRect.minX, y: destRect.maxY)
-            ctx.scaleBy(x: 1, y: -1)
-            let localDest = CGRect(origin: .zero, size: destRect.size)
-            ctx.draw(cropped, in: localDest)
-        }
-    }
-
-    /// `CGAffineTransform` maps image top-left **(0,0)**, top-right **(w,0)**, bottom-left **(0,h)** (UIKit-style bitmap) onto **`pTL` / `pTR` / `pBL`** in renderer coordinates.
-    private static func affineImageTLTRBLToPoints(
-        imageWidth w: CGFloat,
-        imageHeight h: CGFloat,
-        topLeft pTL: CGPoint,
-        topRight pTR: CGPoint,
-        bottomLeft pBL: CGPoint
-    ) -> CGAffineTransform {
-        let tx = pTL.x
-        let ty = pTL.y
-        let a = (pTR.x - pTL.x) / w
-        let b = (pTR.y - pTL.y) / w
-        let c = (pBL.x - pTL.x) / h
-        let d = (pBL.y - pTL.y) / h
-        return CGAffineTransform(a: a, b: b, c: c, d: d, tx: tx, ty: ty)
-    }
-
-    /// Maps top-right **(w,0)**, bottom-right **(w,h)**, bottom-left **(0,h)** onto **`pTR` / `pBR` / `pBL`**.
-    private static func affineImageTRBRBLToPoints(
-        imageWidth w: CGFloat,
-        imageHeight h: CGFloat,
-        topRight pTR: CGPoint,
-        bottomRight pBR: CGPoint,
-        bottomLeft pBL: CGPoint
-    ) -> CGAffineTransform {
-        let c = (pBR.x - pTR.x) / h
-        let d = (pBR.y - pTR.y) / h
-        let a = (pTR.x - pBL.x + c * h) / w
-        let b = (pTR.y - pBL.y + d * h) / w
-        let tx = pBL.x - c * h
-        let ty = pBL.y - d * h
-        return CGAffineTransform(a: a, b: b, c: c, d: d, tx: tx, ty: ty)
-    }
-
-    private func quadBoundingMapRect(_ pts: [MKMapPoint]) -> MKMapRect {
-        guard let first = pts.first else { return .null }
-        var r = MKMapRect(origin: MKMapPoint(x: first.x, y: first.y), size: MKMapSize(width: 0, height: 0))
-        for p in pts.dropFirst() {
-            let mr = MKMapRect(origin: p, size: MKMapSize(width: 0, height: 0))
-            r = r.union(mr)
-        }
-        return r.isEmpty ? MKMapRect(x: first.x, y: first.y, width: 1, height: 1) : r
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.interpolationQuality = .high
+        ctx.translateBy(x: destRect.minX, y: destRect.maxY)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.draw(cropped, in: CGRect(origin: .zero, size: destRect.size))
     }
 
     /// Renders UIImage with `.up` orientation so sampling matches geographic top/bottom.
@@ -205,6 +103,7 @@ final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
         if image.imageOrientation == .up, let cg = image.cgImage { return cg }
         let format = UIGraphicsImageRendererFormat()
         format.scale = image.scale
+        format.opaque = false
         let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
         let drawn = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
         return drawn.cgImage

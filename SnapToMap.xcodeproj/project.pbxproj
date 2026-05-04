@@ -14,6 +14,7 @@
 		B75CE877AA783FF5FF55098E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2B288C6F420232C2216E201E /* Assets.xcassets */; };
 		C1A2F3E4D5C6B798AABBCCDD /* ImageRasterMapOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B199887766554433221100FF /* ImageRasterMapOverlay.swift */; };
 		DB4E6DB74BFE6E53EA8D431C /* MapViewRepresentable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */; };
+		F7A7B7C7D7E7F70819293A7B /* OverlayMapBake.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */; };
 		E3C3B002F002D002B002C002 /* MapControlChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C2B001F001D001A001B001 /* MapControlChrome.swift */; };
 		E59CACAD388ECE0E6EBF9E77 /* PicToMapApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9498F353B016CE0333FC7F4A /* PicToMapApp.swift */; };
 /* End PBXBuildFile section */
@@ -30,6 +31,7 @@
 		A0152501D7FD80FEE395C167 /* MapViewBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewBridge.swift; sourceTree = "<group>"; };
 		B199887766554433221100FF /* ImageRasterMapOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageRasterMapOverlay.swift; sourceTree = "<group>"; };
 		E2C2B001F001D001A001B001 /* MapControlChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapControlChrome.swift; sourceTree = "<group>"; };
+		F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMapBake.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -44,6 +46,7 @@
 				7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */,
 				E2C2B001F001D001A001B001 /* MapControlChrome.swift */,
 				73FB23DC65473206083E68C0 /* OverlayModels.swift */,
+				F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */,
 				9498F353B016CE0333FC7F4A /* PicToMapApp.swift */,
 				97413E7C29CCF406980DCC60 /* Preview Content */,
 			);
@@ -146,6 +149,7 @@
 				E3C3B002F002D002B002C002 /* MapControlChrome.swift in Sources */,
 				C1A2F3E4D5C6B798AABBCCDD /* ImageRasterMapOverlay.swift in Sources */,
 				99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */,
+				F7A7B7C7D7E7F70819293A7B /* OverlayMapBake.swift in Sources */,
 				E59CACAD388ECE0E6EBF9E77 /* PicToMapApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
