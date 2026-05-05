@@ -22,6 +22,8 @@ struct OverlayItem: Identifiable {
     let corners: [CLLocationCoordinate2D]
     /// Framing at save time; when present, edit mode restores this camera instead of fitting a north-up rect.
     let placementCamera: PersistedMapCamera?
+    /// Camera-roll file bytes from **`PhotosPicker`** when available; written to **`sourceImageData`** as-is on first save (no re-encode). Cleared after a successful disk save to limit RAM.
+    var preservedSourceFileData: Data?
 }
 
 struct PersistedOverlays: Codable {

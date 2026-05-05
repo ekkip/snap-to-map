@@ -30,11 +30,13 @@ struct ContentView: View {
     @State private var browserOpacitySliderCollapsed: Bool = true
     @State private var warpedDraftCGImage: CGImage?
     @State private var primaryCTAShowsActivity: Bool = false
+    /// Bytes from **`PhotosPicker`** (`Data.self`); copied into Core Data on first save without recompression.
+    @State private var draftSourceFileData: Data?
+    /// Nested saves bump this (e.g. rapid actions); indicator stays until all complete.
+    @State private var overlayPersistenceInFlight: Int = 0
     @StateObject private var mapBridge = MapViewBridge()
+    private let persistence = PersistenceController.shared
     private let ciContext = CIContext()
-
-    private let overlaysMetadataFilename = "saved-overlays.json"
-    private let overlaysDirectoryName = "overlay-images"
     private let distortHandleDiameter: CGFloat = 31
     /// Fade warped draft **image** and **corner quad** during map motion in stick-to-map mode; 50 ms each way.
     private let draftMapMotionFadeDuration: TimeInterval = 0.05
@@ -126,7 +128,7 @@ struct ContentView: View {
             }
             /// **`bottomLeading`** (opacity) is applied **before** this overlay so the trailing edit column stays **above** it in hit‑testing / drawing order.
             .overlay(alignment: .bottomTrailing) {
-                bottomTrailingEditHUD(canvas: geometry.size, bottomInset: geometry.safeAreaInsets.bottom)
+                bottomTrailingChrome(canvas: geometry.size, bottomInset: geometry.safeAreaInsets.bottom)
                     .zIndex(10)
             }
             .animation(.easeInOut(duration: 0.2), value: isEditing)
@@ -239,40 +241,56 @@ struct ContentView: View {
         .padding(.bottom, bottomInset + 8)
     }
 
-    /// Bottom-trailing: reset-distort above cancel. User-location stays under compass.
+    /// Bottom-trailing: persistence spinner, then reset-distort above cancel when editing.
     @ViewBuilder
-    private func bottomTrailingEditHUD(canvas: CGSize, bottomInset: CGFloat) -> some View {
-        if isEditing {
+    private func bottomTrailingChrome(canvas: CGSize, bottomInset: CGFloat) -> some View {
+        if overlayPersistenceInFlight > 0 || isEditing {
             VStack(alignment: .trailing, spacing: 8) {
-                if hasCornerEdits {
-                    chromeIconButton(icon: "arrow.counterclockwise", fontSize: 20, hitFlushAlignment: .trailing) {
+                if overlayPersistenceInFlight > 0 {
+                    overlayPersistenceSavingIndicator
+                }
+                if isEditing {
+                    if hasCornerEdits {
+                        chromeIconButton(icon: "arrow.counterclockwise", fontSize: 20, hitFlushAlignment: .trailing) {
+                            collapseBrowsingOpacitySliderIfNeeded()
+                            resetDraftQuad(for: canvas)
+                        }
+                    }
+                    chromeIconButton(icon: draftAnchoredToMap ? "lock.fill" : "lock.open.fill", fontSize: 20, hitFlushAlignment: .trailing) {
                         collapseBrowsingOpacitySliderIfNeeded()
-                        resetDraftQuad(for: canvas)
+                        draftAnchoredToMap.toggle()
+                        if !draftAnchoredToMap {
+                            cancelDraftMapMotionSettledDebounce()
+                            resetDraftMapMotionFadeState()
+                        }
+                        if draftAnchoredToMap {
+                            syncDraftGeoFromScreenQuad(canvas: canvas)
+                            syncDraftQuadFromGeo(canvas: canvas)
+                        } else {
+                            syncDraftQuadFromGeo(canvas: canvas)
+                        }
+                        updateWarpedDraftCache(canvas: canvas)
                     }
-                }
-                chromeIconButton(icon: draftAnchoredToMap ? "lock.fill" : "lock.open.fill", fontSize: 20, hitFlushAlignment: .trailing) {
-                    collapseBrowsingOpacitySliderIfNeeded()
-                    draftAnchoredToMap.toggle()
-                    if !draftAnchoredToMap {
-                        cancelDraftMapMotionSettledDebounce()
-                        resetDraftMapMotionFadeState()
+                    chromeIconButton(icon: "xmark", fontSize: 20, hitFlushAlignment: .trailing) {
+                        collapseBrowsingOpacitySliderIfNeeded()
+                        cancelEditing()
                     }
-                    if draftAnchoredToMap {
-                        syncDraftGeoFromScreenQuad(canvas: canvas)
-                        syncDraftQuadFromGeo(canvas: canvas)
-                    } else {
-                        syncDraftQuadFromGeo(canvas: canvas)
-                    }
-                    updateWarpedDraftCache(canvas: canvas)
-                }
-                chromeIconButton(icon: "xmark", fontSize: 20, hitFlushAlignment: .trailing) {
-                    collapseBrowsingOpacitySliderIfNeeded()
-                    cancelEditing()
                 }
             }
             .simultaneousGesture(TapGesture().onEnded { collapseBrowsingOpacitySliderIfNeeded() })
             .padding(.trailing, 16)
             .padding(.bottom, bottomInset + 8)
+        }
+    }
+
+    private var overlayPersistenceSavingIndicator: some View {
+        TimelineView(.animation(minimumInterval: 1 / 30)) { context in
+            let degrees = (context.date.timeIntervalSinceReferenceDate * (360.0 / 1.35)).truncatingRemainder(dividingBy: 360)
+            Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90.circle.fill")
+                .font(.system(size: 26, weight: .medium))
+                .foregroundStyle(Color.primary)
+                .rotationEffect(.degrees(degrees))
+                .accessibilityLabel("Saving")
         }
     }
 
@@ -397,6 +415,7 @@ struct ContentView: View {
             await MainActor.run {
                 mapBridge.cancelPendingEditFit()
                 draftImage = image
+                draftSourceFileData = data
                 draftAnchoredToMap = false
                 draftGeoCorners = []
                 initialDraftGeoCorners = []
@@ -522,54 +541,65 @@ struct ContentView: View {
             corners = draftQuad.map { mapView.convert($0, toCoordinateFrom: mapView) }
         }
         let overlayID = editingOverlayBackup?.id ?? UUID()
+        let preservedPick = draftSourceFileData
 
-        if draftImage.rasterExceedsLargeOverlayPixelThreshold {
-            primaryCTAShowsActivity = true
-            Task { @MainActor in
-                await Task.yield()
-                await Task.yield()
-                finishSaveDraftAsOverlay(draftImage: draftImage, corners: corners, overlayID: overlayID)
-            }
-        } else {
-            finishSaveDraftAsOverlay(draftImage: draftImage, corners: corners, overlayID: overlayID)
-        }
-    }
-
-    private func finishSaveDraftAsOverlay(draftImage: UIImage, corners: [CLLocationCoordinate2D], overlayID: UUID) {
         mapBridge.cancelPendingEditFit()
         finalizeDraftRasterOpacityGestureEnd()
-
-        let mapDisplayImage = OverlayMapBake.bakeMercatorDisplayTexture(source: draftImage, corners: corners) ?? draftImage
-        overlays.append(
-            OverlayItem(
-                id: overlayID,
-                sourceImage: draftImage,
-                mapDisplayImage: mapDisplayImage,
-                corners: corners,
-                placementCamera: persistMapCameraSnapshot()
-            )
-        )
-
-        self.draftImage = nil
-        draftQuad = []
-        initialDraftQuad = []
-        draftAnchoredToMap = false
-        draftGeoCorners = []
-        initialDraftGeoCorners = []
-        editingOverlayBackup = nil
-
-        browserOpacitySliderCollapsed = true
-        isEditing = false
-        selectedItem = nil
-        finalizeBrowsingRasterOpacityInteraction()
-        persistOverlaysSkippingUnchangedImages(forceRewriteBaked: true)
         primaryCTAShowsActivity = false
+        overlayPersistenceInFlight += 1
+
+        Task {
+            let mapDisplayImage = await Task.detached(priority: .userInitiated) {
+                OverlayMapBake.bakeMercatorDisplayTexture(source: draftImage, corners: corners) ?? draftImage
+            }.value
+            let placementCamera = await MainActor.run { persistMapCameraSnapshot() }
+            await MainActor.run {
+                overlays.append(
+                    OverlayItem(
+                        id: overlayID,
+                        sourceImage: draftImage,
+                        mapDisplayImage: mapDisplayImage,
+                        corners: corners,
+                        placementCamera: placementCamera,
+                        preservedSourceFileData: preservedPick
+                    )
+                )
+
+                self.draftImage = nil
+                draftSourceFileData = nil
+                draftQuad = []
+                initialDraftQuad = []
+                draftAnchoredToMap = false
+                draftGeoCorners = []
+                initialDraftGeoCorners = []
+                editingOverlayBackup = nil
+
+                browserOpacitySliderCollapsed = true
+                isEditing = false
+                selectedItem = nil
+                finalizeBrowsingRasterOpacityInteraction()
+
+                let snap = overlays
+                OverlayLibrary.saveOverlays(
+                    snap,
+                    in: persistence.container,
+                    forceRewriteSource: false,
+                    forceRewriteBaked: false
+                ) { _ in
+                    if let idx = overlays.firstIndex(where: { $0.id == overlayID }) {
+                        overlays[idx].preservedSourceFileData = nil
+                    }
+                    overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
+                }
+            }
+        }
     }
 
     private func cancelEditing() {
         mapBridge.cancelPendingEditFit()
         primaryCTAShowsActivity = false
         draftImage = nil
+        draftSourceFileData = nil
         draftQuad = []
         initialDraftQuad = []
         draftAnchoredToMap = false
@@ -583,13 +613,14 @@ struct ContentView: View {
         selectedItem = nil
         browserOpacitySliderCollapsed = true
         finalizeBrowsingRasterOpacityInteraction()
-        persistOverlaysSkippingUnchangedImages()
+        persistOverlaysToStore()
     }
 
     private func removeEditingOverlay() {
         mapBridge.cancelPendingEditFit()
         primaryCTAShowsActivity = false
         draftImage = nil
+        draftSourceFileData = nil
         draftQuad = []
         initialDraftQuad = []
         draftAnchoredToMap = false
@@ -600,7 +631,7 @@ struct ContentView: View {
         selectedItem = nil
         browserOpacitySliderCollapsed = true
         finalizeBrowsingRasterOpacityInteraction()
-        persistOverlaysSkippingUnchangedImages()
+        persistOverlaysToStore()
     }
 
     private func beginEditingOverlay(id: UUID) {
@@ -653,6 +684,7 @@ struct ContentView: View {
         }
 
         draftImage = overlay.sourceImage
+        draftSourceFileData = nil
         draftAnchoredToMap = true
         draftGeoCorners = overlay.corners
         initialDraftGeoCorners = overlay.corners
@@ -684,177 +716,26 @@ struct ContentView: View {
         )
     }
 
-    /// Writes **`saved-overlays.json`** always; source rasters when missing or **`forceRewriteAllImages`**;
-    /// baked Mercator browse textures when missing, when **`forceRewriteBaked`** (e.g. after save), or with **`forceRewriteAllImages`**.
-    /// Cancel / Delete therefore avoid **`jpegData`/`pngData`** on unchanged on-disk overlays.
-    private func persistOverlaysSkippingUnchangedImages(forceRewriteAllImages: Bool = false, forceRewriteBaked: Bool = false) {
-        struct PersistRow: Sendable {
-            let id: UUID
-            let imageBytes: Data?
-            let bakedBytes: Data?
-            let corners: [PersistedCoordinate]
-            let placementCamera: PersistedMapCamera?
-            let imageFileURL: URL
-            let bakedFileURL: URL
+    private func persistOverlaysToStore(forceRewriteSource: Bool = false, forceRewriteBaked: Bool = false) {
+        let snapshot = overlays
+        overlayPersistenceInFlight += 1
+        OverlayLibrary.saveOverlays(
+            snapshot,
+            in: persistence.container,
+            forceRewriteSource: forceRewriteSource,
+            forceRewriteBaked: forceRewriteBaked
+        ) { _ in
+            overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
         }
-
-        let directoryURL = overlaysDirectoryURL()
-        let metadataURL = overlaysMetadataURL()
-
-        var rows: [PersistRow] = []
-        rows.reserveCapacity(overlays.count)
-        var activeRelativeNames = Set<String>()
-
-        let fm = FileManager.default
-        for o in overlays {
-            let imageURL = directoryURL.appendingPathComponent(Self.overlayImageFilename(id: o.id))
-            let bakedURL = directoryURL.appendingPathComponent(Self.overlayBakedImageFilename(id: o.id))
-            activeRelativeNames.insert(imageURL.lastPathComponent)
-            activeRelativeNames.insert(bakedURL.lastPathComponent)
-
-            let needsImageWrite = forceRewriteAllImages || !fm.fileExists(atPath: imageURL.path)
-            let needsBakedWrite =
-                forceRewriteBaked || forceRewriteAllImages || !fm.fileExists(atPath: bakedURL.path)
-            let encoded: Data? = needsImageWrite
-                ? (o.sourceImage.jpegData(compressionQuality: 0.92) ?? o.sourceImage.pngData())
-                : nil
-            let bakedEncoded: Data? = needsBakedWrite
-                ? (o.mapDisplayImage.pngData() ?? o.mapDisplayImage.jpegData(compressionQuality: 0.92))
-                : nil
-
-            rows.append(PersistRow(
-                id: o.id,
-                imageBytes: encoded,
-                bakedBytes: bakedEncoded,
-                corners: o.corners.map { PersistedCoordinate(latitude: $0.latitude, longitude: $0.longitude) },
-                placementCamera: o.placementCamera,
-                imageFileURL: imageURL,
-                bakedFileURL: bakedURL
-            ))
-        }
-
-        Task.detached(priority: .utility) {
-            do {
-                try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-
-                let currentFiles = (try? fm.contentsOfDirectory(
-                    at: directoryURL,
-                    includingPropertiesForKeys: nil
-                )) ?? []
-                for fileURL in currentFiles where !activeRelativeNames.contains(fileURL.lastPathComponent) {
-                    try? fm.removeItem(at: fileURL)
-                }
-
-                var entries: [PersistedOverlayEntry] = []
-                entries.reserveCapacity(rows.count)
-
-                for row in rows {
-                    if let bytes = row.imageBytes {
-                        try bytes.write(to: row.imageFileURL, options: [.atomic])
-                    }
-                    if let baked = row.bakedBytes {
-                        try baked.write(to: row.bakedFileURL, options: [.atomic])
-                        let legacyJpg = row.bakedFileURL.deletingLastPathComponent()
-                            .appendingPathComponent("\(row.id.uuidString)-baked.jpg")
-                        try? fm.removeItem(at: legacyJpg)
-                    }
-                    entries.append(PersistedOverlayEntry(
-                        id: row.id,
-                        corners: row.corners,
-                        placementCamera: row.placementCamera
-                    ))
-                }
-
-                let metadataData = try JSONEncoder().encode(PersistedOverlays(entries: entries))
-                try metadataData.write(to: metadataURL, options: [.atomic])
-            } catch {
-                // Keep this intentionally silent for the simple demo app.
-            }
-        }
-    }
-
-
-
-    private static func overlayImageFilename(id: UUID) -> String {
-        "\(id.uuidString).png"
-    }
-
-    private static func overlayBakedImageFilename(id: UUID) -> String {
-        "\(id.uuidString)-baked.png"
-    }
-
-    private static func overlayLegacyBakedJpegFilename(id: UUID) -> String {
-        "\(id.uuidString)-baked.jpg"
     }
 
     private func restorePersistedOverlay() {
         isEditing = false
-
-        guard let metadataData = try? Data(contentsOf: overlaysMetadataURL()) else {
-            overlays = []
-            return
-        }
-
-        let persisted: PersistedOverlays
         do {
-            persisted = try JSONDecoder().decode(PersistedOverlays.self, from: metadataData)
+            overlays = try OverlayLibrary.loadOverlays(viewContext: persistence.container.viewContext)
         } catch {
             overlays = []
-            return
         }
-
-        let directoryURL = overlaysDirectoryURL()
-
-        var restored: [OverlayItem] = []
-        restored.reserveCapacity(persisted.entries.count)
-
-        for entry in persisted.entries {
-            guard entry.corners.count == 4 else {
-                overlays = []
-                return
-            }
-
-            let imageURL = directoryURL.appendingPathComponent(Self.overlayImageFilename(id: entry.id))
-            guard let imageData = try? Data(contentsOf: imageURL),
-                  let sourceImage = UIImage(data: imageData) else {
-                overlays = []
-                return
-            }
-
-            let corners = entry.corners.map {
-                CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
-            }
-            let bakedPNGURL = directoryURL.appendingPathComponent(Self.overlayBakedImageFilename(id: entry.id))
-            let bakedLegacyJPGURL = directoryURL.appendingPathComponent(Self.overlayLegacyBakedJpegFilename(id: entry.id))
-            let mapDisplayImage: UIImage
-            if let url = [bakedPNGURL, bakedLegacyJPGURL].first(where: { FileManager.default.fileExists(atPath: $0.path) }),
-               let bakedData = try? Data(contentsOf: url),
-               let baked = UIImage(data: bakedData) {
-                mapDisplayImage = baked
-            } else {
-                mapDisplayImage =
-                    OverlayMapBake.bakeMercatorDisplayTexture(source: sourceImage, corners: corners) ?? sourceImage
-            }
-            restored.append(
-                OverlayItem(
-                    id: entry.id,
-                    sourceImage: sourceImage,
-                    mapDisplayImage: mapDisplayImage,
-                    corners: corners,
-                    placementCamera: entry.placementCamera
-                )
-            )
-        }
-
-        overlays = restored
-    }
-
-    private func overlaysMetadataURL() -> URL {
-        documentsDirectory().appendingPathComponent(overlaysMetadataFilename)
-    }
-
-    private func overlaysDirectoryURL() -> URL {
-        documentsDirectory().appendingPathComponent(overlaysDirectoryName, isDirectory: true)
     }
 
     private func collapseBrowsingOpacitySliderIfNeeded() {
@@ -894,9 +775,5 @@ struct ContentView: View {
         }
 
         mapBridge.applyRasterOverlayRendererAlphas()
-    }
-
-    private func documentsDirectory() -> URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 }

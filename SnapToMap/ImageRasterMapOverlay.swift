@@ -1,5 +1,4 @@
 import CoreGraphics
-import CoreLocation
 import MapKit
 import UIKit
 
@@ -28,12 +27,12 @@ extension UIImage {
     }
 }
 
-/// Georeferenced **pre-baked** bitmap via `MKOverlay` / `MKOverlayRenderer` — browse mode draws **`image`** axis-aligned on **`boundingMapRect`** only (no realtime projective work).
+/// Georeferenced image via `MKOverlay` / `MKOverlayRenderer` (similar consumer cost profile to tiled `MKTileOverlay` overlays).
 final class ImageRasterMapOverlay: NSObject, MKOverlay {
     let overlayID: UUID
     let image: UIImage
 
-    /// `true` when the **display** bitmap spans more than **100 megapixels** (see `UIImage.rasterExceedsLargeOverlayPixelThreshold`).
+    /// `true` when the source bitmap spans more than **100 megapixels** (see `UIImage.rasterExceedsLargeOverlayPixelThreshold`).
     let largeImage: Bool
 
     private let mapBoundingRect: MKMapRect
@@ -64,11 +63,10 @@ final class ImageRasterMapOverlay: NSObject, MKOverlay {
 final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
     override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in ctx: CGContext) {
         guard let overlay = overlay as? ImageRasterMapOverlay else { return }
-        guard let cgImage = Self.normalizedCGImage(from: overlay.image) else { return }
-
         let bbox = overlay.boundingMapRect
         let clipped = bbox.intersection(mapRect)
         guard !clipped.isNull, !clipped.isEmpty, clipped.size.width > 0, clipped.size.height > 0 else { return }
+        guard let cgImage = Self.normalizedCGImage(from: overlay.image) else { return }
 
         let destRect = rect(for: clipped)
 
@@ -92,10 +90,13 @@ final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
 
         ctx.saveGState()
         defer { ctx.restoreGState() }
+        // Opacity is applied via **`MKOverlayRenderer.alpha`** (see **`MapViewBridge.applyRasterOverlayRendererAlphas`**) so slider changes
+        // composite smoothly without re-running this heavyweight draw on every drag frame (unlike SwiftUI `.opacity` on the edit overlay).
         ctx.interpolationQuality = .high
         ctx.translateBy(x: destRect.minX, y: destRect.maxY)
         ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(cropped, in: CGRect(origin: .zero, size: destRect.size))
+        let localDest = CGRect(origin: .zero, size: destRect.size)
+        ctx.draw(cropped, in: localDest)
     }
 
     /// Renders UIImage with `.up` orientation so sampling matches geographic top/bottom.
@@ -103,7 +104,6 @@ final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
         if image.imageOrientation == .up, let cg = image.cgImage { return cg }
         let format = UIGraphicsImageRendererFormat()
         format.scale = image.scale
-        format.opaque = false
         let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
         let drawn = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
         return drawn.cgImage

@@ -87,8 +87,12 @@ enum OverlayMapBake {
         guard rectToRender.width >= 2, rectToRender.height >= 2 else { return nil }
 
         let ctx = CIContext(options: [.highQualityDownsample: true])
-        guard let cgOut = ctx.createCGImage(composited, from: rectToRender) else { return nil }
-        return UIImage(cgImage: cgOut, scale: 1, orientation: .up)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        if let cgOut = ctx.createCGImage(composited, from: rectToRender, format: .RGBA8, colorSpace: colorSpace) {
+            return UIImage(cgImage: cgOut, scale: 1, orientation: .up)
+        }
+        guard let cgFallback = ctx.createCGImage(composited, from: rectToRender) else { return nil }
+        return UIImage(cgImage: cgFallback, scale: 1, orientation: .up)
     }
 
     private static func downscaleCIIfNeeded(_ input: CIImage, maxDimension: CGFloat) -> CIImage {
@@ -106,6 +110,7 @@ enum OverlayMapBake {
         if image.imageOrientation == .up, let cg = image.cgImage { return cg }
         let format = UIGraphicsImageRendererFormat()
         format.scale = image.scale
+        format.opaque = false
         let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
         let drawn = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
         return drawn.cgImage

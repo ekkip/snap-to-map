@@ -101,8 +101,11 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     @Published private(set) var isAnyRasterMapOverlayOnMap: Bool = false
 
     func updateRasterTileOverlayPresence(_ anyRasterVisible: Bool) {
-        if isAnyRasterMapOverlayOnMap != anyRasterVisible {
-            isAnyRasterMapOverlayOnMap = anyRasterVisible
+        guard isAnyRasterMapOverlayOnMap != anyRasterVisible else { return }
+        let value = anyRasterVisible
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isAnyRasterMapOverlayOnMap != value else { return }
+            self.isAnyRasterMapOverlayOnMap = value
         }
     }
 
@@ -110,8 +113,11 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     @Published private(set) var displayedMapRastersAreAllLargeImage: Bool = false
 
     func updateDisplayedMapRastersAreAllLargeImage(_ allLarge: Bool) {
-        if displayedMapRastersAreAllLargeImage != allLarge {
-            displayedMapRastersAreAllLargeImage = allLarge
+        guard displayedMapRastersAreAllLargeImage != allLarge else { return }
+        let value = allLarge
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.displayedMapRastersAreAllLargeImage != value else { return }
+            self.displayedMapRastersAreAllLargeImage = value
         }
     }
 
@@ -128,7 +134,9 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     private var mapManipulationFromDirectTouches = false
 
     func notifyMapLayoutChanged() {
-        mapLayoutRevision &+= 1
+        DispatchQueue.main.async { [weak self] in
+            self?.mapLayoutRevision &+= 1
+        }
     }
 
     /// Set when **`armEditTransitionAfterMapSettles`** is waiting on region quiescence; **`ContentView`** applies and clears **`mapEditHandoff`**.
