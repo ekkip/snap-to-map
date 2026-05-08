@@ -9,12 +9,14 @@ enum OverlayLibrary {
 
     private static let metadataFilename = "saved-overlays.json"
     private static let imagesDirectoryName = "overlay-images"
+    private static let bakedImagesDirectoryName = "derived-baked-images"
+    private static let bakedTileCacheDirectoryName = "snap-to-map-tile-cache"
     /// Compared in **degrees**; avoids false “corner changed” when JSON text differs only in float formatting (which forced a **full baked re-encode + source HEIC** pass on cancel/save).
     private static let cornerEqualityEpsilonDegrees: CLLocationDegrees = 1e-7
     /// Caps baked storage footprint for standard overlays (~9.4 MP; equivalent to 3072²).
     private static let bakedPersistencePixelBudget: CGFloat = 9_437_184
-    /// Baked storage budget for very large overlays (~268 MP; equivalent to 16384²).
-    private static let bakedPersistencePixelBudgetHighRes: CGFloat = 268_435_456
+    /// Baked storage budget for very large overlays (~67 MP; equivalent to 8192²).
+    private static let bakedPersistencePixelBudgetHighRes: CGFloat = 67_108_864
     /// Source raster size threshold that switches bake/persistence into high-res budgets.
     static let largeRasterOverlayPixelThresholdExclusive: Int64 = 100_000_000
     private static let bakedDownscaleCIContext = CIContext(options: [.highQualityDownsample: true])
@@ -83,20 +85,29 @@ enum OverlayLibrary {
         }
     }
 
-    /// Maintenance utility: removes all persisted baked blobs so they are regenerated from source images on next load/save.
+    /// Maintenance utility: removes all baked-derived disk data (and optionally tile-cache files) so imagery is regenerated from source data.
     @discardableResult
-    static func clearAllBakedImageData(context: NSManagedObjectContext) throws -> Int {
-        let fr = StoredMapOverlay.fetchRequest()
-        fr.predicate = NSPredicate(format: "bakedImageData != nil")
-        let rows = try context.fetch(fr)
-        guard !rows.isEmpty else { return 0 }
-        let now = Date()
-        for row in rows {
-            row.bakedImageData = nil
-            row.modifiedAt = now
+    static func clearAllBakedDerivedData(context: NSManagedObjectContext, clearTileCache: Bool = false) throws -> Int {
+        clearAllBakedImagesFromDisk()
+        if clearTileCache {
+            clearBakedTileCacheFromDisk()
         }
-        try context.save()
-        return rows.count
+        return 0
+    }
+
+    static func clearBakedTileCacheFromDisk() {
+        let fm = FileManager.default
+        let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)
+        guard let root = caches.first?.appendingPathComponent(bakedTileCacheDirectoryName, isDirectory: true) else { return }
+        guard fm.fileExists(atPath: root.path) else { return }
+        try? fm.removeItem(at: root)
+    }
+
+    static func clearAllBakedImagesFromDisk() {
+        let fm = FileManager.default
+        let root = bakedImagesDirectoryURL()
+        guard fm.fileExists(atPath: root.path) else { return }
+        try? fm.removeItem(at: root)
     }
 
     /// Loads overlay rows. Pass **`intersectingMapRect`** to fetch only rows whose stored bounds overlap the map viewport (skips loading off-screen blobs from SQLite where possible).
@@ -134,7 +145,7 @@ enum OverlayLibrary {
             let mapDisplay: UIImage
             if sourceImage.rasterExceedsLargeOverlayPixelThreshold {
                 let bakedOK: UIImage? = {
-                    guard let baked = row.bakedImageData,
+                    guard let baked = bakedImageDataFromDisk(id: uuid),
                           let img = UIImage(data: baked),
                           bakedImageLikelyPreservesAlpha(img) else { return nil }
                     let bakedPixels = (img.size.width * img.scale) * (img.size.height * img.scale)
@@ -145,7 +156,7 @@ enum OverlayLibrary {
                 } else {
                     mapDisplay = OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: sourceImage, corners: corners) ?? sourceImage
                 }
-            } else if let baked = row.bakedImageData,
+            } else if let baked = bakedImageDataFromDisk(id: uuid),
                       let img = UIImage(data: baked),
                       bakedImageLikelyPreservesAlpha(img) {
                 mapDisplay = img
@@ -240,7 +251,8 @@ enum OverlayLibrary {
     /// Always writes source rows as **HEIC**.
     private static func encodeSourceImage(_ image: UIImage) throws -> Data {
         let q = heifQualityForMegapixels(of: image, baseQuality: heifQualitySourceBase)
-        guard let heic = BakedHEIFEncoder.encodeLossyWithAlpha(image: image, quality: q) else {
+        // Source photos are typically opaque; encode without alpha to reduce decode RAM and file size.
+        guard let heic = BakedHEIFEncoder.encodeLossy(image: image, quality: q, preserveAlpha: false) else {
             throw OverlayEncodeError.heicSourceEncodeFailed
         }
         return heic
@@ -333,6 +345,7 @@ enum OverlayLibrary {
         let active = Set(overlays.map(\.id))
         for row in existing {
             guard let id = row.uuid, !active.contains(id) else { continue }
+            removeBakedImageFromDisk(id: id)
             context.delete(row)
             byId.removeValue(forKey: id)
         }
@@ -365,16 +378,24 @@ enum OverlayLibrary {
             // Source bytes only when missing or forced — **not** when only corners/camera change (_pixels unchanged).
             // Baked mercator texture depends on **quad corners** only; **`placementCamera`** is map framing metadata and must not force a baked HEIC re-encode (that was making “cancel” / placement-only saves as slow as a full bake).
             let needsSourceWrite = forceRewriteSource || row.sourceImageData == nil
-            let needsBakedWrite = forceRewriteBaked || cornersChanged || row.bakedImageData == nil
+            let needsBakedWrite = forceRewriteBaked || cornersChanged || !bakedImageExistsOnDisk(id: o.id)
 
             let sourceBlob: Data?
             let bakedBlob: Data?
             switch (needsSourceWrite, needsBakedWrite) {
             case (true, true):
-                sourceBlob = try Self.encodeSourceImage(o.sourceImage)
+                if let preserved = o.preservedSourceFileData {
+                    sourceBlob = preserved
+                } else {
+                    sourceBlob = try Self.encodeSourceImage(o.sourceImage)
+                }
                 bakedBlob = try Self.encodeBakedImage(o.mapDisplayImage)
             case (true, false):
-                sourceBlob = try Self.encodeSourceImage(o.sourceImage)
+                if let preserved = o.preservedSourceFileData {
+                    sourceBlob = preserved
+                } else {
+                    sourceBlob = try Self.encodeSourceImage(o.sourceImage)
+                }
                 bakedBlob = nil
             case (false, true):
                 sourceBlob = nil
@@ -388,7 +409,7 @@ enum OverlayLibrary {
                 row.sourceImageData = sourceBlob
             }
             if let bakedBlob {
-                row.bakedImageData = bakedBlob
+                writeBakedImageDataToDisk(bakedBlob, id: o.id)
             }
 
             byId[o.id] = row
@@ -444,5 +465,35 @@ enum OverlayLibrary {
             size: MKMapSize(width: w + 2 * mx, height: h + 2 * my)
         )
         return expanded.intersection(MKMapRect.world)
+    }
+
+    private static func bakedImagesDirectoryURL() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent(bakedImagesDirectoryName, isDirectory: true)
+    }
+
+    private static func bakedImageFileURL(id: UUID) -> URL {
+        bakedImagesDirectoryURL().appendingPathComponent("\(id.uuidString).heic", isDirectory: false)
+    }
+
+    private static func bakedImageDataFromDisk(id: UUID) -> Data? {
+        try? Data(contentsOf: bakedImageFileURL(id: id))
+    }
+
+    private static func bakedImageExistsOnDisk(id: UUID) -> Bool {
+        FileManager.default.fileExists(atPath: bakedImageFileURL(id: id).path)
+    }
+
+    private static func writeBakedImageDataToDisk(_ data: Data, id: UUID) {
+        let fm = FileManager.default
+        let dir = bakedImagesDirectoryURL()
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? data.write(to: bakedImageFileURL(id: id), options: .atomic)
+    }
+
+    private static func removeBakedImageFromDisk(id: UUID) {
+        let url = bakedImageFileURL(id: id)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 }

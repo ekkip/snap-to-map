@@ -9,12 +9,14 @@ import UIKit
 enum OverlayMapBake {
     /// Default baked-output budget (~16.8 MP; equivalent to 4096²).
     private static let defaultOutputPixelBudget: CGFloat = 16_777_216
-    /// Larger baked-output budget for heavy sources (~268 MP; equivalent to 16384²).
-    private static let highResOutputPixelBudget: CGFloat = 268_435_456
+    /// Larger baked-output budget for heavy sources (~67 MP; equivalent to 8192²).
+    /// Keeps browse detail high while avoiding 1+ GB transient RGBA allocations for 400 MP-class imports.
+    private static let highResOutputPixelBudget: CGFloat = 67_108_864
     /// Default CI input budget before perspective warp (~67 MP; equivalent to 8192²).
     private static let defaultSourceCIPixelBudget: CGFloat = 67_108_864
-    /// CI input budget for very large source rasters (~1.07 GP; equivalent to 32768²).
-    private static let highResSourceCIPixelBudget: CGFloat = 1_073_741_824
+    /// CI input budget for very large source rasters (~134 MP; equivalent to 11585²).
+    /// This prevents full-resolution perspective filtering on extremely large camera images.
+    private static let highResSourceCIPixelBudget: CGFloat = 134_217_728
 
     static func mapBoundingMapRect(for coordinates: [CLLocationCoordinate2D]) -> MKMapRect {
         let points = coordinates.map { MKMapPoint($0) }

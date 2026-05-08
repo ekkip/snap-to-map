@@ -11,7 +11,19 @@ enum BakedHEIFEncoder {
 
     /// `quality` is **0…1** (`kCGImageDestinationLossyCompressionQuality`). Preserves alpha when the image has it.
     static func encodeLossyWithAlpha(image: UIImage, quality: CGFloat) -> Data? {
+        encodeLossy(image: image, quality: quality, preserveAlpha: true)
+    }
+
+    /// `quality` is **0…1** (`kCGImageDestinationLossyCompressionQuality`).
+    /// Set `preserveAlpha` to `false` for opaque-only payloads to avoid alpha-channel memory overhead.
+    static func encodeLossy(image: UIImage, quality: CGFloat, preserveAlpha: Bool) -> Data? {
         guard let cgImage = normalizedCGImageForEncode(from: image) else { return nil }
+        let imageForEncode: CGImage
+        if preserveAlpha {
+            imageForEncode = cgImage
+        } else {
+            imageForEncode = rgbImageDroppingAlphaIfPresent(cgImage) ?? cgImage
+        }
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
             data,
@@ -23,10 +35,29 @@ enum BakedHEIFEncoder {
         let props: [CFString: Any] = [
             kCGImageDestinationLossyCompressionQuality: q,
         ]
-        CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
+        CGImageDestinationAddImage(dest, imageForEncode, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         guard (data as Data).count > 0 else { return nil }
         return data as Data
+    }
+
+    private static func rgbImageDroppingAlphaIfPresent(_ image: CGImage) -> CGImage? {
+        let alphaInfo = image.alphaInfo
+        let alreadyOpaque = alphaInfo == .none || alphaInfo == .noneSkipFirst || alphaInfo == .noneSkipLast
+        if alreadyOpaque { return image }
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil,
+                  width: image.width,
+                  height: image.height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: cs,
+                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+              ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return ctx.makeImage()
     }
 
     private static func normalizedCGImageForEncode(from image: UIImage) -> CGImage? {

@@ -1,6 +1,9 @@
 import CoreGraphics
+import CoreImage
+import ImageIO
 import MapKit
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - Protocol
 
@@ -23,6 +26,9 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
     let overlayID: UUID
     let image: UIImage
     private let imageBoundingMapRect: MKMapRect
+    private let tileCache: TileCache
+    private let transparentTileDataByScale = NSCache<NSString, NSData>()
+    private static let tileDecodeCIContext = CIContext(options: [.highQualityDownsample: true])
 
     weak var opacityBag: RasterMapOpacityBag?
 
@@ -33,9 +39,15 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         self.image = image
         self.imageBoundingMapRect = mapBoundingRect
         self.opacityBag = opacityBag
+        self.tileCache = TileCache(
+            overlayID: overlayID,
+            image: image,
+            mapBoundingRect: mapBoundingRect
+        )
         super.init(urlTemplate: "snap-to-map-baked://local")
         canReplaceMapContent = false
         tileSize = CGSize(width: 256, height: 256)
+        maximumZ = 22
     }
 
     @available(*, unavailable)
@@ -50,25 +62,17 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
     }
 
     override func loadTile(at path: MKTileOverlayPath, result: @escaping (Data?, (any Error)?) -> Void) {
-        let tileRect = Self.mapRect(for: path, geometryFlipped: isGeometryFlipped)
-        let bbox = imageBoundingMapRect
-        let clipped = bbox.intersection(tileRect)
-        if clipped.isNull || clipped.isEmpty || clipped.size.width <= 0 || clipped.size.height <= 0 {
-            result(Self.transparentTilePNG(points: tileSize, scale: path.contentScaleFactor), nil)
-            return
+        tileCache.loadTile(path: path, tileSize: tileSize, geometryFlipped: isGeometryFlipped) { [weak self] data in
+            guard let self else {
+                result(nil, nil)
+                return
+            }
+            guard let data else {
+                result(self.transparentTilePNG(points: self.tileSize, scale: path.contentScaleFactor), nil)
+                return
+            }
+            result(data, nil)
         }
-        guard let data = Self.pngTileData(
-            image: image,
-            tileRect: tileRect,
-            bbox: bbox,
-            clipped: clipped,
-            tileSize: tileSize,
-            contentScale: path.contentScaleFactor
-        ) else {
-            result(Self.transparentTilePNG(points: tileSize, scale: path.contentScaleFactor), nil)
-            return
-        }
-        result(data, nil)
     }
 
     /// Mercator **`MKMapRect`** covered by **`path`** (same tiling as **`MKTileOverlay`** / `MKMapRect.world`).
@@ -85,26 +89,28 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         return MKMapRect(origin: MKMapPoint(x: ox, y: oy), size: MKMapSize(width: tileW, height: tileH))
     }
 
-    private static func transparentTilePNG(points: CGSize, scale: CGFloat) -> Data {
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = scale
-        format.opaque = false
-        let renderer = UIGraphicsImageRenderer(size: points, format: format)
-        let img = renderer.image { _ in }
-        return img.pngData() ?? Data()
+    private func transparentTilePNG(points: CGSize, scale: CGFloat) -> Data {
+        let key = NSString(string: "transparent-\(Int((scale * 100).rounded()))")
+        if let cached = transparentTileDataByScale.object(forKey: key) {
+            return cached as Data
+        }
+        let pxW = max(1, Int((points.width * scale).rounded()))
+        let pxH = max(1, Int((points.height * scale).rounded()))
+        let data = Self.transparentPNGData(width: pxW, height: pxH) ?? Data()
+        transparentTileDataByScale.setObject(data as NSData, forKey: key)
+        return data
     }
 
     private static func pngTileData(
-        image: UIImage,
+        sourceCGImage: CGImage,
         tileRect: MKMapRect,
         bbox: MKMapRect,
         clipped: MKMapRect,
         tileSize: CGSize,
         contentScale: CGFloat
     ) -> Data? {
-        guard let cgImage = normalizedCGImage(from: image) else { return nil }
-        let iw = CGFloat(cgImage.width)
-        let ih = CGFloat(cgImage.height)
+        let iw = CGFloat(sourceCGImage.width)
+        let ih = CGFloat(sourceCGImage.height)
         guard iw > 0, ih > 0 else { return nil }
 
         let u0 = CGFloat((clipped.origin.x - bbox.origin.x) / bbox.size.width)
@@ -119,42 +125,336 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
             height: max(v1 - v0, 0) * ih
         ).integral
         guard srcRect.width >= 1, srcRect.height >= 1,
-              let cropped = cgImage.cropping(to: srcRect) else {
+              let cropped = sourceCGImage.cropping(to: srcRect) else {
             return nil
         }
 
         let tw = max(tileRect.width, 1)
         let th = max(tileRect.height, 1)
-        let ow = tileSize.width
-        let oh = tileSize.height
+        let ow = max(1, CGFloat((tileSize.width * contentScale).rounded()))
+        let oh = max(1, CGFloat((tileSize.height * contentScale).rounded()))
         let dx = CGFloat((clipped.origin.x - tileRect.origin.x) / tw) * ow
         let dy = CGFloat((clipped.origin.y - tileRect.origin.y) / th) * oh
         let dw = CGFloat(clipped.size.width / tw) * ow
         let dh = CGFloat(clipped.size.height / th) * oh
         guard dw >= 0.5, dh >= 0.5 else { return nil }
 
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = contentScale
-        format.opaque = false
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: ow, height: oh), format: format)
-        let out = renderer.image { ctx in
-            let c = ctx.cgContext
-            c.interpolationQuality = .high
-            c.translateBy(x: dx, y: dy + dh)
-            c.scaleBy(x: 1, y: -1)
-            c.draw(cropped, in: CGRect(x: 0, y: 0, width: dw, height: dh))
-        }
-        return out.pngData()
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil,
+                  width: Int(ow),
+                  height: Int(oh),
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.clear(CGRect(x: 0, y: 0, width: ow, height: oh))
+        let drawY = oh - (dy + dh)
+        ctx.draw(cropped, in: CGRect(x: dx, y: drawY, width: dw, height: dh))
+        guard let out = ctx.makeImage() else { return nil }
+        return encodePNG(cgImage: out)
     }
 
-    private static func normalizedCGImage(from image: UIImage) -> CGImage? {
-        if image.imageOrientation == .up, let cg = image.cgImage { return cg }
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = image.scale
-        format.opaque = false
-        let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
-        let drawn = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
-        return drawn.cgImage
+    private static func encodePNG(cgImage: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return data as Data
+    }
+
+    private static func transparentPNGData(width: Int, height: Int) -> Data? {
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil,
+                  width: width,
+                  height: height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ),
+              let cg = ctx.makeImage() else { return nil }
+        return encodePNG(cgImage: cg)
+    }
+
+    /// Lazy tile pyramid cache: first request renders/encodes the tile, subsequent requests hit memory or disk.
+    private final class TileCache {
+        private struct ClampedRequest {
+            let z: Int
+            let x: Int
+            let y: Int
+            let shift: Int
+            let childX: Int
+            let childY: Int
+            let scale100: Int
+        }
+
+        private let overlayID: UUID
+        private let sourceCGImage: CGImage
+        private let mapBoundingRect: MKMapRect
+        private let nativeMaxZ: Int
+        private let memoryCache = NSCache<NSString, NSData>()
+        private let ioQueue = DispatchQueue(label: "snap-to-map.tile-cache", qos: .userInitiated, attributes: .concurrent)
+        private let fm = FileManager.default
+        private let cacheRootURL: URL
+
+        init(overlayID: UUID, image: UIImage, mapBoundingRect: MKMapRect) {
+            self.overlayID = overlayID
+            self.mapBoundingRect = mapBoundingRect
+            // Tile path must stay CoreGraphics-only; rely on pre-decoded CGImage.
+            if let cg = image.cgImage {
+                self.sourceCGImage = cg
+            } else if let ci = CIImage(image: image) {
+                let extent = ci.extent.integral
+                if extent.width >= 1, extent.height >= 1,
+                   let decoded = BakedImageMapTileOverlay.tileDecodeCIContext.createCGImage(ci, from: extent) {
+                    self.sourceCGImage = decoded
+                } else {
+                    self.sourceCGImage = Self.make1x1TransparentCGImage()
+                }
+            } else {
+                self.sourceCGImage = Self.make1x1TransparentCGImage()
+            }
+            self.cacheRootURL = Self.makeCacheRootURL(overlayID: overlayID, image: image, mapBoundingRect: mapBoundingRect)
+            self.nativeMaxZ = Self.computeNativeMaxZoomLevel(
+                sourceCGImage: self.sourceCGImage,
+                mapBoundingRect: mapBoundingRect,
+                tileSizePoints: 256,
+                screenScale: UIScreen.main.scale
+            )
+            self.memoryCache.countLimit = 512
+            self.memoryCache.totalCostLimit = 64 * 1024 * 1024
+            try? fm.createDirectory(at: cacheRootURL, withIntermediateDirectories: true)
+        }
+
+        func loadTile(path: MKTileOverlayPath, tileSize: CGSize, geometryFlipped: Bool, completion: @escaping (Data?) -> Void) {
+            ioQueue.async {
+                let key = self.cacheKey(path: path)
+                if let mem = self.memoryCache.object(forKey: key) {
+                    completion(mem as Data)
+                    return
+                }
+                let diskURL = self.diskURL(path: path)
+                if let disk = try? Data(contentsOf: diskURL) {
+                    self.storeInMemory(disk, key: key)
+                    completion(disk)
+                    return
+                }
+                let req = self.clampedRequest(for: path)
+                let clampedPath = MKTileOverlayPath(
+                    x: req.x,
+                    y: req.y,
+                    z: req.z,
+                    contentScaleFactor: path.contentScaleFactor
+                )
+                guard let base = self.loadOrRenderExactTile(path: clampedPath, tileSize: tileSize, geometryFlipped: geometryFlipped) else {
+                    completion(nil)
+                    return
+                }
+                let served: Data?
+                if req.shift == 0 {
+                    served = base
+                } else {
+                    served = Self.makeOverzoomedChildTile(
+                        parentTileData: base,
+                        shift: req.shift,
+                        childX: req.childX,
+                        childY: req.childY,
+                        contentScale: path.contentScaleFactor,
+                        tileSize: tileSize
+                    )
+                }
+                guard let served else {
+                    completion(nil)
+                    return
+                }
+                self.storeInMemory(served, key: key)
+                // Do not persist overzoom children as deeper z/x/y tiles on disk.
+                // Disk cache should stop at native/clamped tile levels.
+                if req.shift == 0 {
+                    self.storeOnDisk(served, at: diskURL)
+                }
+                completion(served)
+            }
+        }
+
+        private func clampedRequest(for path: MKTileOverlayPath) -> ClampedRequest {
+            let z = min(path.z, nativeMaxZ)
+            let shift = max(0, path.z - z)
+            let scale = 1 << shift
+            let x = path.x / scale
+            let y = path.y / scale
+            let childMask = (1 << shift) - 1
+            let childX = shift == 0 ? 0 : (path.x & childMask)
+            let childY = shift == 0 ? 0 : (path.y & childMask)
+            let scale100 = Int((path.contentScaleFactor * 100).rounded())
+            return ClampedRequest(z: z, x: x, y: y, shift: shift, childX: childX, childY: childY, scale100: scale100)
+        }
+
+        private func loadOrRenderExactTile(path: MKTileOverlayPath, tileSize: CGSize, geometryFlipped: Bool) -> Data? {
+            let key = cacheKey(path: path)
+            if let mem = memoryCache.object(forKey: key) {
+                return mem as Data
+            }
+            let url = diskURL(path: path)
+            if let disk = try? Data(contentsOf: url) {
+                storeInMemory(disk, key: key)
+                return disk
+            }
+            let tileRect = BakedImageMapTileOverlay.mapRect(for: path, geometryFlipped: geometryFlipped)
+            let clipped = mapBoundingRect.intersection(tileRect)
+            guard !clipped.isNull, !clipped.isEmpty, clipped.size.width > 0, clipped.size.height > 0 else {
+                return nil
+            }
+            guard let data = BakedImageMapTileOverlay.pngTileData(
+                sourceCGImage: sourceCGImage,
+                tileRect: tileRect,
+                bbox: mapBoundingRect,
+                clipped: clipped,
+                tileSize: tileSize,
+                contentScale: path.contentScaleFactor
+            ) else {
+                return nil
+            }
+            storeInMemory(data, key: key)
+            storeOnDisk(data, at: url)
+            return data
+        }
+
+        private static func computeNativeMaxZoomLevel(
+            sourceCGImage: CGImage,
+            mapBoundingRect: MKMapRect,
+            tileSizePoints: CGFloat,
+            screenScale: CGFloat
+        ) -> Int {
+            let pxW = max(1, CGFloat(sourceCGImage.width))
+            let pxH = max(1, CGFloat(sourceCGImage.height))
+            let bw = max(1, CGFloat(mapBoundingRect.size.width))
+            let bh = max(1, CGFloat(mapBoundingRect.size.height))
+            let sourcePixelsPerMapPoint = min(pxW / bw, pxH / bh)
+            let tilePixels = max(1, tileSizePoints * max(1, screenScale))
+            let world = CGFloat(MKMapRect.world.size.width)
+            let raw = log2((sourcePixelsPerMapPoint * world) / tilePixels)
+            guard raw.isFinite else { return 0 }
+            return max(0, Int(floor(raw)))
+        }
+
+        private static func makeCacheRootURL(overlayID: UUID, image: UIImage, mapBoundingRect: MKMapRect) -> URL {
+            let cacheBase = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            let sig = cacheSignature(image: image, mapBoundingRect: mapBoundingRect)
+            return cacheBase
+                .appendingPathComponent("snap-to-map-tile-cache", isDirectory: true)
+                .appendingPathComponent(overlayID.uuidString, isDirectory: true)
+                .appendingPathComponent(sig, isDirectory: true)
+        }
+
+        private static func cacheSignature(image: UIImage, mapBoundingRect: MKMapRect) -> String {
+            let pxW = Int((image.size.width * image.scale).rounded())
+            let pxH = Int((image.size.height * image.scale).rounded())
+            func q(_ v: Double) -> Int64 { Int64((v * 1_000_000).rounded()) }
+            return "v6-\(pxW)x\(pxH)-\(q(mapBoundingRect.origin.x))-\(q(mapBoundingRect.origin.y))-\(q(mapBoundingRect.size.width))-\(q(mapBoundingRect.size.height))"
+        }
+
+        private func cacheKey(path: MKTileOverlayPath) -> NSString {
+            let scale = Int((path.contentScaleFactor * 100).rounded())
+            return NSString(string: "\(path.z)/\(path.x)/\(path.y)@\(scale)")
+        }
+
+        private func diskURL(path: MKTileOverlayPath) -> URL {
+            let scale = Int((path.contentScaleFactor * 100).rounded())
+            return cacheRootURL
+                .appendingPathComponent("z\(path.z)", isDirectory: true)
+                .appendingPathComponent("x\(path.x)", isDirectory: true)
+                .appendingPathComponent("y\(path.y)@\(scale).png", isDirectory: false)
+        }
+
+        private func storeInMemory(_ data: Data, key: NSString) {
+            memoryCache.setObject(data as NSData, forKey: key, cost: data.count)
+        }
+
+        private func storeOnDisk(_ data: Data, at url: URL) {
+            let dir = url.deletingLastPathComponent()
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
+
+        private static func makeOverzoomedChildTile(
+            parentTileData: Data,
+            shift: Int,
+            childX: Int,
+            childY: Int,
+            contentScale: CGFloat,
+            tileSize: CGSize
+        ) -> Data? {
+            guard shift > 0,
+                  let src = CGImageSourceCreateWithData(parentTileData as CFData, nil),
+                  let parentCG = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+            let pw = max(1, parentCG.width)
+            let ph = max(1, parentCG.height)
+            let n = 1 << shift
+            let sx = CGFloat(childX) * (CGFloat(pw) / CGFloat(n))
+            let sy = CGFloat(childY) * (CGFloat(ph) / CGFloat(n))
+            let sw = CGFloat(pw) / CGFloat(n)
+            let sh = CGFloat(ph) / CGFloat(n)
+            let srcRect = CGRect(x: sx, y: sy, width: sw, height: sh)
+                .integral
+                .intersection(CGRect(x: 0, y: 0, width: pw, height: ph))
+            guard srcRect.width >= 1, srcRect.height >= 1,
+                  let cropped = parentCG.cropping(to: srcRect),
+                  let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+            let outW = Int(max(1, (tileSize.width * contentScale).rounded()))
+            let outH = Int(max(1, (tileSize.height * contentScale).rounded()))
+            guard let ctx = CGContext(
+                data: nil,
+                width: outW,
+                height: outH,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return nil }
+            ctx.interpolationQuality = .high
+            ctx.clear(CGRect(x: 0, y: 0, width: outW, height: outH))
+            ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+            guard let out = ctx.makeImage() else { return nil }
+            return BakedImageMapTileOverlay.encodePNG(cgImage: out)
+        }
+
+        private static func make1x1TransparentCGImage() -> CGImage {
+            let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+            let ctx = CGContext(
+                data: nil,
+                width: 1,
+                height: 1,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: cs,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+            if let img = ctx?.makeImage() { return img }
+            let bytes: [UInt8] = [0, 0, 0, 0]
+            let data = Data(bytes)
+            if let provider = CGDataProvider(data: data as CFData),
+               let img = CGImage(
+                   width: 1,
+                   height: 1,
+                   bitsPerComponent: 8,
+                   bitsPerPixel: 32,
+                   bytesPerRow: 4,
+                   space: cs,
+                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                   provider: provider,
+                   decode: nil,
+                   shouldInterpolate: false,
+                   intent: .defaultIntent
+               ) {
+                return img
+            }
+            fatalError("Failed to create fallback transparent CGImage")
+        }
     }
 }
 

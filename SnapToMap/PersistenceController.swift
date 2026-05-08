@@ -3,9 +3,9 @@ import CoreData
 /// Local Core Data stack (no CloudKit yet). Use **`NSPersistentCloudKitContainer`** later with the same model name.
 final class PersistenceController {
     static let shared = PersistenceController()
-    /// Optional startup maintenance pass for rebuilding baked textures from source rows.
-    /// Keep `false` for normal app runs; set to `true` when you want to clear stale baked blobs.
-    private static let clearAllBakedDataAtStartup = false
+    /// Optional startup maintenance pass for rebuilding baked-derived disk assets from source rows.
+    /// Keep `false` for normal app runs; set to `true` when you want to clear stale baked files/tiles.
+    private static let clearAllBakedDataAtStartup = true
 
     let container: NSPersistentContainer
     private var saveObserver: NSObjectProtocol?
@@ -35,7 +35,7 @@ final class PersistenceController {
         container.viewContext.performAndWait {
             try? OverlayLibrary.migrateOverlayBoundingBoxesIfNeeded(context: container.viewContext)
             if Self.clearAllBakedDataAtStartup {
-                _ = try? OverlayLibrary.clearAllBakedImageData(context: container.viewContext)
+                _ = try? OverlayLibrary.clearAllBakedDerivedData(context: container.viewContext, clearTileCache: true)
             }
         }
 
