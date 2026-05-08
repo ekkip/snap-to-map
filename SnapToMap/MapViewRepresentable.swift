@@ -3,6 +3,15 @@ import MapKit
 import SwiftUI
 import UIKit
 
+extension MKMapRect: @retroactive Equatable {
+    public static func == (lhs: MKMapRect, rhs: MKMapRect) -> Bool {
+        lhs.origin.x == rhs.origin.x &&
+        lhs.origin.y == rhs.origin.y &&
+        lhs.size.width == rhs.size.width &&
+        lhs.size.height == rhs.size.height
+    }
+}
+
 protocol MapInteractionMapViewTouchDelegate: AnyObject {
     /// At least one touch on the map (or its subviews) is in **`.began` / `.moved` / `.stationary`** — independent of **`UIGestureRecognizer.state`** gaps during rotate / multi‑touch.
     func mapInteractionMapView(_ mapView: MapInteractionMapView, directTouchesDownChanged touchesDown: Bool)
@@ -236,40 +245,91 @@ struct MapViewRepresentable: UIViewRepresentable {
         func applySyncMapObjects(on mapView: MKMapView, overlays: [OverlayItem]) {
             guard let rasterBag = mapBridge?.rasterOpacity else { return }
             currentOverlays = overlays
-            mapView.overlays
-                .compactMap { $0 as? ImageRasterMapOverlay }
-                .forEach { mapView.removeOverlay($0) }
-            mapView.annotations
-                .compactMap { $0 as? OverlayMarkerAnnotation }
-                .forEach { mapView.removeAnnotation($0) }
+            let quadItems = overlays.filter { $0.corners.count == 4 }
+            let cullViewport = expandedVisibleMapRectForCulling(on: mapView)
+            let itemsToMount = quadItems.filter { mapRect(for: $0.corners).intersects(cullViewport) }
+
+            let existingRasterByID = Dictionary(uniqueKeysWithValues: mapView.overlays.compactMap { overlay -> (UUID, SnapRasterMapOverlay)? in
+                guard let snap = overlay as? SnapRasterMapOverlay else { return nil }
+                return (snap.overlayID, snap)
+            })
+            let existingMarkerByID = Dictionary(uniqueKeysWithValues: mapView.annotations.compactMap { ann -> (UUID, OverlayMarkerAnnotation)? in
+                guard let marker = ann as? OverlayMarkerAnnotation else { return nil }
+                return (marker.overlayID, marker)
+            })
+
+            let desiredIDs = Set(itemsToMount.map(\.id))
+            let desiredRasterIDs = Set(itemsToMount.compactMap { item -> UUID? in
+                let bbox = mapRect(for: item.corners)
+                return shouldDisplayAsMarker(item: item, bbox: bbox, on: mapView) ? nil : item.id
+            })
+            let desiredMarkerIDs = desiredIDs.subtracting(desiredRasterIDs)
+
+            for (id, existing) in existingRasterByID where !desiredRasterIDs.contains(id) {
+                mapView.removeOverlay(existing)
+            }
+            for (id, existing) in existingMarkerByID where !desiredMarkerIDs.contains(id) {
+                mapView.removeAnnotation(existing)
+            }
 
             var anyRasterTileOnMap = false
-            for item in overlays where item.corners.count == 4 {
+            for item in itemsToMount {
                 let bbox = mapRect(for: item.corners)
-                let display = item.mapDisplayImage
-                let mapOverlay = ImageRasterMapOverlay(
+                let displayAsMarker = shouldDisplayAsMarker(item: item, bbox: bbox, on: mapView)
+                if displayAsMarker {
+                    if let existingOverlay = existingRasterByID[item.id] {
+                        mapView.removeOverlay(existingOverlay)
+                    }
+                    if existingMarkerByID[item.id] == nil {
+                        let coord = centerCoordinate(corners: item.corners)
+                        let marker = OverlayMarkerAnnotation(overlayID: item.id, coordinate: coord)
+                        mapView.addAnnotation(marker)
+                    }
+                    continue
+                }
+
+                anyRasterTileOnMap = true
+                if let existingMarker = existingMarkerByID[item.id] {
+                    mapView.removeAnnotation(existingMarker)
+                }
+                if let existingOverlay = existingRasterByID[item.id],
+                   overlayMatches(item: item, bbox: bbox, existing: existingOverlay) {
+                    continue
+                }
+                if let existingOverlay = existingRasterByID[item.id] {
+                    mapView.removeOverlay(existingOverlay)
+                }
+                let presentation = OverlayMapPresentation.make(
                     overlayID: item.id,
-                    image: display,
+                    mapDisplayImage: item.mapDisplayImage,
+                    usesTiledMapPresentation: item.usesTiledMapPresentation,
                     mapBoundingRect: bbox,
-                    largeImage: display.rasterExceedsLargeOverlayPixelThreshold,
                     opacityBag: rasterBag
                 )
-                if shouldDisplayAsMarker(item: item, rasterOverlay: mapOverlay, on: mapView) {
-                    let coord = centerCoordinate(corners: item.corners)
-                    let marker = OverlayMarkerAnnotation(overlayID: item.id, coordinate: coord)
-                    mapView.addAnnotation(marker)
-                } else {
-                    mapView.addOverlay(mapOverlay, level: .aboveLabels)
-                    anyRasterTileOnMap = true
-                }
+                mapView.addOverlay(presentation.mkOverlay, level: .aboveLabels)
             }
             mapBridge?.updateRasterTileOverlayPresence(anyRasterTileOnMap)
-            let mapRasters = mapView.overlays.compactMap { $0 as? ImageRasterMapOverlay }
-            let allDisplayedAreLargeImage = !mapRasters.isEmpty && mapRasters.allSatisfy(\.largeImage)
-            mapBridge?.updateDisplayedMapRastersAreAllLargeImage(allDisplayedAreLargeImage)
+            let snapOverlays = mapView.overlays.compactMap { $0 as? SnapRasterMapOverlay }
+            let allDisplayedAreHeavyOpacity = !snapOverlays.isEmpty && snapOverlays.allSatisfy(\.presentationUsesHeavyOpacityPath)
+            mapBridge?.updateDisplayedMapRastersAreAllLargeImage(allDisplayedAreHeavyOpacity)
             let bridgeRef = mapBridge
             DispatchQueue.main.async {
                 bridgeRef?.applyRasterOverlayRendererAlphas()
+            }
+        }
+
+        private func overlayMatches(item: OverlayItem, bbox: MKMapRect, existing: SnapRasterMapOverlay) -> Bool {
+            guard existing.boundingMapRect == bbox else { return false }
+            if item.usesTiledMapPresentation {
+                guard let tiled = existing as? BakedImageMapTileOverlay else { return false }
+                let oldSize = tiled.image.size
+                let newSize = item.mapDisplayImage.size
+                return abs(oldSize.width - newSize.width) < 0.5 && abs(oldSize.height - newSize.height) < 0.5
+            } else {
+                guard let raster = existing as? ImageRasterMapOverlay else { return false }
+                let oldSize = raster.image.size
+                let newSize = item.mapDisplayImage.size
+                return abs(oldSize.width - newSize.width) < 0.5 && abs(oldSize.height - newSize.height) < 0.5
             }
         }
 
@@ -296,7 +356,23 @@ struct MapViewRepresentable: UIViewRepresentable {
             )
         }
 
-        private func shouldDisplayAsMarker(item: OverlayItem, rasterOverlay: ImageRasterMapOverlay, on mapView: MKMapView) -> Bool {
+        /// Padded visible rect for deciding which overlays get **`MKOverlay`** / marker attachments. Avoids mounting every persisted overlay on every sync (SwiftUI often re-enters **`updateUIView`** without the map moving).
+        private func expandedVisibleMapRectForCulling(on mapView: MKMapView) -> MKMapRect {
+            let v = mapView.visibleMapRect
+            let w = v.size.width
+            let h = v.size.height
+            guard w.isFinite, h.isFinite, w > 0, h > 0 else { return MKMapRect.world }
+            let expansion = 0.12
+            let mx = w * expansion
+            let my = h * expansion
+            let expanded = MKMapRect(
+                origin: MKMapPoint(x: v.origin.x - mx, y: v.origin.y - my),
+                size: MKMapSize(width: w + 2 * mx, height: h + 2 * my)
+            )
+            return expanded.intersection(MKMapRect.world)
+        }
+
+        private func shouldDisplayAsMarker(item: OverlayItem, bbox: MKMapRect, on mapView: MKMapView) -> Bool {
             let projectedCorners = item.corners.map { mapView.convert($0, toPointTo: mapView) }
             guard projectedCorners.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return true }
 
@@ -308,8 +384,8 @@ struct MapViewRepresentable: UIViewRepresentable {
             }
 
             let visibleRect = mapView.visibleMapRect
-            let overlayWidth = max(rasterOverlay.boundingMapRect.width, 1)
-            let overlayHeight = max(rasterOverlay.boundingMapRect.height, 1)
+            let overlayWidth = max(bbox.width, 1)
+            let overlayHeight = max(bbox.height, 1)
             let zoomOutFactor = max(visibleRect.width / overlayWidth, visibleRect.height / overlayHeight)
 
             let overlayScale = CGFloat(max(1.0, log2(max(overlayWidth, overlayHeight) / 2_000)))
@@ -324,6 +400,9 @@ struct MapViewRepresentable: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let raster = overlay as? ImageRasterMapOverlay {
                 return ImageRasterMapOverlayRenderer(overlay: raster)
+            }
+            if let tile = overlay as? BakedImageMapTileOverlay {
+                return MKTileOverlayRenderer(tileOverlay: tile)
             }
             return MKOverlayRenderer(overlay: overlay)
         }
@@ -374,7 +453,7 @@ struct MapViewRepresentable: UIViewRepresentable {
             }
             onRequestDismissBrowsingOpacitySlider?()
             let location = recognizer.location(in: mapView)
-            let overlaysTopFirst = mapView.overlays.compactMap { $0 as? ImageRasterMapOverlay }.reversed()
+            let overlaysTopFirst = mapView.overlays.reversed().compactMap { $0 as? SnapRasterMapOverlay }
             for overlay in overlaysTopFirst {
                 guard let item = currentOverlays.first(where: { $0.id == overlay.overlayID }) else { continue }
                 let polygon = item.corners.map { mapView.convert($0, toPointTo: mapView) }

@@ -3,6 +3,9 @@ import CoreData
 /// Local Core Data stack (no CloudKit yet). Use **`NSPersistentCloudKitContainer`** later with the same model name.
 final class PersistenceController {
     static let shared = PersistenceController()
+    /// Optional startup maintenance pass for rebuilding baked textures from source rows.
+    /// Keep `false` for normal app runs; set to `true` when you want to clear stale baked blobs.
+    private static let clearAllBakedDataAtStartup = false
 
     let container: NSPersistentContainer
     private var saveObserver: NSObjectProtocol?
@@ -12,7 +15,14 @@ final class PersistenceController {
         if inMemory {
             let description = NSPersistentStoreDescription()
             description.url = URL(fileURLWithPath: "/dev/null")
+            description.setOption(true as NSNumber, forKey: NSMigratePersistentStoresAutomaticallyOption)
+            description.setOption(true as NSNumber, forKey: NSInferMappingModelAutomaticallyOption)
             container.persistentStoreDescriptions = [description]
+        } else {
+            for description in container.persistentStoreDescriptions {
+                description.setOption(true as NSNumber, forKey: NSMigratePersistentStoresAutomaticallyOption)
+                description.setOption(true as NSNumber, forKey: NSInferMappingModelAutomaticallyOption)
+            }
         }
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
 
@@ -22,7 +32,12 @@ final class PersistenceController {
             }
         }
 
-        migrateLegacyFilesIfNeeded()
+        container.viewContext.performAndWait {
+            try? OverlayLibrary.migrateOverlayBoundingBoxesIfNeeded(context: container.viewContext)
+            if Self.clearAllBakedDataAtStartup {
+                _ = try? OverlayLibrary.clearAllBakedImageData(context: container.viewContext)
+            }
+        }
 
         saveObserver = NotificationCenter.default.addObserver(
             forName: .NSManagedObjectContextDidSave,
@@ -39,23 +54,6 @@ final class PersistenceController {
     deinit {
         if let saveObserver {
             NotificationCenter.default.removeObserver(saveObserver)
-        }
-    }
-
-    /// Run before any UI loads overlays so **`restore`** sees imported rows.
-    private func migrateLegacyFilesIfNeeded() {
-        container.viewContext.performAndWait {
-            do {
-                let didImport = try OverlayLibrary.importLegacyJSONAndPNGsIfStoreEmpty(context: container.viewContext)
-                if container.viewContext.hasChanges {
-                    try container.viewContext.save()
-                    if didImport {
-                        OverlayLibrary.deleteLegacyOverlayFileBundleIfPresent()
-                    }
-                }
-            } catch {
-                container.viewContext.rollback()
-            }
         }
     }
 }

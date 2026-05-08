@@ -7,10 +7,14 @@ import UIKit
 
 /// One-time “bake” of **`source`** + geographic quad into a **Mercator axis-aligned** texture keyed to **`boundingMapRect`**, so **`MKMapView`** browse mode only stretches a rectangle (no per-frame projective work).
 enum OverlayMapBake {
-    /// Longest output side; keeps memory bounded (~16 MP at 4096).
-    private static let defaultMaxOutputDimension: Int = 4096
-    /// Downsample source before **`CIPerspectiveTransform`** so multi‑hundred‑MP inputs do not peak device RAM.
-    private static let maxSourceDimensionForCI: CGFloat = 8192
+    /// Default baked-output budget (~16.8 MP; equivalent to 4096²).
+    private static let defaultOutputPixelBudget: CGFloat = 16_777_216
+    /// Larger baked-output budget for heavy sources (~268 MP; equivalent to 16384²).
+    private static let highResOutputPixelBudget: CGFloat = 268_435_456
+    /// Default CI input budget before perspective warp (~67 MP; equivalent to 8192²).
+    private static let defaultSourceCIPixelBudget: CGFloat = 67_108_864
+    /// CI input budget for very large source rasters (~1.07 GP; equivalent to 32768²).
+    private static let highResSourceCIPixelBudget: CGFloat = 1_073_741_824
 
     static func mapBoundingMapRect(for coordinates: [CLLocationCoordinate2D]) -> MKMapRect {
         let points = coordinates.map { MKMapPoint($0) }
@@ -26,11 +30,25 @@ enum OverlayMapBake {
         )
     }
 
+    /// Picks bake limits from **`source`** so browse texture and tiling see enough pixels to matter.
+    static func bakeMercatorDisplayTextureForBrowse(source: UIImage, corners: [CLLocationCoordinate2D]) -> UIImage? {
+        if source.rasterExceedsLargeOverlayPixelThreshold {
+            return bakeMercatorDisplayTexture(
+                source: source,
+                corners: corners,
+                outputPixelBudget: highResOutputPixelBudget,
+                sourceCIPixelBudget: highResSourceCIPixelBudget
+            )
+        }
+        return bakeMercatorDisplayTexture(source: source, corners: corners)
+    }
+
     /// Builds the map browse texture; **`nil`** only if geometry/CG conversion fails.
     static func bakeMercatorDisplayTexture(
         source: UIImage,
         corners: [CLLocationCoordinate2D],
-        maxOutputDimension: Int = defaultMaxOutputDimension
+        outputPixelBudget: CGFloat = defaultOutputPixelBudget,
+        sourceCIPixelBudget: CGFloat = defaultSourceCIPixelBudget
     ) -> UIImage? {
         guard corners.count == 4, let cgIn = normalizedCGImage(from: source) else { return nil }
         let bbox = mapBoundingMapRect(for: corners)
@@ -41,18 +59,10 @@ enum OverlayMapBake {
         guard bw.isFinite, bh.isFinite, bw > 0, bh > 0 else { return nil }
 
         let aspect = bw / bh
-        let W: Int
-        let H: Int
-        if aspect >= 1 {
-            W = maxOutputDimension
-            H = max(1, Int((Double(maxOutputDimension) / Double(aspect)).rounded(.toNearestOrAwayFromZero)))
-        } else {
-            H = maxOutputDimension
-            W = max(1, Int((Double(maxOutputDimension) * Double(aspect)).rounded(.toNearestOrAwayFromZero)))
-        }
+        let (W, H) = outputSizeForAspect(aspect, pixelBudget: outputPixelBudget)
 
         var ci = CIImage(cgImage: cgIn)
-        ci = downscaleCIIfNeeded(ci, maxDimension: maxSourceDimensionForCI)
+        ci = downscaleCIIfNeeded(ci, pixelBudget: sourceCIPixelBudget)
 
         let mapPts = corners.map { MKMapPoint($0) }
         let ciH = CGFloat(H)
@@ -95,13 +105,24 @@ enum OverlayMapBake {
         return UIImage(cgImage: cgFallback, scale: 1, orientation: .up)
     }
 
-    private static func downscaleCIIfNeeded(_ input: CIImage, maxDimension: CGFloat) -> CIImage {
+    private static func outputSizeForAspect(_ aspect: Double, pixelBudget: CGFloat) -> (Int, Int) {
+        let safeAspect = max(CGFloat(1e-6), CGFloat(aspect.isFinite ? aspect : 1))
+        let budget = max(1, pixelBudget)
+        let w = sqrt(budget * safeAspect)
+        let h = sqrt(budget / safeAspect)
+        return (max(1, Int(w.rounded(.toNearestOrAwayFromZero))),
+                max(1, Int(h.rounded(.toNearestOrAwayFromZero))))
+    }
+
+    private static func downscaleCIIfNeeded(_ input: CIImage, pixelBudget: CGFloat) -> CIImage {
         let e = input.extent
         let w = e.width
         let h = e.height
-        let m = max(w, h)
-        guard m > maxDimension, m > 0 else { return input }
-        let s = maxDimension / m
+        guard w > 0, h > 0 else { return input }
+        let pixels = w * h
+        let budget = max(1, pixelBudget)
+        guard pixels > budget else { return input }
+        let s = sqrt(budget / pixels)
         let scaled = input.transformed(by: CGAffineTransform(scaleX: s, y: s))
         return scaled.transformed(by: CGAffineTransform(translationX: -scaled.extent.origin.x, y: -scaled.extent.origin.y))
     }

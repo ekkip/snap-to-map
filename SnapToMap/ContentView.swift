@@ -550,7 +550,7 @@ struct ContentView: View {
 
         Task {
             let mapDisplayImage = await Task.detached(priority: .userInitiated) {
-                OverlayMapBake.bakeMercatorDisplayTexture(source: draftImage, corners: corners) ?? draftImage
+                OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: draftImage, corners: corners) ?? draftImage
             }.value
             let placementCamera = await MainActor.run { persistMapCameraSnapshot() }
             await MainActor.run {
@@ -586,10 +586,12 @@ struct ContentView: View {
                     forceRewriteSource: false,
                     forceRewriteBaked: false
                 ) { _ in
-                    if let idx = overlays.firstIndex(where: { $0.id == overlayID }) {
-                        overlays[idx].preservedSourceFileData = nil
+                    Task { @MainActor in
+                        if let idx = overlays.firstIndex(where: { $0.id == overlayID }) {
+                            overlays[idx].preservedSourceFileData = nil
+                        }
+                        overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
                     }
-                    overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
                 }
             }
         }
@@ -640,7 +642,7 @@ struct ContentView: View {
             return
         }
 
-        primaryCTAShowsActivity = overlay.sourceImage.rasterExceedsLargeOverlayPixelThreshold
+        primaryCTAShowsActivity = overlay.usesTiledMapPresentation
 
         if let cam = overlay.placementCamera {
             mapBridge.armEditTransitionAfterMapSettles(for: overlay, expectedVisibleMapRect: nil)
@@ -725,7 +727,9 @@ struct ContentView: View {
             forceRewriteSource: forceRewriteSource,
             forceRewriteBaked: forceRewriteBaked
         ) { _ in
-            overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
+            Task { @MainActor in
+                overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
+            }
         }
     }
 

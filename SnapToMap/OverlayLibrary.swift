@@ -1,6 +1,7 @@
 import CoreData
 import CoreLocation
 import CoreImage
+import MapKit
 import UIKit
 
 /// Loads, saves, and migrates overlay data. Replaces ad-hoc `saved-overlays.json` + `overlay-images/`.
@@ -10,24 +11,24 @@ enum OverlayLibrary {
     private static let imagesDirectoryName = "overlay-images"
     /// Compared in **degrees**; avoids false “corner changed” when JSON text differs only in float formatting (which forced a **full baked re-encode + source HEIC** pass on cancel/save).
     private static let cornerEqualityEpsilonDegrees: CLLocationDegrees = 1e-7
-    /// Caps baked **storage** size so **HEIC** rasterization stays tractable on device (browse still uses in-memory / on-map resolution as before).
-    private static let bakedPersistenceMaxLongEdgePoints: CGFloat = 3072
+    /// Caps baked storage footprint for standard overlays (~9.4 MP; equivalent to 3072²).
+    private static let bakedPersistencePixelBudget: CGFloat = 9_437_184
+    /// Baked storage budget for very large overlays (~268 MP; equivalent to 16384²).
+    private static let bakedPersistencePixelBudgetHighRes: CGFloat = 268_435_456
+    /// Source raster size threshold that switches bake/persistence into high-res budgets.
+    static let largeRasterOverlayPixelThresholdExclusive: Int64 = 100_000_000
     private static let bakedDownscaleCIContext = CIContext(options: [.highQualityDownsample: true])
-    /// Lossy quality for **source** rows written by this app (**HEIC**).
-    private static let heifQualitySource: CGFloat = 0.88
-    /// Lossy quality for **baked** mercator textures (**HEIC**).
-    private static let heifQualityBaked: CGFloat = 0.82
+    /// Base quality for smaller **source** images before megapixel scaling.
+    private static let heifQualitySourceBase: CGFloat = 0.88
+    /// Base quality for smaller **baked** textures before megapixel scaling.
+    private static let heifQualityBakedBase: CGFloat = 0.82
+    /// Floor quality for very large rasters (~400 MP class inputs).
+    private static let heifQualityMinForHugeRasters: CGFloat = 0.50
+    /// Pixel-count point where quality reaches `heifQualityMinForHugeRasters`.
+    private static let heifQualityMinPixelThreshold: CGFloat = 250_000_000
 
     private static func documentsDirectory() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    }
-
-    private static func legacyMetadataURL() -> URL {
-        documentsDirectory().appendingPathComponent(metadataFilename)
-    }
-
-    private static func legacyImagesDirectory() -> URL {
-        documentsDirectory().appendingPathComponent(imagesDirectoryName, isDirectory: true)
     }
 
     private static func overlayImageFilename(id: UUID) -> String {
@@ -36,10 +37,6 @@ enum OverlayLibrary {
 
     private static func overlayBakedImageFilename(id: UUID) -> String {
         "\(id.uuidString)-baked.png"
-    }
-
-    private static func overlayLegacyBakedJpegFilename(id: UUID) -> String {
-        "\(id.uuidString)-baked.jpg"
     }
 
     /// Merges concurrent **`saveOverlays`** calls so only **one** background context runs at a time (logs showed overlapping **`persist`** / inflated **`overlayPersistenceInFlight`** and relaunch before **`count:2`** finished → **`loadedCount:1`**).
@@ -54,32 +51,72 @@ enum OverlayLibrary {
     private static var saveCoalesced: CoalescedSave?
     private static var saveFlushRunning = false
 
+    private enum OverlayEncodeError: Error {
+        case heicSourceEncodeFailed
+        case heicBakedEncodeFailed
+    }
+
     // MARK: - Public API
 
-    /// **Opaque** baked blobs (e.g. legacy **JPEG**) drop transparency → rebake from **`sourceImage`** on load so the map isn’t white outside the quad.
-    /// **HEIF** (ISO BMFF `ftyp`), **PNG**, and legacy **WebP** blobs are treated as alpha-capable.
-    private static func bakedBlobLikelyPreservesAlpha(_ data: Data) -> Bool {
-        guard data.count >= 12 else { return false }
-        let prefix = data.prefix(8)
-        if prefix.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) { return true }
-        if data.prefix(4) == Data([0x52, 0x49, 0x46, 0x46]), data.subdata(in: 8..<12) == Data([0x57, 0x45, 0x42, 0x50]) {
+    /// Decoded-image alpha check guards against legacy opaque baked blobs (e.g. old JPEG rows).
+    private static func bakedImageLikelyPreservesAlpha(_ image: UIImage) -> Bool {
+        guard let cg = image.cgImage else { return true }
+        switch cg.alphaInfo {
+        case .first, .last, .premultipliedFirst, .premultipliedLast:
             return true
+        default:
+            return false
         }
-        if dataLooksLikeHEIFContainer(data) { return true }
-        return false
     }
 
-    /// **`ftyp`** at offset 4; still-image / HEIC major brands used by ImageIO.
-    private static func dataLooksLikeHEIFContainer(_ data: Data) -> Bool {
-        guard data[4] == 0x66, data[5] == 0x74, data[6] == 0x79, data[7] == 0x70 else { return false }
-        let brand = String(data: data.subdata(in: 8..<12), encoding: .ascii) ?? ""
-        let heifBrands: Set<String> = ["heic", "heix", "hevc", "hevx", "mif1", "msf1", "heif"]
-        return heifBrands.contains(brand)
+    /// Fills **`bbox*`** / **`hasBoundingBox`** from **`cornersJSON`** for rows that predate spatial metadata. Safe to call repeatedly.
+    static func migrateOverlayBoundingBoxesIfNeeded(context: NSManagedObjectContext) throws {
+        let fr = StoredMapOverlay.fetchRequest()
+        fr.predicate = NSPredicate(format: "hasBoundingBox == NO")
+        let rows = try context.fetch(fr)
+        for row in rows {
+            guard let corners = decodeCorners(from: row.cornersJSON ?? ""), corners.count == 4 else { continue }
+            assignGeorectMetadata(to: row, corners: corners)
+        }
+        if context.hasChanges {
+            try context.save()
+        }
     }
 
-    static func loadOverlays(viewContext: NSManagedObjectContext) throws -> [OverlayItem] {
+    /// Maintenance utility: removes all persisted baked blobs so they are regenerated from source images on next load/save.
+    @discardableResult
+    static func clearAllBakedImageData(context: NSManagedObjectContext) throws -> Int {
+        let fr = StoredMapOverlay.fetchRequest()
+        fr.predicate = NSPredicate(format: "bakedImageData != nil")
+        let rows = try context.fetch(fr)
+        guard !rows.isEmpty else { return 0 }
+        let now = Date()
+        for row in rows {
+            row.bakedImageData = nil
+            row.modifiedAt = now
+        }
+        try context.save()
+        return rows.count
+    }
+
+    /// Loads overlay rows. Pass **`intersectingMapRect`** to fetch only rows whose stored bounds overlap the map viewport (skips loading off-screen blobs from SQLite where possible).
+    static func loadOverlays(
+        viewContext: NSManagedObjectContext,
+        intersectingMapRect: MKMapRect? = nil,
+        mapRectPaddingFraction: Double = 0.12
+    ) throws -> [OverlayItem] {
         let request = StoredMapOverlay.fetchRequest()
         request.sortDescriptors = [NSSortDescriptor(keyPath: \StoredMapOverlay.sortOrder, ascending: true)]
+        if let rect = intersectingMapRect {
+            let v = mapRectExpandedForSpatialQuery(rect, paddingFraction: mapRectPaddingFraction)
+            request.predicate = NSPredicate(
+                format: "hasBoundingBox == YES AND bboxMinX < %@ AND %@ < bboxMaxX AND bboxMinY < %@ AND %@ < bboxMaxY",
+                NSNumber(value: v.maxX),
+                NSNumber(value: v.origin.x),
+                NSNumber(value: v.maxY),
+                NSNumber(value: v.origin.y)
+            )
+        }
         let rows = try viewContext.fetch(request)
         var result: [OverlayItem] = []
         result.reserveCapacity(rows.count)
@@ -92,13 +129,28 @@ enum OverlayLibrary {
                 continue
             }
             let placement = decodePlacementCamera(from: row.placementCameraJSON)
+            /// Stored bake may predate high-res mercator / tiling; huge source + undersized baked blob → rebake on load.
+            let minHighResBakedPixelCount: CGFloat = 150_994_944 // 12288² legacy-equivalent floor.
             let mapDisplay: UIImage
-            if let baked = row.bakedImageData,
-               bakedBlobLikelyPreservesAlpha(baked),
-               let img = UIImage(data: baked) {
+            if sourceImage.rasterExceedsLargeOverlayPixelThreshold {
+                let bakedOK: UIImage? = {
+                    guard let baked = row.bakedImageData,
+                          let img = UIImage(data: baked),
+                          bakedImageLikelyPreservesAlpha(img) else { return nil }
+                    let bakedPixels = (img.size.width * img.scale) * (img.size.height * img.scale)
+                    return bakedPixels >= minHighResBakedPixelCount ? img : nil
+                }()
+                if let bakedOK {
+                    mapDisplay = bakedOK
+                } else {
+                    mapDisplay = OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: sourceImage, corners: corners) ?? sourceImage
+                }
+            } else if let baked = row.bakedImageData,
+                      let img = UIImage(data: baked),
+                      bakedImageLikelyPreservesAlpha(img) {
                 mapDisplay = img
             } else {
-                mapDisplay = OverlayMapBake.bakeMercatorDisplayTexture(source: sourceImage, corners: corners) ?? sourceImage
+                mapDisplay = OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: sourceImage, corners: corners) ?? sourceImage
             }
             result.append(
                 OverlayItem(
@@ -183,91 +235,50 @@ enum OverlayLibrary {
         }
     }
 
-    // MARK: - Legacy import
-
-    /// **`true`** if legacy rows were inserted (caller should **`save`** then delete legacy files).
-    @discardableResult
-    static func importLegacyJSONAndPNGsIfStoreEmpty(context: NSManagedObjectContext) throws -> Bool {
-        let count = try context.count(for: StoredMapOverlay.fetchRequest())
-        if count > 0 { return false }
-
-        guard FileManager.default.fileExists(atPath: legacyMetadataURL().path) else { return false }
-
-        let metadataData = try Data(contentsOf: legacyMetadataURL())
-        let persisted = try JSONDecoder().decode(PersistedOverlays.self, from: metadataData)
-        guard !persisted.entries.isEmpty else { return false }
-
-        let directoryURL = legacyImagesDirectory()
-
-        for (index, entry) in persisted.entries.enumerated() {
-            guard entry.corners.count == 4 else { throw ImportError.invalidCorners }
-
-            let imageURL = directoryURL.appendingPathComponent(overlayImageFilename(id: entry.id))
-            let imageData = try Data(contentsOf: imageURL)
-            guard UIImage(data: imageData) != nil else { throw ImportError.missingSourceImage }
-
-            let bakedPNGURL = directoryURL.appendingPathComponent(overlayBakedImageFilename(id: entry.id))
-            let bakedLegacyJPGURL = directoryURL.appendingPathComponent(overlayLegacyBakedJpegFilename(id: entry.id))
-            let bakedData: Data?
-            if let url = [bakedPNGURL, bakedLegacyJPGURL].first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
-                bakedData = try Data(contentsOf: url)
-            } else {
-                bakedData = nil
-            }
-
-            let now = Date()
-            let coords = entry.corners.map { PersistedCoordinate(latitude: $0.latitude, longitude: $0.longitude) }
-            let cornersJSON = try Self.encodeCornersJSON(coords)
-            let placementJSON = try encodePlacementCamera(entry.placementCamera)
-
-            let row = StoredMapOverlay(context: context)
-            row.uuid = entry.id
-            row.schemaVersion = 1
-            row.sortOrder = Int32(index)
-            row.cornersJSON = cornersJSON
-            row.placementCameraJSON = placementJSON
-            row.sourceImageData = imageData
-            row.bakedImageData = bakedData
-            row.createdAt = now
-            row.modifiedAt = now
-        }
-        return true
-    }
-
-    /// Call only after a successful **`save()`** of a full legacy import.
-    static func deleteLegacyOverlayFileBundleIfPresent() {
-        let fm = FileManager.default
-        try? fm.removeItem(at: legacyMetadataURL())
-        try? fm.removeItem(at: legacyImagesDirectory())
-    }
-
-    private enum ImportError: Error {
-        case invalidCorners
-        case missingSourceImage
-    }
-
     // MARK: - Private
 
-    /// **HEIC** via **ImageIO**, then **PNG** only if the HEIC encoder refuses (Simulator quirks, rare failures).
-    private static func encodeSourceImage(_ image: UIImage) -> Data? {
-        if let heic = BakedHEIFEncoder.encodeLossyWithAlpha(image: image, quality: heifQualitySource) { return heic }
-        return image.pngData()
+    /// Always writes source rows as **HEIC**.
+    private static func encodeSourceImage(_ image: UIImage) throws -> Data {
+        let q = heifQualityForMegapixels(of: image, baseQuality: heifQualitySourceBase)
+        guard let heic = BakedHEIFEncoder.encodeLossyWithAlpha(image: image, quality: q) else {
+            throw OverlayEncodeError.heicSourceEncodeFailed
+        }
+        return heic
     }
 
-    /// Mercator bake keeps **transparency** outside the warped quad. **HEIC** for disk; **PNG** only as last-resort fallback (same as source).
-    private static func encodeBakedImage(_ image: UIImage) -> Data? {
+    /// Mercator bake keeps **transparency** outside the warped quad and is always persisted as **HEIC**.
+    private static func encodeBakedImage(_ image: UIImage) throws -> Data {
         let forDisk = imageScaledForBakedPersistence(image)
-        if let heic = BakedHEIFEncoder.encodeLossyWithAlpha(image: forDisk, quality: heifQualityBaked) { return heic }
-        return forDisk.pngData()
+        let q = heifQualityForMegapixels(of: forDisk, baseQuality: heifQualityBakedBase)
+        guard let heic = BakedHEIFEncoder.encodeLossyWithAlpha(image: forDisk, quality: q) else {
+            throw OverlayEncodeError.heicBakedEncodeFailed
+        }
+        return heic
+    }
+
+    /// Progressive compression by raster size: keep high quality for small/medium assets and reduce toward 0.5 for very large inputs.
+    private static func heifQualityForMegapixels(of image: UIImage, baseQuality: CGFloat) -> CGFloat {
+        let pxW = max(1, image.size.width * image.scale)
+        let pxH = max(1, image.size.height * image.scale)
+        let megapixels = (pxW * pxH) / 1_000_000
+        let minQ = heifQualityMinForHugeRasters
+        let startMP: CGFloat = 12
+        let endMP = max(startMP + 1, heifQualityMinPixelThreshold / 1_000_000)
+        if megapixels <= startMP { return baseQuality }
+        if megapixels >= endMP { return minQ }
+        let t = (megapixels - startMP) / (endMP - startMP)
+        return baseQuality - (baseQuality - minQ) * t
     }
 
     private static func imageScaledForBakedPersistence(_ image: UIImage) -> UIImage {
-        let maxE = bakedPersistenceMaxLongEdgePoints
+        let pixelBudget = image.rasterExceedsLargeOverlayPixelThreshold
+            ? bakedPersistencePixelBudgetHighRes
+            : bakedPersistencePixelBudget
         let pxW = image.size.width * image.scale
         let pxH = image.size.height * image.scale
-        let long = max(pxW, pxH)
-        guard long > maxE, long > 0, let ci = CIImage(image: image) else { return image }
-        let s = maxE / long
+        let pixels = pxW * pxH
+        guard pixels > pixelBudget, pixels > 0, let ci = CIImage(image: image) else { return image }
+        let s = sqrt(pixelBudget / pixels)
         let outW = max(1, floor(pxW * s))
         let outH = max(1, floor(pxH * s))
         let scaleX = outW / pxW
@@ -341,6 +352,7 @@ enum OverlayLibrary {
             let placementChanged = placementGeometricallyChanged(storedJSON: row.placementCameraJSON, newJSON: placementJSON)
 
             row.cornersJSON = cornersJSON
+            assignGeorectMetadata(to: row, corners: o.corners)
             if placementChanged {
                 row.placementCameraJSON = placementJSON
             }
@@ -359,22 +371,14 @@ enum OverlayLibrary {
             let bakedBlob: Data?
             switch (needsSourceWrite, needsBakedWrite) {
             case (true, true):
-                if let raw = o.preservedSourceFileData {
-                    sourceBlob = raw
-                } else {
-                    sourceBlob = Self.encodeSourceImage(o.sourceImage)
-                }
-                bakedBlob = Self.encodeBakedImage(o.mapDisplayImage)
+                sourceBlob = try Self.encodeSourceImage(o.sourceImage)
+                bakedBlob = try Self.encodeBakedImage(o.mapDisplayImage)
             case (true, false):
-                if let raw = o.preservedSourceFileData {
-                    sourceBlob = raw
-                } else {
-                    sourceBlob = Self.encodeSourceImage(o.sourceImage)
-                }
+                sourceBlob = try Self.encodeSourceImage(o.sourceImage)
                 bakedBlob = nil
             case (false, true):
                 sourceBlob = nil
-                bakedBlob = Self.encodeBakedImage(o.mapDisplayImage)
+                bakedBlob = try Self.encodeBakedImage(o.mapDisplayImage)
             case (false, false):
                 sourceBlob = nil
                 bakedBlob = nil
@@ -413,5 +417,32 @@ enum OverlayLibrary {
     private static func decodePlacementCamera(from json: String?) -> PersistedMapCamera? {
         guard let json, let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(PersistedMapCamera.self, from: data)
+    }
+
+    /// **`MKMapRect`** in map points for the quad; enables Core Data viewport predicates without decoding image blobs.
+    private static func assignGeorectMetadata(to row: StoredMapOverlay, corners: [CLLocationCoordinate2D]) {
+        guard corners.count == 4 else {
+            row.hasBoundingBox = false
+            return
+        }
+        let r = OverlayMapBake.mapBoundingMapRect(for: corners)
+        row.bboxMinX = r.origin.x
+        row.bboxMinY = r.origin.y
+        row.bboxMaxX = r.origin.x + r.size.width
+        row.bboxMaxY = r.origin.y + r.size.height
+        row.hasBoundingBox = true
+    }
+
+    private static func mapRectExpandedForSpatialQuery(_ rect: MKMapRect, paddingFraction: Double) -> MKMapRect {
+        let w = rect.size.width
+        let h = rect.size.height
+        guard w > 0, h > 0, w.isFinite, h.isFinite else { return MKMapRect.world }
+        let mx = w * paddingFraction
+        let my = h * paddingFraction
+        let expanded = MKMapRect(
+            origin: MKMapPoint(x: rect.origin.x - mx, y: rect.origin.y - my),
+            size: MKMapSize(width: w + 2 * mx, height: h + 2 * my)
+        )
+        return expanded.intersection(MKMapRect.world)
     }
 }

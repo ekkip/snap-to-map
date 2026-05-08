@@ -17,13 +17,32 @@ struct OverlayItem: Identifiable {
     let id: UUID
     /// Original photo for re-edit (**«Done»** / lossless).
     let sourceImage: UIImage
-    /// Mercator **bounding-box** texture used by **`ImageRasterMapOverlay`** in browse mode (see **`OverlayMapBake`**).
+    /// Mercator **bounding-box** texture used on the map in browse mode (**`OverlayMapPresentation`**: raster or tiled; see **`OverlayMapBake`**).
     let mapDisplayImage: UIImage
+    /// Set once from **`sourceImage`** when the item is created. Drives **`BakedImageMapTileOverlay`** vs **`ImageRasterMapOverlay`** so map sync does not re-query rasters; also matches **`OverlayLibrary.largeRasterOverlayPixelThresholdExclusive`** (>100 MP source pixels).
+    let usesTiledMapPresentation: Bool
     let corners: [CLLocationCoordinate2D]
     /// Framing at save time; when present, edit mode restores this camera instead of fitting a north-up rect.
     let placementCamera: PersistedMapCamera?
-    /// Camera-roll file bytes from **`PhotosPicker`** when available; written to **`sourceImageData`** as-is on first save (no re-encode). Cleared after a successful disk save to limit RAM.
+    /// Camera-roll file bytes from **`PhotosPicker`** kept only in memory for immediate editing workflows; persistence writes re-encode from `sourceImage`.
     var preservedSourceFileData: Data?
+
+    init(
+        id: UUID,
+        sourceImage: UIImage,
+        mapDisplayImage: UIImage,
+        corners: [CLLocationCoordinate2D],
+        placementCamera: PersistedMapCamera?,
+        preservedSourceFileData: Data? = nil
+    ) {
+        self.id = id
+        self.sourceImage = sourceImage
+        self.mapDisplayImage = mapDisplayImage
+        self.usesTiledMapPresentation = sourceImage.rasterExceedsLargeOverlayPixelThreshold
+        self.corners = corners
+        self.placementCamera = placementCamera
+        self.preservedSourceFileData = preservedSourceFileData
+    }
 }
 
 struct PersistedOverlays: Codable {

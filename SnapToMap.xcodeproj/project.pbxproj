@@ -9,14 +9,15 @@
 /* Begin PBXBuildFile section */
 		2010B0010000PERS5000FILE /* PersistenceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2010F0010000PERS5000FILE /* PersistenceController.swift */; };
 		2010B0020000OVER5000FILE /* OverlayLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2010F0020000OVER5000FILE /* OverlayLibrary.swift */; };
-		2010CDEE0002CDCDCDCD0001 /* SnapToMapModel.xcdatamodeld in Sources */ = {isa = PBXBuildFile; fileRef = 2010CDEE0001CDCDCDCD0001 /* SnapToMapModel.xcdatamodeld */; };
 		20EAB3348E0989157B9DEDF0 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 48945E7DD0BC77ACA3CFD532 /* Preview Assets.xcassets */; };
 		3DCCF6C5240F9D01F612BA5A /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7644E56B7A369762FE2677EA /* ContentView.swift */; };
+		69B2C7A02FAE246A00328C9F /* SnapToMapModel.xcdatamodeld in Sources */ = {isa = PBXBuildFile; fileRef = 69B2C79E2FAE246A00328C9F /* SnapToMapModel.xcdatamodeld */; };
 		99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73FB23DC65473206083E68C0 /* OverlayModels.swift */; };
 		9A5972EAC9706CDA48CB9D9A /* MapViewBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0152501D7FD80FEE395C167 /* MapViewBridge.swift */; };
 		B04EBEEFCAFE0005D0D00005 /* BakedHEIFEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */; };
 		B75CE877AA783FF5FF55098E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2B288C6F420232C2216E201E /* Assets.xcassets */; };
 		C1A2F3E4D5C6B798AABBCCDD /* ImageRasterMapOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B199887766554433221100FF /* ImageRasterMapOverlay.swift */; };
+		D01MAPRES0001BUILD001 /* OverlayMapPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */; };
 		DB4E6DB74BFE6E53EA8D431C /* MapViewRepresentable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */; };
 		E3C3B002F002D002B002C002 /* MapControlChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C2B001F001D001A001B001 /* MapControlChrome.swift */; };
 		E59CACAD388ECE0E6EBF9E77 /* PicToMapApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9498F353B016CE0333FC7F4A /* PicToMapApp.swift */; };
@@ -24,19 +25,20 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		2010CDEE0001CDCDCDCD0001 /* SnapToMapModel.xcdatamodeld */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = SnapToMapModel.xcdatamodeld; sourceTree = "<group>"; };
 		2010F0010000PERS5000FILE /* PersistenceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistenceController.swift; sourceTree = "<group>"; };
 		2010F0020000OVER5000FILE /* OverlayLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayLibrary.swift; sourceTree = "<group>"; };
 		2B288C6F420232C2216E201E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		3DDE5DDB3AC19296B55D593C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		48945E7DD0BC77ACA3CFD532 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		4A8B14F76DF5F5D3F8473B86 /* SnapToMap.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SnapToMap.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		69B2C79F2FAE246A00328C9F /* SnapToMapModel.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = SnapToMapModel.xcdatamodel; sourceTree = "<group>"; };
 		73FB23DC65473206083E68C0 /* OverlayModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayModels.swift; sourceTree = "<group>"; };
 		7644E56B7A369762FE2677EA /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewRepresentable.swift; sourceTree = "<group>"; };
 		9498F353B016CE0333FC7F4A /* PicToMapApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PicToMapApp.swift; sourceTree = "<group>"; };
 		A0152501D7FD80FEE395C167 /* MapViewBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewBridge.swift; sourceTree = "<group>"; };
 		B199887766554433221100FF /* ImageRasterMapOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageRasterMapOverlay.swift; sourceTree = "<group>"; };
+		D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMapPresentation.swift; sourceTree = "<group>"; };
 		E2C2B001F001D001A001B001 /* MapControlChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapControlChrome.swift; sourceTree = "<group>"; };
 		F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BakedHEIFEncoder.swift; sourceTree = "<group>"; };
 		F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMapBake.swift; sourceTree = "<group>"; };
@@ -67,9 +69,10 @@
 				73FB23DC65473206083E68C0 /* OverlayModels.swift */,
 				2010F0020000OVER5000FILE /* OverlayLibrary.swift */,
 				F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */,
+				D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */,
 				2010F0010000PERS5000FILE /* PersistenceController.swift */,
 				9498F353B016CE0333FC7F4A /* PicToMapApp.swift */,
-				2010CDEE0001CDCDCDCD0001 /* SnapToMapModel.xcdatamodeld */,
+				69B2C79E2FAE246A00328C9F /* SnapToMapModel.xcdatamodeld */,
 				97413E7C29CCF406980DCC60 /* Preview Content */,
 			);
 			path = SnapToMap;
@@ -177,9 +180,10 @@
 				99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */,
 				2010B0020000OVER5000FILE /* OverlayLibrary.swift in Sources */,
 				F7A7B7C7D7E7F70819293A7B /* OverlayMapBake.swift in Sources */,
+				D01MAPRES0001BUILD001 /* OverlayMapPresentation.swift in Sources */,
 				2010B0010000PERS5000FILE /* PersistenceController.swift in Sources */,
+				69B2C7A02FAE246A00328C9F /* SnapToMapModel.xcdatamodeld in Sources */,
 				E59CACAD388ECE0E6EBF9E77 /* PicToMapApp.swift in Sources */,
-				2010CDEE0002CDCDCDCD0001 /* SnapToMapModel.xcdatamodeld in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -380,6 +384,18 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCVersionGroup section */
+		69B2C79E2FAE246A00328C9F /* SnapToMapModel.xcdatamodeld */ = {
+			isa = XCVersionGroup;
+			children = (
+				69B2C79F2FAE246A00328C9F /* SnapToMapModel.xcdatamodel */,
+			);
+			currentVersion = 69B2C79F2FAE246A00328C9F /* SnapToMapModel.xcdatamodel */;
+			path = SnapToMapModel.xcdatamodeld;
+			sourceTree = "<group>";
+			versionGroupType = wrapper.xcdatamodel;
+		};
+/* End XCVersionGroup section */
 	};
 	rootObject = 0BD368AA3A09F42006A0BEE6 /* Project object */;
 }

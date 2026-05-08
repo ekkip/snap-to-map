@@ -16,18 +16,16 @@ extension UIImage {
     /// Total pixel count of the raster.
     func rasterPixelCount() -> Int64 {
         let d = rasterPixelDimensions()
+		print("\(#function) – \(d.width) × \(d.height) = \(d.width * d.height)")
         return d.width * d.height
     }
 
-    /// True when **`width × height` > 100_000_000** (more than ~100 MP); used like a heavyweight **`MKTileOverlay`** stack for opacity repaint.
-    static let largeRasterOverlayPixelThresholdExclusive: Int64 = 100_000_000
-
     var rasterExceedsLargeOverlayPixelThreshold: Bool {
-        rasterPixelCount() > Self.largeRasterOverlayPixelThresholdExclusive
+        rasterPixelCount() > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive
     }
 }
 
-/// Georeferenced image via `MKOverlay` / `MKOverlayRenderer` (similar consumer cost profile to tiled `MKTileOverlay` overlays).
+/// Georeferenced image via `MKOverlay` / `MKOverlayRenderer`. Heavy sources use **`OverlayMapPresentation`** → **`BakedImageMapTileOverlay`** (see **`sourceImage.rasterExceedsLargeOverlayPixelThreshold`**).
 final class ImageRasterMapOverlay: NSObject, MKOverlay {
     let overlayID: UUID
     let image: UIImage

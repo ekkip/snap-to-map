@@ -29,8 +29,7 @@ final class MapEditHandoff {
         self.fittedQuadScreen = fittedQuadScreen
     }
 }
-/// Raster overlay opacity staging: live drag applies immediately only when `ImageRasterMapOverlay.largeImage == false`;
-/// heavyweight rasters (> 100 MP pixels) consume `committed` until the gesture ends (same repaint trade-off as stacked `MKTileOverlay` tiles).
+/// Raster overlay opacity staging: live drag applies immediately only when **`presentationUsesHeavyOpacityPath == false`** (small **`ImageRasterMapOverlay`**); tiled / large rasters use **`committed`** until the gesture ends.
 final class RasterMapOpacityBag {
     var committed: CGFloat = 1
     var dragging: CGFloat?
@@ -97,7 +96,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
 
     let rasterOpacity = RasterMapOpacityBag()
 
-    /// `true` when at least one saved overlay is drawn as an **`ImageRasterMapOverlay`** (zoomed in enough); false when all valid overlays show only **`OverlayMarkerAnnotation`** pins.
+    /// `true` when at least one overlay is drawn as a **`SnapRasterMapOverlay`** (raster or baked tile, zoomed in enough); false when all valid overlays show only **`OverlayMarkerAnnotation`** pins.
     @Published private(set) var isAnyRasterMapOverlayOnMap: Bool = false
 
     func updateRasterTileOverlayPresence(_ anyRasterVisible: Bool) {
@@ -109,7 +108,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         }
     }
 
-    /// True when the map has at least one **`ImageRasterMapOverlay`** and every one has **`largeImage == true`**. Drives whether opacity **`DragGesture.onChanged`** may repaint map tiles (false → only **`onEnded`** commits for those rasters).
+    /// True when every visible **`SnapRasterMapOverlay`** uses the heavy opacity path (**`BakedImageMapTileOverlay`** or **`ImageRasterMapOverlay.largeImage`**). Drives whether browse opacity **`DragGesture.onChanged`** may repaint map tiles (false → only **`onEnded`** commits for those).
     @Published private(set) var displayedMapRastersAreAllLargeImage: Bool = false
 
     func updateDisplayedMapRastersAreAllLargeImage(_ allLarge: Bool) {
@@ -469,13 +468,19 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         return true
     }
 
-    /// Updates each raster renderer’s compositing **`alpha`** from **`RasterMapOpacityBag`** (per-overlay **`largeImage` / committed / dragging** rules). MapKit applies this **without** necessarily invoking **`draw(_:zoomScale:in:)`** again, so browse-mode opacity tracks the slider smoothly (edit mode uses SwiftUI opacity on a separate layer).
+    /// Updates each raster / tile overlay renderer’s **`alpha`** from **`RasterMapOpacityBag`** (per-overlay heavy-path rules). MapKit can apply this without redrawing every tile / `draw(_:)` pass.
     func applyRasterOverlayRendererAlphas() {
         guard let mapView else { return }
-        for case let overlay as ImageRasterMapOverlay in mapView.overlays {
-            guard let renderer = mapView.renderer(for: overlay) else { continue }
-            let alpha = overlay.opacityBag?.resolvedAlpha(isLargeImage: overlay.largeImage) ?? 1
-            renderer.alpha = CGFloat(alpha)
+        for overlay in mapView.overlays {
+            if let raster = overlay as? ImageRasterMapOverlay {
+                guard let renderer = mapView.renderer(for: raster) else { continue }
+                let alpha = raster.opacityBag?.resolvedAlpha(isLargeImage: raster.largeImage) ?? 1
+                renderer.alpha = CGFloat(alpha)
+            } else if let tile = overlay as? BakedImageMapTileOverlay {
+                guard let renderer = mapView.renderer(for: tile) as? MKTileOverlayRenderer else { continue }
+                let alpha = tile.opacityBag?.resolvedAlpha(isLargeImage: true) ?? 1
+                renderer.alpha = CGFloat(alpha)
+            }
         }
     }
 
