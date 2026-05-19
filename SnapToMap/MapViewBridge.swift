@@ -122,6 +122,8 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
 
     /// Bumped from **`mapView(_:regionDidChangeAnimated:)`** so **`ContentView`** can re-project the draft overlay when it is anchored to the map.
     @Published private(set) var mapLayoutRevision: UInt64 = 0
+    /// Debug-only current zoom level approximation derived from visible map rect.
+    @Published private(set) var currentDebugZoomLevel: Double = 0
 
     /// Bumped after **`MapRegionSettleTiming`** debounce + **two** frozen **`MapVisualState`** samples (same idea as edit handoff) while the draft is stick‑to‑map — **`ContentView`** warps the image and fades it in.
     @Published private(set) var draftStickToMapSettledRevision: UInt64 = 0
@@ -134,6 +136,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
 
     func notifyMapLayoutChanged() {
         DispatchQueue.main.async { [weak self] in
+            self?.updateCurrentDebugZoomLevelDeferred()
             self?.mapLayoutRevision &+= 1
         }
     }
@@ -489,14 +492,60 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     func attach(mapView: MKMapView) {
         self.mapView = mapView
         self.locationManager.delegate = self
+        updateCurrentDebugZoomLevelDeferred()
+    }
+
+    func zoomIn(animated: Bool = true) {
+        zoomVisibleMapRect(by: 0.5, animated: animated)
+    }
+
+    func zoomOut(animated: Bool = true) {
+        zoomVisibleMapRect(by: 2.0, animated: animated)
+    }
+
+    private func zoomVisibleMapRect(by factor: Double, animated: Bool) {
+        guard let mapView, factor.isFinite, factor > 0 else { return }
+        let visible = mapView.visibleMapRect
+        guard visible.size.width > 0, visible.size.height > 0 else { return }
+        let target = MKMapRect(
+            x: visible.midX - (visible.size.width * factor) / 2,
+            y: visible.midY - (visible.size.height * factor) / 2,
+            width: visible.size.width * factor,
+            height: visible.size.height * factor
+        ).intersection(MKMapRect.world)
+        guard !target.isNull, !target.isEmpty else { return }
+        mapView.setVisibleMapRect(target, animated: animated)
+    }
+
+    private func updateCurrentDebugZoomLevelDeferred() {
+        DispatchQueue.main.async { [weak self] in
+            self?.updateCurrentDebugZoomLevelNow()
+        }
+    }
+
+    private func updateCurrentDebugZoomLevelNow() {
+        guard let mapView else { return }
+        let worldWidth = max(MKMapRect.world.size.width, 1)
+        let visibleWidthMapPoints = max(mapView.visibleMapRect.size.width, 1)
+        let zoom = log2(worldWidth / visibleWidthMapPoints)
+        guard zoom.isFinite else { return }
+        if abs(currentDebugZoomLevel - zoom) > 0.0001 {
+            currentDebugZoomLevel = zoom
+        }
     }
 
     /// Ensures the system can show the user-location annotation on `MKMapView` (`showsUserLocation`).
     /// The result of the authorization request is handled asynchronously by the delegate callback.
     func requestLocationAuthorizationIfNeeded() {
-        guard CLLocationManager.locationServicesEnabled() else { return }
-        // Request authorization asynchronously; delegate will handle status changes.
-        locationManager.requestWhenInUseAuthorization()
+        switch locationManager.authorizationStatus {
+        case .notDetermined:
+            // Keep this non-blocking on the main thread by relying on auth status only.
+            locationManager.requestWhenInUseAuthorization()
+        case .restricted, .denied, .authorizedAlways, .authorizedWhenInUse:
+            break
+        @unknown default:
+            break
+        }
     }
 
     func centerOnUserLocation(animated: Bool = true) {

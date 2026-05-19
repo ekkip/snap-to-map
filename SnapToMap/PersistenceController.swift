@@ -5,7 +5,7 @@ final class PersistenceController {
     static let shared = PersistenceController()
     /// Optional startup maintenance pass for rebuilding baked-derived disk assets from source rows.
     /// Keep `false` for normal app runs; set to `true` when you want to clear stale baked files/tiles.
-    private static let clearAllBakedDataAtStartup = true
+    private static let clearAllBakedDataAtStartup = false
 
     let container: NSPersistentContainer
     private var saveObserver: NSObjectProtocol?

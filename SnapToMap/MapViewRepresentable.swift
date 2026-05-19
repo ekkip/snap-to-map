@@ -248,6 +248,9 @@ struct MapViewRepresentable: UIViewRepresentable {
             let quadItems = overlays.filter { $0.corners.count == 4 }
             let cullViewport = expandedVisibleMapRectForCulling(on: mapView)
             let itemsToMount = quadItems.filter { mapRect(for: $0.corners).intersects(cullViewport) }
+            SnapMemoryInstrumentation.checkpoint(
+                "map.sync applySync quad=\(quadItems.count) mount=\(itemsToMount.count) tiledInMount=\(itemsToMount.filter(\.usesTiledMapPresentation).count)"
+            )
 
             let existingRasterByID = Dictionary(uniqueKeysWithValues: mapView.overlays.compactMap { overlay -> (UUID, SnapRasterMapOverlay)? in
                 guard let snap = overlay as? SnapRasterMapOverlay else { return nil }
@@ -299,12 +302,28 @@ struct MapViewRepresentable: UIViewRepresentable {
                 if let existingOverlay = existingRasterByID[item.id] {
                     mapView.removeOverlay(existingOverlay)
                 }
+                if item.usesTiledMapPresentation {
+                    if let runtime = item.tilePyramid {
+                        let root = OverlayLibrary.tilePyramidRevisionDirectoryURL(id: item.id, revision: runtime.revision)
+                        let levels = OverlayLibrary.debugTilePyramidPNGCountsByZoom(pyramidRoot: root)
+                        let levelSummary = levels.keys.sorted().map { "z\($0):\(levels[$0] ?? 0)" }.joined(separator: ",")
+                        print("[TileDiag] map.mount id=\(item.id.uuidString.prefix(8)) tiled=true rev=\(runtime.revision) minZ=\(runtime.minimumZoom) maxZ=\(runtime.maximumZoom) rootExists=\(FileManager.default.fileExists(atPath: root.path)) levels=[\(levelSummary)]")
+                    } else {
+                        print("[TileDiag] map.mount id=\(item.id.uuidString.prefix(8)) tiled=true runtime=nil (lazy tile path)")
+                    }
+                }
                 let presentation = OverlayMapPresentation.make(
                     overlayID: item.id,
                     mapDisplayImage: item.mapDisplayImage,
                     usesTiledMapPresentation: item.usesTiledMapPresentation,
                     mapBoundingRect: bbox,
-                    opacityBag: rasterBag
+                    opacityBag: rasterBag,
+                    sourceRasterForTileLOD: item.sourceRasterData,
+                    geographicCorners: item.corners,
+                    tilePyramidRuntime: item.tilePyramid,
+                    tilePyramidDiskRoot: item.tilePyramid.map {
+                        OverlayLibrary.tilePyramidRevisionDirectoryURL(id: item.id, revision: $0.revision)
+                    }
                 )
                 mapView.addOverlay(presentation.mkOverlay, level: .aboveLabels)
             }
@@ -324,7 +343,10 @@ struct MapViewRepresentable: UIViewRepresentable {
                 guard let tiled = existing as? BakedImageMapTileOverlay else { return false }
                 let oldSize = tiled.image.size
                 let newSize = item.mapDisplayImage.size
-                return abs(oldSize.width - newSize.width) < 0.5 && abs(oldSize.height - newSize.height) < 0.5
+                guard abs(oldSize.width - newSize.width) < 0.5 && abs(oldSize.height - newSize.height) < 0.5 else {
+                    return false
+                }
+                return tiled.tilePyramidRuntimeInfo == item.tilePyramid
             } else {
                 guard let raster = existing as? ImageRasterMapOverlay else { return false }
                 let oldSize = raster.image.size

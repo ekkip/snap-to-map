@@ -10,10 +10,14 @@
 		2010B0010000PERS5000FILE /* PersistenceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2010F0010000PERS5000FILE /* PersistenceController.swift */; };
 		2010B0020000OVER5000FILE /* OverlayLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2010F0020000OVER5000FILE /* OverlayLibrary.swift */; };
 		20EAB3348E0989157B9DEDF0 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 48945E7DD0BC77ACA3CFD532 /* Preview Assets.xcassets */; };
+		3B66D84ED71A4D22A6FE86FB /* OpenCVBinary in Frameworks */ = {isa = PBXBuildFile; productRef = E4FC44FEF6024B13B9A97CE4 /* OpenCVBinary */; };
 		3DCCF6C5240F9D01F612BA5A /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7644E56B7A369762FE2677EA /* ContentView.swift */; };
 		69B2C7A02FAE246A00328C9F /* SnapToMapModel.xcdatamodeld in Sources */ = {isa = PBXBuildFile; fileRef = 69B2C79E2FAE246A00328C9F /* SnapToMapModel.xcdatamodeld */; };
 		99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73FB23DC65473206083E68C0 /* OverlayModels.swift */; };
 		9A5972EAC9706CDA48CB9D9A /* MapViewBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0152501D7FD80FEE395C167 /* MapViewBridge.swift */; };
+		A10BBUILDOPCV01 /* OpenCVBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFOPCV01 /* OpenCVBridge.swift */; };
+		A10BBUILDPYR03 /* OverlayTilePyramid.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFPYR03 /* OverlayTilePyramid.swift */; };
+		A10BBUILDSTM02 /* STMOpenCVBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFMMM02 /* STMOpenCVBridge.mm */; settings = {COMPILER_FLAGS = "-Wno-quoted-include-in-framework-header -Wno-documentation"; }; };
 		B04EBEEFCAFE0005D0D00005 /* BakedHEIFEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */; };
 		B75CE877AA783FF5FF55098E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2B288C6F420232C2216E201E /* Assets.xcassets */; };
 		C1A2F3E4D5C6B798AABBCCDD /* ImageRasterMapOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B199887766554433221100FF /* ImageRasterMapOverlay.swift */; };
@@ -37,6 +41,11 @@
 		7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewRepresentable.swift; sourceTree = "<group>"; };
 		9498F353B016CE0333FC7F4A /* PicToMapApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PicToMapApp.swift; sourceTree = "<group>"; };
 		A0152501D7FD80FEE395C167 /* MapViewBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewBridge.swift; sourceTree = "<group>"; };
+		A10FREFBRGH03 /* SnapToMap-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SnapToMap-Bridging-Header.h"; sourceTree = "<group>"; };
+		A10FREFMMM02 /* STMOpenCVBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = STMOpenCVBridge.mm; sourceTree = "<group>"; };
+		A10FREFOPCV01 /* OpenCVBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenCVBridge.swift; sourceTree = "<group>"; };
+		A10FREFPYR03 /* OverlayTilePyramid.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTilePyramid.swift; sourceTree = "<group>"; };
+		A10FREFSTMH01 /* STMOpenCVBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = STMOpenCVBridge.h; sourceTree = "<group>"; };
 		B199887766554433221100FF /* ImageRasterMapOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageRasterMapOverlay.swift; sourceTree = "<group>"; };
 		D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMapPresentation.swift; sourceTree = "<group>"; };
 		E2C2B001F001D001A001B001 /* MapControlChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapControlChrome.swift; sourceTree = "<group>"; };
@@ -49,6 +58,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				3B66D84ED71A4D22A6FE86FB /* OpenCVBinary in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -61,6 +71,7 @@
 				2B288C6F420232C2216E201E /* Assets.xcassets */,
 				F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */,
 				7644E56B7A369762FE2677EA /* ContentView.swift */,
+				A10FREFPYR03 /* OverlayTilePyramid.swift */,
 				B199887766554433221100FF /* ImageRasterMapOverlay.swift */,
 				3DDE5DDB3AC19296B55D593C /* Info.plist */,
 				A0152501D7FD80FEE395C167 /* MapViewBridge.swift */,
@@ -70,6 +81,10 @@
 				2010F0020000OVER5000FILE /* OverlayLibrary.swift */,
 				F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */,
 				D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */,
+				A10FREFOPCV01 /* OpenCVBridge.swift */,
+				A10FREFSTMH01 /* STMOpenCVBridge.h */,
+				A10FREFMMM02 /* STMOpenCVBridge.mm */,
+				A10FREFBRGH03 /* SnapToMap-Bridging-Header.h */,
 				2010F0010000PERS5000FILE /* PersistenceController.swift */,
 				9498F353B016CE0333FC7F4A /* PicToMapApp.swift */,
 				69B2C79E2FAE246A00328C9F /* SnapToMapModel.xcdatamodeld */,
@@ -112,6 +127,7 @@
 				C06EBEEFCAFE0007D0D00007 /* Frameworks */,
 				B71EACA1B3233CA630ECCC1F /* Sources */,
 				7B1E7074927E7FD776C31166 /* Resources */,
+				E600STRIPOPCV01 /* Strip invalid embedded opencv2.framework */,
 			);
 			buildRules = (
 			);
@@ -119,6 +135,7 @@
 			);
 			name = SnapToMap;
 			packageProductDependencies = (
+				E4FC44FEF6024B13B9A97CE4 /* OpenCVBinary */,
 			);
 			productName = PicToMap;
 			productReference = 4A8B14F76DF5F5D3F8473B86 /* SnapToMap.app */;
@@ -143,6 +160,7 @@
 			mainGroup = F52D5BEFFCE4DC778CA6E7F0;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				82E2BB3835854AF6BFC4BF7E /* XCLocalSwiftPackageReference "Packages/opencv-spm" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 6BFF154BCD7AC553C7A24B5F /* Products */;
@@ -166,6 +184,29 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		E600STRIPOPCV01 /* Strip invalid embedded opencv2.framework */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(TARGET_BUILD_DIR)/$(FULL_PRODUCT_NAME)/Frameworks/opencv2.framework/Info.plist",
+			);
+			name = "Strip invalid embedded opencv2.framework";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/opencv2_embedded_framework_stripped.stamp",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# The OpenCV xcframework wraps a static archive as opencv2.framework without CFBundleExecutable;\n# Xcode still copies it into the app bundle, and iOS install fails (MIInstallerErrorDomain 11).\n# Symbols are already linked into the app binary — safe to delete from Frameworks.\n# Input/output paths schedule this phase AFTER the embed/copy step (otherwise the framework comes back).\nFW=\"${TARGET_BUILD_DIR}/${FULL_PRODUCT_NAME}/Frameworks/opencv2.framework\"\nSTAMP=\"${DERIVED_FILE_DIR}/opencv2_embedded_framework_stripped.stamp\"\nif [ -d \"$FW\" ]; then\n  echo \"note: Removing unused embedded opencv2.framework (static OpenCV is linked into the binary)\"\n  /bin/rm -rf \"$FW\"\nfi\n/usr/bin/touch \"$STAMP\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		B71EACA1B3233CA630ECCC1F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -180,6 +221,9 @@
 				99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */,
 				2010B0020000OVER5000FILE /* OverlayLibrary.swift in Sources */,
 				F7A7B7C7D7E7F70819293A7B /* OverlayMapBake.swift in Sources */,
+				A10BBUILDOPCV01 /* OpenCVBridge.swift in Sources */,
+				A10BBUILDSTM02 /* STMOpenCVBridge.mm in Sources */,
+				A10BBUILDPYR03 /* OverlayTilePyramid.swift in Sources */,
 				D01MAPRES0001BUILD001 /* OverlayMapPresentation.swift in Sources */,
 				2010B0010000PERS5000FILE /* PersistenceController.swift in Sources */,
 				69B2C7A02FAE246A00328C9F /* SnapToMapModel.xcdatamodeld in Sources */,
@@ -321,6 +365,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = SnapToMap/Info.plist;
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
@@ -335,6 +380,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.snaptomap;
 				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.example.snaptomap;
 				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "SnapToMap/SnapToMap-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
@@ -343,6 +389,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = SnapToMap/Info.plist;
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
@@ -357,6 +404,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.snaptomap;
 				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.example.snaptomap;
 				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "SnapToMap/SnapToMap-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
@@ -383,6 +431,21 @@
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		82E2BB3835854AF6BFC4BF7E /* XCLocalSwiftPackageReference "Packages/opencv-spm" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "Packages/opencv-spm";
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		E4FC44FEF6024B13B9A97CE4 /* OpenCVBinary */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 82E2BB3835854AF6BFC4BF7E /* XCLocalSwiftPackageReference "Packages/opencv-spm" */;
+			productName = OpenCVBinary;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCVersionGroup section */
 		69B2C79E2FAE246A00328C9F /* SnapToMapModel.xcdatamodeld */ = {

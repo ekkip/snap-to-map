@@ -1,4 +1,5 @@
 import CoreGraphics
+import ImageIO
 import MapKit
 import UIKit
 
@@ -22,6 +23,17 @@ extension UIImage {
 
     var rasterExceedsLargeOverlayPixelThreshold: Bool {
         rasterPixelCount() > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive
+    }
+
+    /// Pixel count from container metadata (**ImageIO**) without decoding the full bitmap — required for huge sources.
+    static func rasterPixelCount(forCompressedImageData data: Data) -> Int64? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? NSNumber,
+              let h = props[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return nil
+        }
+        return Int64(w.intValue) * Int64(h.intValue)
     }
 }
 

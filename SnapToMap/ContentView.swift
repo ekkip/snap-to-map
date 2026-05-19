@@ -32,12 +32,25 @@ struct ContentView: View {
     @State private var primaryCTAShowsActivity: Bool = false
     /// Bytes from **`PhotosPicker`** (`Data.self`); copied into Core Data on first save without recompression.
     @State private var draftSourceFileData: Data?
+    /// True when the **picked / persisted** raster exceeds **`OverlayLibrary.largeRasterOverlayPixelThresholdExclusive`** ( **`draftImage`** may be subsampled).
+    @State private var draftSourceExceedsLargeOverlayThreshold = false
     /// Nested saves bump this (e.g. rapid actions); indicator stays until all complete.
     @State private var overlayPersistenceInFlight: Int = 0
+    /// Debug-only current pyramid iteration z while background build is running.
+    @State private var debugPyramidIterationZoomLevel: Int?
+    /// Debug-only in-level progress x/L for current pyramid zoom level.
+    @State private var debugPyramidIterationTileIndex: Int?
+    @State private var debugPyramidIterationTileTotal: Int?
+    /// Debug-only elapsed seconds in current pyramid level.
+    @State private var debugPyramidIterationElapsedSeconds: Double?
+    /// Debug-only phase label (`preview` / `refine` / `full`) for pyramid progress.
+    @State private var debugPyramidIterationPhase: String?
     @StateObject private var mapBridge = MapViewBridge()
     private let persistence = PersistenceController.shared
     private let ciContext = CIContext()
     private let distortHandleDiameter: CGFloat = 31
+    /// Edit-mode warp preview: max input side before **`CIPerspectiveTransform`** (full-res graph over 400 MP stalls the main thread).
+    private let editWarpMaxSourceSide: CGFloat = 4096
     /// Fade warped draft **image** and **corner quad** during map motion in stick-to-map mode; 50 ms each way.
     private let draftMapMotionFadeDuration: TimeInterval = 0.05
     @State private var draftMapMotionImageOpacity: Double = 1
@@ -73,6 +86,7 @@ struct ContentView: View {
                 } else {
                     warpedDraftCGImage = nil
                     resetDraftMapMotionFadeState()
+                    draftSourceExceedsLargeOverlayThreshold = false
                 }
             }
             .onChange(of: draftWarpCacheSignature(canvas: geometry.size)) { _, _ in
@@ -99,6 +113,19 @@ struct ContentView: View {
                         collapseBrowsingOpacitySliderIfNeeded()
                         mapBridge.centerOnUserLocation()
                     }
+                    chromeIconButton(icon: "plus", fontSize: 20, hitFlushAlignment: .trailing) {
+                        collapseBrowsingOpacitySliderIfNeeded()
+                        mapBridge.zoomIn()
+                    }
+                    chromeIconButton(icon: "minus", fontSize: 20, hitFlushAlignment: .trailing) {
+                        collapseBrowsingOpacitySliderIfNeeded()
+                        mapBridge.zoomOut()
+                    }
+                    Text(String(format: "z %.2f", mapBridge.currentDebugZoomLevel))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.ultraThinMaterial, in: Capsule())
                 }
                 .simultaneousGesture(TapGesture().onEnded { collapseBrowsingOpacitySliderIfNeeded() })
                 .padding(.top, geometry.safeAreaInsets.top + 8)
@@ -138,6 +165,15 @@ struct ContentView: View {
                     collapseBrowsingOpacitySliderIfNeeded()
                 }
             }
+            .onChange(of: overlayPersistenceInFlight) { _, inFlight in
+                if inFlight <= 0, !hasRefiningPyramids {
+                    debugPyramidIterationZoomLevel = nil
+                    debugPyramidIterationTileIndex = nil
+                    debugPyramidIterationTileTotal = nil
+                    debugPyramidIterationElapsedSeconds = nil
+                    debugPyramidIterationPhase = nil
+                }
+            }
             .onAppear {
                 mapBridge.requestLocationAuthorizationIfNeeded()
                 mapBridge.rasterOpacity.committed = CGFloat(min(max(mapRasterOpacityCommitted, 0), 1))
@@ -145,8 +181,41 @@ struct ContentView: View {
                 mapBridge.applyRasterOverlayRendererAlphas()
                 if !hasAttemptedRestore {
                     hasAttemptedRestore = true
-                    restorePersistedOverlay()
+                    OverlayLibrary.resumePendingRefinements(in: persistence.container) {
+                        restorePersistedOverlay()
+                    }
                 }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .overlayTilePyramidIterationDidChange)) { note in
+                let finished = (note.userInfo?[OverlayTilePyramidBuilder.debugIterationFinishedKey] as? Bool) ?? false
+                if finished {
+                    if !hasRefiningPyramids && overlayPersistenceInFlight <= 0 {
+                        debugPyramidIterationZoomLevel = nil
+                        debugPyramidIterationTileIndex = nil
+                        debugPyramidIterationTileTotal = nil
+                        debugPyramidIterationElapsedSeconds = nil
+                        debugPyramidIterationPhase = nil
+                    }
+                    return
+                }
+                if let z = note.userInfo?[OverlayTilePyramidBuilder.debugIterationZoomLevelKey] as? Int {
+                    debugPyramidIterationZoomLevel = z
+                }
+                if let x = note.userInfo?[OverlayTilePyramidBuilder.debugIterationLevelTileIndexKey] as? Int {
+                    debugPyramidIterationTileIndex = x
+                }
+                if let total = note.userInfo?[OverlayTilePyramidBuilder.debugIterationLevelTileTotalKey] as? Int {
+                    debugPyramidIterationTileTotal = total
+                }
+                if let elapsed = note.userInfo?[OverlayTilePyramidBuilder.debugIterationElapsedSecondsKey] as? Double {
+                    debugPyramidIterationElapsedSeconds = elapsed
+                }
+                if let phase = note.userInfo?[OverlayTilePyramidBuilder.debugIterationPhaseKey] as? String {
+                    debugPyramidIterationPhase = phase
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .overlayTilePyramidRefinementDidComplete)) { _ in
+                restorePersistedOverlay()
             }
             .onChange(of: mapRasterOpacityCommitted) { _, _ in
                 if !isEditing, mapRasterOpacityDragging == nil {
@@ -198,6 +267,7 @@ struct ContentView: View {
 
     /// Center: `.primaryCTA` for Add / Done; uses `MapControlChrome.Appearance.primaryCTA`.
     private func bottomCenterControl(bottomInset: CGFloat) -> some View {
+        let hidePrimaryDuringRefine = !isEditing && hasRefiningPyramids && !primaryCTAShowsActivity
         let d = MapControlChrome.diameter
         let tap = d + 2
         return ZStack(alignment: .bottom) {
@@ -206,7 +276,9 @@ struct ContentView: View {
                 .frame(width: tap, height: tap)
                 .contentShape(Circle())
             Group {
-                if isEditing {
+                if hidePrimaryDuringRefine {
+                    EmptyView()
+                } else if isEditing {
                     if primaryCTAShowsActivity {
                         MapControlChrome.circularControl(.primaryCTA) {
                             ProgressView()
@@ -244,9 +316,10 @@ struct ContentView: View {
     /// Bottom-trailing: persistence spinner, then reset-distort above cancel when editing.
     @ViewBuilder
     private func bottomTrailingChrome(canvas: CGSize, bottomInset: CGFloat) -> some View {
-        if overlayPersistenceInFlight > 0 || isEditing {
+        if overlayPersistenceInFlight > 0 || hasRefiningPyramids || isEditing {
             VStack(alignment: .trailing, spacing: 8) {
-                if overlayPersistenceInFlight > 0 {
+                let shouldShowSyncIndicator = hasRefiningPyramids || (overlayPersistenceInFlight > 0 && !primaryCTAShowsActivity)
+                if shouldShowSyncIndicator {
                     overlayPersistenceSavingIndicator
                 }
                 if isEditing {
@@ -284,14 +357,49 @@ struct ContentView: View {
     }
 
     private var overlayPersistenceSavingIndicator: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30)) { context in
-            let degrees = (context.date.timeIntervalSinceReferenceDate * (360.0 / 1.35)).truncatingRemainder(dividingBy: 360)
-            Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90.circle.fill")
-                .font(.system(size: 26, weight: .medium))
-                .foregroundStyle(Color.primary)
-                .rotationEffect(.degrees(degrees))
-                .accessibilityLabel("Saving")
+        VStack(alignment: .trailing, spacing: 4) {
+            if let z = debugPyramidIterationZoomLevel {
+                let progressLabel: String = {
+                    let phasePrefix: String = {
+                        switch debugPyramidIterationPhase {
+                        case OverlayTilePyramidBuilder.BuildPhase.preview.rawValue:
+                            return "Preview"
+                        case OverlayTilePyramidBuilder.BuildPhase.refine.rawValue:
+                            return "Refine"
+                        case OverlayTilePyramidBuilder.BuildPhase.full.rawValue:
+                            return "Build"
+                        default:
+                            return "PyrDown"
+                        }
+                    }()
+                    let elapsedSuffix: String = {
+                        guard let elapsed = debugPyramidIterationElapsedSeconds else { return "" }
+                        return String(format: " %.1fs", elapsed)
+                    }()
+                    if let x = debugPyramidIterationTileIndex, let total = debugPyramidIterationTileTotal, total > 0 {
+                        return "\(phasePrefix) z\(z)\n\(x)/\(total)\(elapsedSuffix)"
+                    }
+                    return "\(phasePrefix) z\(z)\n\(elapsedSuffix)"
+                }()
+                Text(progressLabel)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: Capsule())
+            }
+            TimelineView(.animation(minimumInterval: 1 / 30)) { context in
+                let degrees = (context.date.timeIntervalSinceReferenceDate * (360.0 / 1.35)).truncatingRemainder(dividingBy: 360)
+                Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90.circle.fill")
+                    .font(.system(size: 26, weight: .medium))
+                    .foregroundStyle(Color.primary)
+                    .rotationEffect(.degrees(degrees))
+                    .accessibilityLabel("Saving")
+            }
         }
+    }
+
+    private var hasRefiningPyramids: Bool {
+        overlays.contains { $0.tilePyramid?.refinementInProgress == true }
     }
 
     /// **`hitFlushAlignment`** pins the **46** pt glass flush to that corner of the **`diameter+2`** tap cell so margins match **`MapControlChrome.diameter`** neighbours (compass / opacity); the extra **1 pt** ring is **inward** only.
@@ -376,7 +484,7 @@ struct ContentView: View {
 
     private var draftWarpDisplayOpacity: Double {
         guard let draftImage else { return 1 }
-        let v = draftImage.rasterExceedsLargeOverlayPixelThreshold
+        let v = draftSourceExceedsLargeOverlayThreshold
             ? draftOverlayOpacityCommitted
             : (draftOverlayOpacityDragging ?? draftOverlayOpacityCommitted)
         return min(max(v, 0), 1)
@@ -406,14 +514,27 @@ struct ContentView: View {
         await MainActor.run { primaryCTAShowsActivity = true }
 
         do {
-            guard let data = try await item.loadTransferable(type: Data.self),
-                  let image = UIImage(data: data) else {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                await MainActor.run { primaryCTAShowsActivity = false }
+                return
+            }
+
+            let loadedUIImage = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                let px = UIImage.rasterPixelCount(forCompressedImageData: data)
+                if let px, px > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive {
+                    return OverlayLibrary.uiImageSubsampling(from: data, maxPixelDimension: 8192)
+                }
+                return UIImage(data: data)
+            }.value
+
+            guard let image = loadedUIImage else {
                 await MainActor.run { primaryCTAShowsActivity = false }
                 return
             }
 
             await MainActor.run {
                 mapBridge.cancelPendingEditFit()
+                draftSourceExceedsLargeOverlayThreshold = (UIImage.rasterPixelCount(forCompressedImageData: data) ?? 0) > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive
                 draftImage = image
                 draftSourceFileData = data
                 draftAnchoredToMap = false
@@ -515,8 +636,16 @@ struct ContentView: View {
             return nil
         }
 
+        let extent = ciImage.extent
+        guard extent.width >= 1, extent.height >= 1 else { return nil }
+        let maxSide = max(extent.width, extent.height)
+        let scaleDown = min(1, editWarpMaxSourceSide / maxSide)
+        var scaledInput = ciImage.transformed(by: CGAffineTransform(scaleX: scaleDown, y: scaleDown))
+        let scaledExtent = scaledInput.extent.integral
+        scaledInput = scaledInput.transformed(by: CGAffineTransform(translationX: -scaledExtent.origin.x, y: -scaledExtent.origin.y))
+
         let filter = CIFilter.perspectiveTransform()
-        filter.inputImage = ciImage
+        filter.inputImage = scaledInput
         filter.topLeft = uiToCoreImage(point: quad[0], canvasHeight: size.height)
         filter.topRight = uiToCoreImage(point: quad[1], canvasHeight: size.height)
         filter.bottomRight = uiToCoreImage(point: quad[2], canvasHeight: size.height)
@@ -545,24 +674,40 @@ struct ContentView: View {
 
         mapBridge.cancelPendingEditFit()
         finalizeDraftRasterOpacityGestureEnd()
-        primaryCTAShowsActivity = false
+        primaryCTAShowsActivity = true
         overlayPersistenceInFlight += 1
 
         Task {
+            SnapMemoryInstrumentation.checkpoint("saveDraft.Task.begin overlayID=\(overlayID.uuidString.prefix(8))…")
             let mapDisplayImage = await Task.detached(priority: .userInitiated) {
                 OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: draftImage, corners: corners) ?? draftImage
             }.value
+            SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))…")
             let placementCamera = await MainActor.run { persistMapCameraSnapshot() }
+            let rasterBytes = preservedPick ?? editingOverlayBackup?.sourceRasterData
+            let intrinsicPixels: Int64 = {
+                if let rasterBytes, let px = UIImage.rasterPixelCount(forCompressedImageData: rasterBytes) {
+                    return px
+                }
+                return draftImage.rasterPixelCount()
+            }()
+            let sourceImageForModel = intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive && rasterBytes != nil
+                ? OverlayItem.browseSourceMemoryPlaceholder()
+                : draftImage
             await MainActor.run {
                 overlays.append(
                     OverlayItem(
                         id: overlayID,
-                        sourceImage: draftImage,
+                        sourceImage: sourceImageForModel,
                         mapDisplayImage: mapDisplayImage,
                         corners: corners,
                         placementCamera: placementCamera,
-                        preservedSourceFileData: preservedPick
+                        preservedSourceFileData: preservedPick,
+                        sourceRasterData: rasterBytes
                     )
+                )
+                SnapMemoryInstrumentation.checkpoint(
+                    "saveDraft.overlayAppendedMainActor id=\(overlayID.uuidString.prefix(8))… tiled=\(overlays.last?.usesTiledMapPresentation ?? false) overlays.count=\(overlays.count)"
                 )
 
                 self.draftImage = nil
@@ -580,16 +725,24 @@ struct ContentView: View {
                 finalizeBrowsingRasterOpacityInteraction()
 
                 let snap = overlays
+                SnapMemoryInstrumentation.checkpoint("saveDraft.beforeOverlayLibrary.saveOverlays overlayCount=\(snap.count)")
                 OverlayLibrary.saveOverlays(
                     snap,
                     in: persistence.container,
                     forceRewriteSource: false,
                     forceRewriteBaked: false
-                ) { _ in
+                ) { success in
+                    SnapMemoryInstrumentation.checkpoint("saveDraft.saveOverlays.completion success=\(success) id=\(overlayID.uuidString.prefix(8))…")
                     Task { @MainActor in
                         if let idx = overlays.firstIndex(where: { $0.id == overlayID }) {
                             overlays[idx].preservedSourceFileData = nil
                         }
+                        if success {
+                            // Swap to persisted overlay runtime info as soon as save/pyramid build finishes,
+                            // so browse mode stops using lazy first-run tile generation.
+                            restorePersistedOverlay()
+                        }
+                        primaryCTAShowsActivity = false
                         overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
                     }
                 }
@@ -685,8 +838,8 @@ struct ContentView: View {
             return
         }
 
-        draftImage = overlay.sourceImage
-        draftSourceFileData = nil
+        draftSourceFileData = overlay.preservedSourceFileData ?? overlay.sourceRasterData
+        draftSourceExceedsLargeOverlayThreshold = overlay.usesTiledMapPresentation
         draftAnchoredToMap = true
         draftGeoCorners = overlay.corners
         initialDraftGeoCorners = overlay.corners
@@ -700,8 +853,17 @@ struct ContentView: View {
         overlays.removeAll(where: { $0.id == overlay.id })
         editingOverlayBackup = overlay
         isEditing = true
-        updateWarpedDraftCache(canvas: canvas)
-        primaryCTAShowsActivity = false
+
+        Task {
+            let preview = await Task.detached(priority: .userInitiated) {
+                overlay.editingPreviewUIImage(maxPixelDimension: 8192)
+            }.value
+            await MainActor.run {
+                draftImage = preview ?? overlay.sourceImage
+                updateWarpedDraftCache(canvas: canvas)
+                primaryCTAShowsActivity = false
+            }
+        }
     }
 
     private func mapRect(for coordinates: [CLLocationCoordinate2D]) -> MKMapRect {
@@ -726,8 +888,11 @@ struct ContentView: View {
             in: persistence.container,
             forceRewriteSource: forceRewriteSource,
             forceRewriteBaked: forceRewriteBaked
-        ) { _ in
+        ) { success in
             Task { @MainActor in
+                if success {
+                    restorePersistedOverlay()
+                }
                 overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
             }
         }
