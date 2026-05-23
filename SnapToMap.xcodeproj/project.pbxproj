@@ -16,6 +16,9 @@
 		99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73FB23DC65473206083E68C0 /* OverlayModels.swift */; };
 		9A5972EAC9706CDA48CB9D9A /* MapViewBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0152501D7FD80FEE395C167 /* MapViewBridge.swift */; };
 		A10BBUILDOPCV01 /* OpenCVBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFOPCV01 /* OpenCVBridge.swift */; };
+		A10BBUILDHEIF01 /* OverlayTileHEIFEncoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFHEIF01 /* OverlayTileHEIFEncoding.swift */; };
+		A10BBUILDPROF01 /* OverlayTileBuildProfiling.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFPROF01 /* OverlayTileBuildProfiling.swift */; };
+		A10BBUILDREND01 /* OverlayTileRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFREND01 /* OverlayTileRenderer.swift */; };
 		A10BBUILDPYR03 /* OverlayTilePyramid.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFPYR03 /* OverlayTilePyramid.swift */; };
 		A10BBUILDSTM02 /* STMOpenCVBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFMMM02 /* STMOpenCVBridge.mm */; settings = {COMPILER_FLAGS = "-Wno-quoted-include-in-framework-header -Wno-documentation"; }; };
 		B04EBEEFCAFE0005D0D00005 /* BakedHEIFEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */; };
@@ -42,9 +45,12 @@
 		9498F353B016CE0333FC7F4A /* PicToMapApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PicToMapApp.swift; sourceTree = "<group>"; };
 		A0152501D7FD80FEE395C167 /* MapViewBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapViewBridge.swift; sourceTree = "<group>"; };
 		A10FREFBRGH03 /* SnapToMap-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SnapToMap-Bridging-Header.h"; sourceTree = "<group>"; };
+		A10FREFHEIF01 /* OverlayTileHEIFEncoding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTileHEIFEncoding.swift; sourceTree = "<group>"; };
 		A10FREFMMM02 /* STMOpenCVBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = STMOpenCVBridge.mm; sourceTree = "<group>"; };
 		A10FREFOPCV01 /* OpenCVBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenCVBridge.swift; sourceTree = "<group>"; };
+		A10FREFPROF01 /* OverlayTileBuildProfiling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTileBuildProfiling.swift; sourceTree = "<group>"; };
 		A10FREFPYR03 /* OverlayTilePyramid.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTilePyramid.swift; sourceTree = "<group>"; };
+		A10FREFREND01 /* OverlayTileRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTileRenderer.swift; sourceTree = "<group>"; };
 		A10FREFSTMH01 /* STMOpenCVBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = STMOpenCVBridge.h; sourceTree = "<group>"; };
 		B199887766554433221100FF /* ImageRasterMapOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageRasterMapOverlay.swift; sourceTree = "<group>"; };
 		D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMapPresentation.swift; sourceTree = "<group>"; };
@@ -81,6 +87,9 @@
 				2010F0020000OVER5000FILE /* OverlayLibrary.swift */,
 				F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */,
 				D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */,
+				A10FREFHEIF01 /* OverlayTileHEIFEncoding.swift */,
+				A10FREFPROF01 /* OverlayTileBuildProfiling.swift */,
+				A10FREFREND01 /* OverlayTileRenderer.swift */,
 				A10FREFOPCV01 /* OpenCVBridge.swift */,
 				A10FREFSTMH01 /* STMOpenCVBridge.h */,
 				A10FREFMMM02 /* STMOpenCVBridge.mm */,
@@ -223,6 +232,9 @@
 				F7A7B7C7D7E7F70819293A7B /* OverlayMapBake.swift in Sources */,
 				A10BBUILDOPCV01 /* OpenCVBridge.swift in Sources */,
 				A10BBUILDSTM02 /* STMOpenCVBridge.mm in Sources */,
+				A10BBUILDHEIF01 /* OverlayTileHEIFEncoding.swift in Sources */,
+				A10BBUILDPROF01 /* OverlayTileBuildProfiling.swift in Sources */,
+				A10BBUILDREND01 /* OverlayTileRenderer.swift in Sources */,
 				A10BBUILDPYR03 /* OverlayTilePyramid.swift in Sources */,
 				D01MAPRES0001BUILD001 /* OverlayMapPresentation.swift in Sources */,
 				2010B0010000PERS5000FILE /* PersistenceController.swift in Sources */,

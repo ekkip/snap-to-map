@@ -9,7 +9,7 @@ import UIKit
 
 /// Caps simultaneous **`CGImageSource`** thumbnail work app‑wide. **`MKTileOverlay`** fires many concurrent loads; each HEIF decode can briefly allocate a very large buffer before downsample (**jetsam** / **`EXC_RESOURCE`**).
 enum ImageIODecodeLimiter {
-    private static let semaphore = DispatchSemaphore(value: 2)
+    private static let semaphore = DispatchSemaphore(value: 1)
 
     static func synchronizing<T>(_ work: () throws -> T) rethrows -> T {
         semaphore.wait()
@@ -142,7 +142,7 @@ enum OverlayMapBake {
         return scaled.transformed(by: CGAffineTransform(translationX: -scaled.extent.origin.x, y: -scaled.extent.origin.y))
     }
 
-    /// Normalized **`CGImage`** for geometry pipelines (OpenCV / Core Image); internal so **`OpenCVBridge`** can reuse the same convention.
+    /// Normalized **`CGImage`** for Core Image / OpenCV geometry pipelines.
     static func normalizedCGImage(from image: UIImage) -> CGImage? {
         if image.imageOrientation == .up, let cg = image.cgImage { return cg }
         let format = UIGraphicsImageRendererFormat()
@@ -179,24 +179,41 @@ enum OverlayMapBake {
 
     // MARK: - Per-tile LOD from compressed source (ImageIO)
 
-    private static let tileRenderCIContext = CIContext(options: [.highQualityDownsample: true])
+    private static let tileRenderCIContext = CIContext(options: [
+        .highQualityDownsample: true,
+        .cacheIntermediates: false,
+    ])
     /// Hard cap on thumbnail longest‑edge per tile decode. **`MKTileOverlay`** requests overlap heavily; **`8192`**-class decodes × parallelism blew past jetsam (**`EXC_RESOURCE`**).
-    private static let maxThumbnailDecodeSide = 4608
+    static let maxThumbnailDecodeSide = 4608
     /// Quantize thumbnail decode targets to improve cache reuse across neighboring tiles.
     private static let thumbnailDecodeBucket: Int = 256
+    private static var thumbnailCacheScope = ""
     private final class ThumbnailBox: NSObject {
         let image: CGImage
         init(_ image: CGImage) { self.image = image }
     }
     private static let thumbnailCache: NSCache<NSString, ThumbnailBox> = {
         let c = NSCache<NSString, ThumbnailBox>()
-        c.countLimit = 12
+        c.countLimit = 16
         c.totalCostLimit = 96 * 1024 * 1024
         return c
     }()
 
-    /// One map tile as PNG: Mercator warp matches **`bakeMercatorDisplayTexture`**, but **`sourceRaster`** is decoded via **`ImageIO`** only as large as this zoom needs.
-    static func pngMercatorTileFromSourceRaster(
+    /// Clears the thumbnail cache when a new pyramid revision starts (avoids stale entries across edits).
+    static func beginThumbnailCacheScope(_ scope: String) {
+        if scope != thumbnailCacheScope {
+            thumbnailCacheScope = scope
+            thumbnailCache.removeAllObjects()
+        }
+    }
+
+    /// Releases decoded source thumbnails after a pyramid build finishes or is superseded.
+    static func endThumbnailCacheScope() {
+        thumbnailCache.removeAllObjects()
+    }
+
+    /// One map tile as HEIF: Mercator warp matches **`bakeMercatorDisplayTexture`**, but **`sourceRaster`** is decoded via **`ImageIO`** only as large as this zoom needs.
+    static func mercatorTileHEIFDataFromSourceRaster(
         sourceRaster: Data,
         corners: [CLLocationCoordinate2D],
         mercatorPixelWidth W: Int,
@@ -206,7 +223,8 @@ enum OverlayMapBake {
         clipped: MKMapRect,
         tileSize: CGSize,
         contentScale: CGFloat,
-        maxThumbnailDecodeSideOverride: Int? = nil
+        maxThumbnailDecodeSideOverride: Int? = nil,
+        thumbnailCacheScope: String = ""
     ) -> Data? {
         guard corners.count == 4, W >= 1, H >= 1 else { return nil }
         guard let geom = mercatorTileGeometry(
@@ -238,7 +256,13 @@ enum OverlayMapBake {
             )
         )
 
-        guard let cgThumb = cachedCGImageThumbnail(from: sourceRaster, maxPixelSize: quantizedSide) else { return nil }
+        let decodeStart = CFAbsoluteTimeGetCurrent()
+        guard let cgThumb = cachedCGImageThumbnail(
+            from: sourceRaster,
+            maxPixelSize: quantizedSide,
+            cacheScope: thumbnailCacheScope
+        ) else { return nil }
+        OverlayTileBuildProfiling.record(.decode, seconds: CFAbsoluteTimeGetCurrent() - decodeStart)
         let ciInput = CIImage(cgImage: cgThumb)
 
         let bboxRect = mapBoundingMapRect(for: corners)
@@ -287,11 +311,20 @@ enum OverlayMapBake {
         guard let composited = composite.outputImage?.cropped(to: targetExtent) else { return nil }
 
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let warpStart = CFAbsoluteTimeGetCurrent()
         guard let cgSlice = tileRenderCIContext.createCGImage(composited, from: targetExtent, format: .RGBA8, colorSpace: colorSpace)
                 ?? tileRenderCIContext.createCGImage(composited, from: targetExtent) else {
             return nil
         }
 
+        let tileFullyCoversOutput =
+            geom.destX <= 0.5
+            && geom.destY <= 0.5
+            && (geom.destX + geom.destWidth) >= geom.outputWidth - 0.5
+            && (geom.destY + geom.destHeight) >= geom.outputHeight - 0.5
+        let bitmapInfo = tileFullyCoversOutput
+            ? CGImageAlphaInfo.noneSkipLast.rawValue
+            : CGImageAlphaInfo.premultipliedLast.rawValue
         guard let outSpace = CGColorSpace(name: CGColorSpace.sRGB),
               let ctx = CGContext(
                   data: nil,
@@ -300,14 +333,50 @@ enum OverlayMapBake {
                   bitsPerComponent: 8,
                   bytesPerRow: 0,
                   space: outSpace,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  bitmapInfo: bitmapInfo
               ) else { return nil }
         ctx.interpolationQuality = .high
-        ctx.clear(CGRect(x: 0, y: 0, width: geom.outputWidth, height: geom.outputHeight))
-        let drawY = geom.outputHeight - (geom.destY + geom.destHeight)
-        ctx.draw(cgSlice, in: CGRect(x: geom.destX, y: drawY, width: geom.destWidth, height: geom.destHeight))
+        if tileFullyCoversOutput {
+            ctx.draw(cgSlice, in: CGRect(x: geom.destX, y: geom.outputHeight - (geom.destY + geom.destHeight), width: geom.destWidth, height: geom.destHeight))
+        } else {
+            ctx.clear(CGRect(x: 0, y: 0, width: geom.outputWidth, height: geom.outputHeight))
+            let drawY = geom.outputHeight - (geom.destY + geom.destHeight)
+            ctx.draw(cgSlice, in: CGRect(x: geom.destX, y: drawY, width: geom.destWidth, height: geom.destHeight))
+        }
         guard let outCg = ctx.makeImage() else { return nil }
-        return pngData(from: outCg)
+        OverlayTileBuildProfiling.record(.warp, seconds: CFAbsoluteTimeGetCurrent() - warpStart)
+
+        let encodeStart = CFAbsoluteTimeGetCurrent()
+        let data = heifData(from: outCg, knownOpaque: tileFullyCoversOutput)
+        OverlayTileBuildProfiling.record(.encode, seconds: CFAbsoluteTimeGetCurrent() - encodeStart)
+        return data
+    }
+
+    /// Backward-compatible name; prefer **`mercatorTileHEIFDataFromSourceRaster`**.
+    static func pngMercatorTileFromSourceRaster(
+        sourceRaster: Data,
+        corners: [CLLocationCoordinate2D],
+        mercatorPixelWidth W: Int,
+        mercatorPixelHeight H: Int,
+        tileRect: MKMapRect,
+        bbox: MKMapRect,
+        clipped: MKMapRect,
+        tileSize: CGSize,
+        contentScale: CGFloat,
+        maxThumbnailDecodeSideOverride: Int? = nil
+    ) -> Data? {
+        mercatorTileHEIFDataFromSourceRaster(
+            sourceRaster: sourceRaster,
+            corners: corners,
+            mercatorPixelWidth: W,
+            mercatorPixelHeight: H,
+            tileRect: tileRect,
+            bbox: bbox,
+            clipped: clipped,
+            tileSize: tileSize,
+            contentScale: contentScale,
+            maxThumbnailDecodeSideOverride: maxThumbnailDecodeSideOverride
+        )
     }
 
     static func nativeMaxZoomLevelFromSourceRaster(
@@ -425,8 +494,9 @@ enum OverlayMapBake {
         }
     }
 
-    private static func cachedCGImageThumbnail(from data: Data, maxPixelSize: Int) -> CGImage? {
-        let key = NSString(string: thumbnailCacheKey(data: data, side: max(1, maxPixelSize)))
+    private static func cachedCGImageThumbnail(from data: Data, maxPixelSize: Int, cacheScope: String) -> CGImage? {
+        let scopePrefix = cacheScope.isEmpty ? "" : "\(cacheScope)-"
+        let key = NSString(string: "\(scopePrefix)\(thumbnailCacheKey(data: data, side: max(1, maxPixelSize)))")
         if let box = thumbnailCache.object(forKey: key) {
             return box.image
         }
@@ -442,7 +512,7 @@ enum OverlayMapBake {
         return "\(data.count)-\(side)-\(head)-\(tail)"
     }
 
-    private static func pngData(from cgImage: CGImage) -> Data? {
-        OverlayLibrary.encodeTileImageData(cgImage)
+    private static func heifData(from cgImage: CGImage, knownOpaque: Bool = false) -> Data? {
+        OverlayTileHEIFEncoding.encodeTileImageData(cgImage, knownOpaque: knownOpaque)
     }
 }

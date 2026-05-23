@@ -51,6 +51,8 @@ struct ContentView: View {
     private let distortHandleDiameter: CGFloat = 31
     /// Edit-mode warp preview: max input side before **`CIPerspectiveTransform`** (full-res graph over 400 MP stalls the main thread).
     private let editWarpMaxSourceSide: CGFloat = 4096
+    private let editWarpMaxSourceSideLargeRaster: CGFloat = 2048
+    @State private var warpedDraftUpdateTask: Task<Void, Never>?
     /// Fade warped draft **image** and **corner quad** during map motion in stick-to-map mode; 50 ms each way.
     private let draftMapMotionFadeDuration: TimeInterval = 0.05
     @State private var draftMapMotionImageOpacity: Double = 1
@@ -182,7 +184,9 @@ struct ContentView: View {
                 if !hasAttemptedRestore {
                     hasAttemptedRestore = true
                     OverlayLibrary.resumePendingRefinements(in: persistence.container) {
-                        restorePersistedOverlay()
+                        OverlayLibrary.resumeUnderestimatedPyramidCeilings(in: persistence.container) {
+                            restorePersistedOverlay()
+                        }
                     }
                 }
             }
@@ -267,7 +271,6 @@ struct ContentView: View {
 
     /// Center: `.primaryCTA` for Add / Done; uses `MapControlChrome.Appearance.primaryCTA`.
     private func bottomCenterControl(bottomInset: CGFloat) -> some View {
-        let hidePrimaryDuringRefine = !isEditing && hasRefiningPyramids && !primaryCTAShowsActivity
         let d = MapControlChrome.diameter
         let tap = d + 2
         return ZStack(alignment: .bottom) {
@@ -276,9 +279,7 @@ struct ContentView: View {
                 .frame(width: tap, height: tap)
                 .contentShape(Circle())
             Group {
-                if hidePrimaryDuringRefine {
-                    EmptyView()
-                } else if isEditing {
+                if isEditing {
                     if primaryCTAShowsActivity {
                         MapControlChrome.circularControl(.primaryCTA) {
                             ProgressView()
@@ -290,12 +291,6 @@ struct ContentView: View {
                             collapseBrowsingOpacitySliderIfNeeded()
                             saveDraftAsOverlay()
                         }
-                    }
-                } else if primaryCTAShowsActivity {
-                    MapControlChrome.circularControl(.primaryCTA) {
-                        ProgressView()
-                            .progressViewStyle(.circular)
-                            .tint(.white)
                     }
                 } else {
                     PhotosPicker(selection: $selectedItem, matching: .images) {
@@ -318,7 +313,7 @@ struct ContentView: View {
     private func bottomTrailingChrome(canvas: CGSize, bottomInset: CGFloat) -> some View {
         if overlayPersistenceInFlight > 0 || hasRefiningPyramids || isEditing {
             VStack(alignment: .trailing, spacing: 8) {
-                let shouldShowSyncIndicator = hasRefiningPyramids || (overlayPersistenceInFlight > 0 && !primaryCTAShowsActivity)
+                let shouldShowSyncIndicator = hasRefiningPyramids || overlayPersistenceInFlight > 0
                 if shouldShowSyncIndicator {
                     overlayPersistenceSavingIndicator
                 }
@@ -399,7 +394,10 @@ struct ContentView: View {
     }
 
     private var hasRefiningPyramids: Bool {
-        overlays.contains { $0.tilePyramid?.refinementInProgress == true }
+        overlays.contains { item in
+            item.tilePyramid?.refinementInProgress == true
+                || (item.usesTiledMapPresentation && item.tilePyramid == nil)
+        }
     }
 
     /// **`hitFlushAlignment`** pins the **46** pt glass flush to that corner of the **`diameter+2`** tap cell so margins match **`MapControlChrome.diameter`** neighbours (compass / opacity); the extra **1 pt** ring is **inward** only.
@@ -440,11 +438,22 @@ struct ContentView: View {
     }
 
     private func updateWarpedDraftCache(canvas: CGSize) {
+        warpedDraftUpdateTask?.cancel()
         guard isEditing, let image = draftImage, draftQuad.count == 4, canvas.width > 1, canvas.height > 1 else {
             warpedDraftCGImage = nil
             return
         }
-        warpedDraftCGImage = warpedImageCG(for: image, size: canvas, quad: draftQuad)
+        let quad = draftQuad
+        let useLargeRasterCap = draftSourceExceedsLargeOverlayThreshold
+        warpedDraftUpdateTask = Task {
+            let warped = await Task.detached(priority: .userInitiated) {
+                Self.warpedDraftCGImage(for: image, size: canvas, quad: quad, largeRaster: useLargeRasterCap)
+            }.value
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                warpedDraftCGImage = warped
+            }
+        }
     }
 
     private func editGizmos(canvas: CGSize) -> some View {
@@ -631,32 +640,37 @@ struct ContentView: View {
         }
     }
 
-    private func warpedImageCG(for image: UIImage, size: CGSize, quad: [CGPoint]) -> CGImage? {
-        guard size.width > 0, size.height > 0, quad.count == 4, let ciImage = CIImage(image: image) else {
-            return nil
-        }
-
+    private static func warpedDraftCGImage(for image: UIImage, size: CGSize, quad: [CGPoint], largeRaster: Bool) -> CGImage? {
+        guard size.width > 0, size.height > 0, quad.count == 4 else { return nil }
+        let maxSideCap: CGFloat = largeRaster ? 2048 : 4096 // mirrors editWarpMaxSourceSideLargeRaster / editWarpMaxSourceSide
+        guard let cgIn = OverlayMapBake.normalizedCGImage(from: image) else { return nil }
+        var ciImage = CIImage(cgImage: cgIn)
         let extent = ciImage.extent
         guard extent.width >= 1, extent.height >= 1 else { return nil }
         let maxSide = max(extent.width, extent.height)
-        let scaleDown = min(1, editWarpMaxSourceSide / maxSide)
+        let scaleDown = min(1, maxSideCap / maxSide)
         var scaledInput = ciImage.transformed(by: CGAffineTransform(scaleX: scaleDown, y: scaleDown))
         let scaledExtent = scaledInput.extent.integral
         scaledInput = scaledInput.transformed(by: CGAffineTransform(translationX: -scaledExtent.origin.x, y: -scaledExtent.origin.y))
 
         let filter = CIFilter.perspectiveTransform()
         filter.inputImage = scaledInput
-        filter.topLeft = uiToCoreImage(point: quad[0], canvasHeight: size.height)
-        filter.topRight = uiToCoreImage(point: quad[1], canvasHeight: size.height)
-        filter.bottomRight = uiToCoreImage(point: quad[2], canvasHeight: size.height)
-        filter.bottomLeft = uiToCoreImage(point: quad[3], canvasHeight: size.height)
+        filter.topLeft = uiToCoreImageStatic(point: quad[0], canvasHeight: size.height)
+        filter.topRight = uiToCoreImageStatic(point: quad[1], canvasHeight: size.height)
+        filter.bottomRight = uiToCoreImageStatic(point: quad[2], canvasHeight: size.height)
+        filter.bottomLeft = uiToCoreImageStatic(point: quad[3], canvasHeight: size.height)
 
         guard let output = filter.outputImage else { return nil }
-        let cropRect = CGRect(origin: .zero, size: size)
-        return ciContext.createCGImage(output, from: cropRect)
+        let outScale = min(1, maxSideCap / max(size.width, size.height))
+        let cropRect = CGRect(
+            origin: .zero,
+            size: CGSize(width: max(1, size.width * outScale), height: max(1, size.height * outScale))
+        )
+        let ctx = CIContext(options: [.cacheIntermediates: false])
+        return ctx.createCGImage(output, from: cropRect)
     }
 
-    private func uiToCoreImage(point: CGPoint, canvasHeight: CGFloat) -> CGPoint {
+    private static func uiToCoreImageStatic(point: CGPoint, canvasHeight: CGFloat) -> CGPoint {
         CGPoint(x: point.x, y: canvasHeight - point.y)
     }
 
@@ -679,8 +693,15 @@ struct ContentView: View {
 
         Task {
             SnapMemoryInstrumentation.checkpoint("saveDraft.Task.begin overlayID=\(overlayID.uuidString.prefix(8))…")
+            let rasterBytesForBake = preservedPick ?? editingOverlayBackup?.sourceRasterData
             let mapDisplayImage = await Task.detached(priority: .userInitiated) {
-                OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: draftImage, corners: corners) ?? draftImage
+                if let rasterBytesForBake,
+                   let px = UIImage.rasterPixelCount(forCompressedImageData: rasterBytesForBake),
+                   px > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive,
+                   let subsampled = OverlayLibrary.uiImageSubsampling(from: rasterBytesForBake, maxPixelDimension: 4096) {
+                    return OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: subsampled, corners: corners) ?? subsampled
+                }
+                return OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: draftImage, corners: corners) ?? draftImage
             }.value
             SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))…")
             let placementCamera = await MainActor.run { persistMapCameraSnapshot() }
@@ -694,6 +715,17 @@ struct ContentView: View {
             let sourceImageForModel = intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive && rasterBytes != nil
                 ? OverlayItem.browseSourceMemoryPlaceholder()
                 : draftImage
+            let pendingPyramid: OverlayTilePyramidRuntimeInfo? =
+                intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive
+                ? OverlayTilePyramidRuntimeInfo(
+                    revision: -1,
+                    minimumZoom: -1,
+                    maximumZoom: -1,
+                    previewMaximumZoom: -1,
+                    fullMaximumZoom: -1,
+                    refinementInProgress: true
+                )
+                : nil
             await MainActor.run {
                 overlays.append(
                     OverlayItem(
@@ -703,13 +735,16 @@ struct ContentView: View {
                         corners: corners,
                         placementCamera: placementCamera,
                         preservedSourceFileData: preservedPick,
-                        sourceRasterData: rasterBytes
+                        sourceRasterData: rasterBytes,
+                        tilePyramid: pendingPyramid
                     )
                 )
                 SnapMemoryInstrumentation.checkpoint(
                     "saveDraft.overlayAppendedMainActor id=\(overlayID.uuidString.prefix(8))… tiled=\(overlays.last?.usesTiledMapPresentation ?? false) overlays.count=\(overlays.count)"
                 )
 
+                self.warpedDraftUpdateTask?.cancel()
+                OverlayLibrary.setPyramidBuildSuppressed(overlayID, suppressed: false)
                 self.draftImage = nil
                 draftSourceFileData = nil
                 draftQuad = []
@@ -721,6 +756,7 @@ struct ContentView: View {
 
                 browserOpacitySliderCollapsed = true
                 isEditing = false
+                primaryCTAShowsActivity = false
                 selectedItem = nil
                 finalizeBrowsingRasterOpacityInteraction()
 
@@ -738,11 +774,8 @@ struct ContentView: View {
                             overlays[idx].preservedSourceFileData = nil
                         }
                         if success {
-                            // Swap to persisted overlay runtime info as soon as save/pyramid build finishes,
-                            // so browse mode stops using lazy first-run tile generation.
                             restorePersistedOverlay()
                         }
-                        primaryCTAShowsActivity = false
                         overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
                     }
                 }
@@ -753,6 +786,10 @@ struct ContentView: View {
     private func cancelEditing() {
         mapBridge.cancelPendingEditFit()
         primaryCTAShowsActivity = false
+        warpedDraftUpdateTask?.cancel()
+        if let backup = editingOverlayBackup {
+            OverlayLibrary.setPyramidBuildSuppressed(backup.id, suppressed: false)
+        }
         draftImage = nil
         draftSourceFileData = nil
         draftQuad = []
@@ -774,6 +811,10 @@ struct ContentView: View {
     private func removeEditingOverlay() {
         mapBridge.cancelPendingEditFit()
         primaryCTAShowsActivity = false
+        warpedDraftUpdateTask?.cancel()
+        if let backup = editingOverlayBackup {
+            OverlayLibrary.setPyramidBuildSuppressed(backup.id, suppressed: false)
+        }
         draftImage = nil
         draftSourceFileData = nil
         draftQuad = []
@@ -794,6 +835,11 @@ struct ContentView: View {
               let overlay = overlays.first(where: { $0.id == id }) else {
             return
         }
+
+        // Drop tiled overlay + pyramid work before camera handoff so 400MP browse does not jetsam during edit entry.
+        editingOverlayBackup = overlay
+        OverlayLibrary.setPyramidBuildSuppressed(overlay.id, suppressed: true)
+        overlays.removeAll(where: { $0.id == overlay.id })
 
         primaryCTAShowsActivity = overlay.usesTiledMapPresentation
 
@@ -833,7 +879,7 @@ struct ContentView: View {
 
     private func applyMapEditTransition(_ handoff: MapEditHandoff, canvas: CGSize) {
         let overlay = handoff.overlay
-        guard !isEditing, overlays.contains(where: { $0.id == overlay.id }) else {
+        guard !isEditing else {
             primaryCTAShowsActivity = false
             return
         }
@@ -850,13 +896,17 @@ struct ContentView: View {
         draftOverlayOpacityDragging = nil
         browserOpacitySliderCollapsed = false
         finalizeBrowsingRasterOpacityInteraction()
-        overlays.removeAll(where: { $0.id == overlay.id })
-        editingOverlayBackup = overlay
+        if editingOverlayBackup?.id != overlay.id {
+            editingOverlayBackup = overlay
+            overlays.removeAll(where: { $0.id == overlay.id })
+        }
+        OverlayLibrary.setPyramidBuildSuppressed(overlay.id, suppressed: true)
         isEditing = true
 
         Task {
+            let previewMax: CGFloat = overlay.usesTiledMapPresentation ? 2048 : 4096
             let preview = await Task.detached(priority: .userInitiated) {
-                overlay.editingPreviewUIImage(maxPixelDimension: 8192)
+                overlay.editingPreviewUIImage(maxPixelDimension: previewMax)
             }.value
             await MainActor.run {
                 draftImage = preview ?? overlay.sourceImage

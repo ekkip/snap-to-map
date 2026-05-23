@@ -3,6 +3,10 @@ import Foundation
 import UIKit
 
 /// Swift façade over **`STMOpenCVBridge`** (Objective-C++ / OpenCV). App code calls into this type only.
+///
+/// **Note:** Offline pyramid tiles use the ImageIO + Core Image path (`OverlayTileRenderer`). This bridge is
+/// **kept linked** for upcoming implementation steps (e.g. alternate warp / `pyrDown` experiments) — do not remove
+/// without checking the migration plan.
 enum OpenCVBridge {
 
     enum BridgeError: Error {

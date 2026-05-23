@@ -10,8 +10,11 @@ extension Notification.Name {
     static let overlayTilePyramidIterationDidChange = Notification.Name("overlayTilePyramidIterationDidChange")
 }
 
-/// Generates MapKit **`MKTileOverlayPath`** PNG pyramids under **`OverlayLibrary`** storage and updates **`StoredMapOverlay`** zoom metadata.
+/// Generates MapKit **`MKTileOverlayPath`** HEIF pyramids under **`OverlayLibrary`** storage and updates **`StoredMapOverlay`** zoom metadata.
 enum OverlayTilePyramidBuilder {
+    private static let pyramidWorkerCount = 2
+    /// One pyramid build at a time app‑wide (**`performBackgroundTask`** nesting previously ran refine + preview concurrently → jetsam).
+    private static let pyramidBuildGate = DispatchSemaphore(value: 1)
     enum BuildPhase: String {
         case preview
         case refine
@@ -113,8 +116,59 @@ enum OverlayTilePyramidBuilder {
         context: NSManagedObjectContext
     ) throws {
         guard corners.count == 4 else { return }
+        if OverlayLibrary.isPyramidBuildSuppressed(overlayID) {
+            print("[TileDiag] build.skip id=\(overlayID.uuidString.prefix(8))… rev=\(revision) suppressedDuringEdit")
+            return
+        }
         let overlayTag = String(overlayID.uuidString.prefix(8))
+        let thumbnailCacheScope = "\(overlayID.uuidString)-\(revision)"
+        OverlayMapBake.beginThumbnailCacheScope(thumbnailCacheScope)
+        try OverlayTileBuildProfiling.withSession(label: "pyramid id=\(overlayTag) rev=\(revision) phase=\(phase.rawValue)") {
+            try buildAndPersistRowImpl(
+                overlayID: overlayID,
+                revision: revision,
+                sourceRaster: sourceRaster,
+                corners: corners,
+                bakedMercatorDisplay: bakedMercatorDisplay,
+                geometryFlipped: geometryFlipped,
+                referenceScreenScale: referenceScreenScale,
+                phase: phase,
+                buildMinimumZoom: buildMinimumZoom,
+                buildMaximumZoom: buildMaximumZoom,
+                advertisedAvailableMaximumZoom: advertisedAvailableMaximumZoom,
+                targetFullMaximumZoom: targetFullMaximumZoom,
+                previewMaximumZoom: previewMaximumZoom,
+                row: row,
+                context: context,
+                overlayTag: overlayTag,
+                thumbnailCacheScope: thumbnailCacheScope
+            )
+        }
+    }
+
+    private static func buildAndPersistRowImpl(
+        overlayID: UUID,
+        revision: Int64,
+        sourceRaster: Data,
+        corners: [CLLocationCoordinate2D],
+        bakedMercatorDisplay: UIImage,
+        geometryFlipped: Bool,
+        referenceScreenScale: CGFloat,
+        phase: BuildPhase,
+        buildMinimumZoom: Int?,
+        buildMaximumZoom: Int?,
+        advertisedAvailableMaximumZoom: Int?,
+        targetFullMaximumZoom: Int?,
+        previewMaximumZoom: Int?,
+        row: StoredMapOverlay,
+        context: NSManagedObjectContext,
+        overlayTag: String,
+        thumbnailCacheScope: String
+    ) throws {
+        pyramidBuildGate.wait()
         defer {
+            pyramidBuildGate.signal()
+            OverlayMapBake.endThumbnailCacheScope()
             postIterationNotification(
                 [
                     debugIterationOverlayIDKey: overlayID.uuidString,
@@ -123,6 +177,7 @@ enum OverlayTilePyramidBuilder {
                 ]
             )
         }
+        OverlayLibrary.noteActivePyramidBuildRevision(overlayID, revision: revision)
         SnapMemoryInstrumentation.checkpoint(
             "pyramid.build.begin id=\(overlayTag)… rev=\(revision) sourceBytes=\(sourceRaster.count)"
         )
@@ -178,6 +233,14 @@ enum OverlayTilePyramidBuilder {
         let minimumZ: Int = buildMinimumZoom ?? ceilings.minimumZ
         let maximumZ: Int = buildMaximumZoom ?? fullMaximumZ
         guard maximumZ >= minimumZ else { return }
+        guard OverlayLibrary.isCurrentPyramidBuildRevision(overlayID, revision: revision) else {
+            print("[TileDiag] build.abort id=\(overlayTag) rev=\(revision) superseded")
+            return
+        }
+
+        let sourcePixelCount = Int64(intrinsic.width) * Int64(intrinsic.height)
+        let heavySource = sourcePixelCount > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive
+        let workerCount = heavySource ? 1 : pyramidWorkerCount
 
         SnapMemoryInstrumentation.checkpoint(
             "pyramid.config.ready pyramidTex=\(mercatorWidth)x\(mercatorHeight) fileIntrinsic=\(intrinsic.width)x\(intrinsic.height) maximumZ=\(maximumZ)"
@@ -227,8 +290,12 @@ enum OverlayTilePyramidBuilder {
             CGFloat(intrinsic.width) / max(1, CGFloat(bbox.size.width)),
             CGFloat(intrinsic.height) / max(1, CGFloat(bbox.size.height))
         )
-        let requiredTilePixels = OverlayLibrary.logicalTileSizePoints * OverlayLibrary.tileDetailReferenceScale
+        let requiredTilePixels = OverlayLibrary.logicalTileSizePoints * OverlayLibrary.tileDetailScreenScaleForNativeMaxZoom()
         for z in stride(from: maximumZ, through: minimumZ, by: -1) {
+            guard OverlayLibrary.isCurrentPyramidBuildRevision(overlayID, revision: revision) else {
+                print("[TileDiag] build.abort id=\(overlayTag) rev=\(revision) superseded at z=\(z)")
+                return
+            }
             let levelStartedAt = Date()
             let levelPadTiles = (z == maximumZ) ? 0 : 2
             postIterationNotification(
@@ -243,7 +310,7 @@ enum OverlayTilePyramidBuilder {
             )
             var writtenAtZ = 0
             var attemptedAtZ = 0
-            var pngNilAtZ = 0
+            var tileNilAtZ = 0
             if let xy = intersectingTileIndexBounds(
                 mapBoundingRect: bbox,
                 z: z,
@@ -286,55 +353,60 @@ enum OverlayTilePyramidBuilder {
                 }
                 let cellCoords: [(x: Int, y: Int)] = (xy.x0...xy.x1).flatMap { x in (xy.y0...xy.y1).map { (x: x, y: $0) } }
 
-                func processCell(x: Int, y: Int) throws -> (attempted: Int, written: Int, pngNil: Int) {
+                func processCell(x: Int, y: Int) throws -> (attempted: Int, written: Int, tileNil: Int) {
+                    guard OverlayLibrary.isCurrentPyramidBuildRevision(overlayID, revision: revision) else {
+                        return (0, 0, 0)
+                    }
                     let path = MKTileOverlayPath(x: x, y: y, z: z, contentScaleFactor: 1)
                     let tileRect = BakedImageMapTileOverlay.mercatorMapRectForOfflinePyramid(path: path, geometryFlipped: geometryFlipped)
                     let clipped = bbox.intersection(tileRect)
                     guard !clipped.isNull, !clipped.isEmpty else { return (0, 0, 0) }
                     var attempted = 0
                     var written = 0
-                    var pngNil = 0
+                    var tileNil = 0
                     for scale in scales {
                         attempted += 1
                         let scaledPath = MKTileOverlayPath(x: x, y: y, z: z, contentScaleFactor: scale)
+                        let decodeSideOverride: Int? = z == maximumZ
+                            ? OverlayMapBake.maxThumbnailDecodeSide
+                            : OverlayTileRenderer.thumbnailDecodeSide(
+                                sourcePixelsPerMapPoint: sourcePixelsPerMapPoint,
+                                z: z,
+                                maxThumbnailDecodeSide: OverlayMapBake.maxThumbnailDecodeSide
+                            )
+                        let sourceRequest = OverlayTileRenderer.SourceTileRequest(
+                            sourceRaster: sourceRaster,
+                            corners: corners,
+                            mercatorPixelWidth: intrinsic.width,
+                            mercatorPixelHeight: intrinsic.height,
+                            tileRect: tileRect,
+                            bbox: bbox,
+                            clipped: clipped,
+                            tileSize: tileSize,
+                            contentScale: scale,
+                            maxThumbnailDecodeSideOverride: decodeSideOverride,
+                            thumbnailCacheScope: thumbnailCacheScope
+                        )
                         let data = try autoreleasepool { () -> Data? in
-                            if z == maximumZ {
-                                return OverlayMapBake.pngMercatorTileFromSourceRaster(
-                                    sourceRaster: sourceRaster,
-                                    corners: corners,
-                                    mercatorPixelWidth: intrinsic.width,
-                                    mercatorPixelHeight: intrinsic.height,
-                                    tileRect: tileRect,
-                                    bbox: bbox,
-                                    clipped: clipped,
-                                    tileSize: tileSize,
-                                    contentScale: scale,
-                                    maxThumbnailDecodeSideOverride: 6144
-                                ) ?? renderTileFromBakedFallback(
-                                    bakedFallbackCG: bakedFallbackCG,
-                                    tileRect: tileRect,
-                                    bbox: bbox,
-                                    clipped: clipped,
-                                    tileSize: tileSize,
-                                    scale: scale
-                                )
+                            if let fromSource = OverlayTileRenderer.mercatorTileHEIFData(from: sourceRequest) {
+                                return fromSource
                             }
-                            return makeTileFromPreviousLevelOnDisk(
-                                pyramidRoot: root,
-                                parentPath: scaledPath,
-                                scale: scale,
-                                tileSize: tileSize
-                            ) ?? OverlayMapBake.pngMercatorTileFromSourceRaster(
-                                sourceRaster: sourceRaster,
-                                corners: corners,
-                                mercatorPixelWidth: intrinsic.width,
-                                mercatorPixelHeight: intrinsic.height,
-                                tileRect: tileRect,
-                                bbox: bbox,
-                                clipped: clipped,
-                                tileSize: tileSize,
-                                contentScale: scale
-                            ) ?? renderTileFromBakedFallback(
+                            if z < maximumZ,
+                               phase == .refine,
+                               OverlayTileRenderer.allChildTilesExistOnDisk(
+                                   pyramidRoot: root,
+                                   parentPath: scaledPath,
+                                   scale: scale
+                               ),
+                               let fromChildren = OverlayTileRenderer.mercatorTileHEIFDataFromChildComposite(
+                                   pyramidRoot: root,
+                                   parentPath: scaledPath,
+                                   scale: scale,
+                                   tileSize: tileSize
+                               ) {
+                                return fromChildren
+                            }
+                            return OverlayTileRenderer.mercatorTileHEIFDataFromBakedFallback(
                                 bakedFallbackCG: bakedFallbackCG,
                                 tileRect: tileRect,
                                 bbox: bbox,
@@ -344,19 +416,22 @@ enum OverlayTilePyramidBuilder {
                             )
                         }
                         guard let data else {
-                            pngNil += 1
+                            tileNil += 1
+                            OverlayTileBuildProfiling.activeSession?.recordTileNil()
                             continue
                         }
+                        OverlayTileBuildProfiling.activeSession?.recordTileProduced()
                         let url = OverlayLibrary.tileDataFileURL(pyramidRoot: root, path: scaledPath)
+                        let ioStart = CFAbsoluteTimeGetCurrent()
                         try data.write(to: url, options: .atomic)
+                        OverlayTileBuildProfiling.record(.diskIO, seconds: CFAbsoluteTimeGetCurrent() - ioStart)
                         TileDiagFileLog.append("[TileDiagFile] writing z=\(scaledPath.z) x=\(scaledPath.x) y=\(scaledPath.y) scale=\(scale) -> \(url.path)")
                         written += 1
                     }
-                    return (attempted, written, pngNil)
+                    return (attempted, written, tileNil)
                 }
 
-                if z == maximumZ, cellCoords.count > 1 {
-                    let workerCount = 2
+                if cellCoords.count > 1 {
                     let sem = DispatchSemaphore(value: workerCount)
                     let group = DispatchGroup()
                     let q = DispatchQueue(label: "snap-to-map.pyramid.top-level-workers", qos: .userInitiated, attributes: .concurrent)
@@ -381,7 +456,7 @@ enum OverlayTilePyramidBuilder {
                                 lock.lock()
                                 attemptedAtZ += s.attempted
                                 writtenAtZ += s.written
-                                pngNilAtZ += s.pngNil
+                                tileNilAtZ += s.tileNil
                                 processedCells += 1
                                 currentProcessed = processedCells
                                 let shouldPostProgress = processedCells == 1 || processedCells % 8 == 0 || processedCells == cells
@@ -414,7 +489,7 @@ enum OverlayTilePyramidBuilder {
                         let s = try processCell(x: c.x, y: c.y)
                         attemptedAtZ += s.attempted
                         writtenAtZ += s.written
-                        pngNilAtZ += s.pngNil
+                        tileNilAtZ += s.tileNil
                         processedCells += 1
                         let shouldPostProgress = processedCells == 1 || processedCells % 8 == 0 || processedCells == cells
                         if shouldPostProgress {
@@ -439,7 +514,7 @@ enum OverlayTilePyramidBuilder {
             let tileMapSpan = MKMapRect.world.size.width / Double(1 << z)
             let sourcePixelsPerTile = Double(sourcePixelsPerMapPoint) * tileMapSpan
             let detailCoverage = requiredTilePixels > 0 ? sourcePixelsPerTile / Double(requiredTilePixels) : 0
-            print("[TileDiag] build.level id=\(overlayTag) rev=\(revision) z=\(z) expectedCells=\(expectedCellsLabel) writtenPNGs=\(writtenAtZ) sourcePxPerTile=\(Int(sourcePixelsPerTile.rounded())) reqPx=\(Int(requiredTilePixels.rounded())) detailCoverage=\(String(format: "%.2f", detailCoverage))")
+            print("[TileDiag] build.level id=\(overlayTag) rev=\(revision) z=\(z) expectedCells=\(expectedCellsLabel) writtenTiles=\(writtenAtZ) sourcePxPerTile=\(Int(sourcePixelsPerTile.rounded())) reqPx=\(Int(requiredTilePixels.rounded())) detailCoverage=\(String(format: "%.2f", detailCoverage))")
             // #region agent log
             agentDebugLog(
                 runId: "pre-fix",
@@ -449,9 +524,9 @@ enum OverlayTilePyramidBuilder {
                 data: [
                     "z": z,
                     "expectedCells": intersectingCellByZ[z] ?? 0,
-                    "attemptedPNGs": attemptedAtZ,
-                    "writtenPNGs": writtenAtZ,
-                    "pngNilCount": pngNilAtZ,
+                    "attemptedTiles": attemptedAtZ,
+                    "writtenTiles": writtenAtZ,
+                    "tileNilCount": tileNilAtZ,
                 ]
             )
             // #endregion
@@ -460,6 +535,10 @@ enum OverlayTilePyramidBuilder {
         SnapMemoryInstrumentation.checkpoint(
             "pyramid.build.beforePersistZoomMeta id=\(overlayID.uuidString.prefix(8))… maxZ=\(maximumZ)"
         )
+        guard OverlayLibrary.isCurrentPyramidBuildRevision(overlayID, revision: revision) else {
+            print("[TileDiag] build.abort id=\(overlayTag) rev=\(revision) superseded before persist")
+            return
+        }
         let persistedMinimumZoom = row.tileMinimumZoom >= 0 ? Int(row.tileMinimumZoom) : minimumZ
         row.tileMinimumZoom = Int32(min(persistedMinimumZoom, minimumZ))
         row.tileMaximumZoom = Int32(advertisedAvailableMaximumZoom ?? maximumZ)
@@ -467,11 +546,11 @@ enum OverlayTilePyramidBuilder {
         row.tileMaximumZoomPreview = Int32(previewMaximumZoom ?? Int(row.tileMaximumZoom))
         row.tileRefinementInProgress = row.tileMaximumZoom < row.tileMaximumZoomFull
         try context.save()
-        let totalPNGs = writtenByZ.values.reduce(0, +)
+        let totalTiles = writtenByZ.values.reduce(0, +)
         let zSummary = writtenByZ.keys.sorted(by: >).map { z in
             "z\(z):\(writtenByZ[z] ?? 0)"
         }.joined(separator: ",")
-        print("[TileDiag] build.end id=\(overlayTag) rev=\(revision) minZ=\(minimumZ) maxZ=\(maximumZ) totalPNGs=\(totalPNGs)")
+        print("[TileDiag] build.end id=\(overlayTag) rev=\(revision) minZ=\(minimumZ) maxZ=\(maximumZ) totalTiles=\(totalTiles)")
         print("[TileDiag] build.levelSummary id=\(overlayTag) rev=\(revision) \(zSummary)")
         // #region agent log
         agentDebugLog(
@@ -485,7 +564,7 @@ enum OverlayTilePyramidBuilder {
                 "minimumZ": minimumZ,
                 "maximumZ": maximumZ,
                 "phase": phase.rawValue,
-                "totalPNGs": totalPNGs,
+                "totalTiles": totalTiles,
                 "levelSummary": zSummary,
             ]
         )
@@ -512,67 +591,10 @@ enum OverlayTilePyramidBuilder {
             tileSizePoints: OverlayLibrary.logicalTileSizePoints,
             screenScale: referenceScreenScale
         )
-        let fullMaximumZ = max(mercatorNativeMaxZ, sourceNativeMaxZ)
+        // Pyramid detail comes from per-tile **source** LOD, not the ~16 MP browse bake texture.
+        let fullMaximumZ = sourceNativeMaxZ
         let previewMaximumZ = min(fullMaximumZ, 0 + min(4, fullMaximumZ))
         return ZoomCeilings(minimumZ: 0, previewMaximumZ: previewMaximumZ, fullMaximumZ: fullMaximumZ)
-    }
-
-    private static func mercatorCGImageForPyramid(
-        sourceRaster: Data,
-        bakedFallback: UIImage,
-        corners: [CLLocationCoordinate2D],
-        outputWidth: Int,
-        outputHeight: Int
-    ) throws -> CGImage {
-        let pixelsOut = outputWidth * outputHeight
-        let budget = 18_000_000
-        SnapMemoryInstrumentation.checkpoint("pyramid.mercatorCG.decide pixelsOut=\(pixelsOut) budget=\(budget) out=\(outputWidth)x\(outputHeight)")
-
-        func bakedMercatorCG() throws -> CGImage {
-            SnapMemoryInstrumentation.checkpoint("pyramid.mercatorCG.branch=bakedFallbackTexture")
-            guard let cg = OverlayMapBake.normalizedCGImage(from: bakedFallback) else {
-                throw PyramidError.missingMercatorImage
-            }
-            return cg
-        }
-
-        guard pixelsOut <= budget else {
-            return try bakedMercatorCG()
-        }
-
-        /// **`UIImage(data:)`** materializes the **full** intrinsic bitmap — lethal for **400 MP** HEIC even when mercator **output** is small.
-        guard let intrinsic = intrinsicPixelSize(from: sourceRaster) else {
-            SnapMemoryInstrumentation.checkpoint("pyramid.mercatorCG.skip intrinsicUnknown→baked")
-            return try bakedMercatorCG()
-        }
-        let intrinsicPixels = Int64(intrinsic.width) * Int64(intrinsic.height)
-        guard intrinsicPixels <= OverlayLibrary.largeRasterOverlayPixelThresholdExclusive else {
-            SnapMemoryInstrumentation.checkpoint("pyramid.mercatorCG.skip intrinsicPx=\(intrinsicPixels)>threshold→baked")
-            return try bakedMercatorCG()
-        }
-
-        guard let pts = OverlayMapBake.mercatorDestinationPixelPoints(width: outputWidth, height: outputHeight, corners: corners),
-              let ui = UIImage(data: sourceRaster)
-        else {
-            return try bakedMercatorCG()
-        }
-        let pngData = try OpenCVBridge.warpSourceToMercatorPNG(
-            source: ui,
-            destinationPoints: pts,
-            outputWidth: outputWidth,
-            outputHeight: outputHeight
-        )
-        guard let src = CGImageSourceCreateWithData(pngData as CFData, nil),
-              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-            throw PyramidError.openCVDecodeFailed
-        }
-        SnapMemoryInstrumentation.checkpoint("pyramid.mercatorCG.branch=opencvWarp decoded=\(cg.width)x\(cg.height)")
-        return cg
-    }
-
-    private enum PyramidError: Error {
-        case missingMercatorImage
-        case openCVDecodeFailed
     }
 
     private static func intrinsicPixelSize(from data: Data) -> (width: Int, height: Int)? {
@@ -583,87 +605,6 @@ enum OverlayTilePyramidBuilder {
             return nil
         }
         return (w.intValue, h.intValue)
-    }
-
-    private static func renderTileFromBakedFallback(
-        bakedFallbackCG: CGImage?,
-        tileRect: MKMapRect,
-        bbox: MKMapRect,
-        clipped: MKMapRect,
-        tileSize: CGSize,
-        scale: CGFloat
-    ) -> Data? {
-        guard let bakedFallbackCG else { return nil }
-        return BakedImageMapTileOverlay.mercatorTilePNGDataForOfflinePyramid(
-            sourceCGImage: bakedFallbackCG,
-            tileRect: tileRect,
-            bbox: bbox,
-            clipped: clipped,
-            tileSize: tileSize,
-            contentScale: scale
-        )
-    }
-
-    private static func makeTileFromPreviousLevelOnDisk(
-        pyramidRoot: URL,
-        parentPath: MKTileOverlayPath,
-        scale: CGFloat,
-        tileSize: CGSize
-    ) -> Data? {
-        let childZ = parentPath.z + 1
-        guard childZ >= 0, childZ < 31 else { return nil }
-        let childBaseX = parentPath.x * 2
-        let childBaseY = parentPath.y * 2
-        let outW = Int(max(1, (tileSize.width * scale).rounded()))
-        let outH = Int(max(1, (tileSize.height * scale).rounded()))
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let ctx = CGContext(
-                  data: nil,
-                  width: outW,
-                  height: outH,
-                  bitsPerComponent: 8,
-                  bytesPerRow: 0,
-                  space: colorSpace,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else {
-            return nil
-        }
-        ctx.interpolationQuality = .high
-        ctx.clear(CGRect(x: 0, y: 0, width: outW, height: outH))
-
-        var drewAny = false
-        let halfW = CGFloat(outW) / 2
-        let halfH = CGFloat(outH) / 2
-        for dx in 0...1 {
-            for dy in 0...1 {
-                let childPath = MKTileOverlayPath(
-                    x: childBaseX + dx,
-                    y: childBaseY + dy,
-                    z: childZ,
-                    contentScaleFactor: scale
-                )
-                var childCG: CGImage?
-                for childURL in OverlayLibrary.tileCandidateFileURLs(pyramidRoot: pyramidRoot, path: childPath) {
-                    if let data = try? Data(contentsOf: childURL),
-                       let src = CGImageSourceCreateWithData(data as CFData, nil),
-                       let decoded = CGImageSourceCreateImageAtIndex(src, 0, nil) {
-                        childCG = decoded
-                        break
-                    }
-                }
-                guard let childCG else { continue }
-                let destX = CGFloat(dx) * halfW
-                let destY = dy == 0 ? halfH : 0
-                ctx.draw(childCG, in: CGRect(x: destX, y: destY, width: halfW, height: halfH))
-                drewAny = true
-            }
-        }
-        guard drewAny, let out = ctx.makeImage() else { return nil }
-        return pngData(from: out)
-    }
-
-    private static func pngData(from cgImage: CGImage) -> Data? {
-        OverlayLibrary.encodeTileImageData(cgImage)
     }
 
     private static func writePyramidMetadata(to root: URL, yIndexMode: String) throws {
