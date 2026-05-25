@@ -143,6 +143,132 @@ struct MapViewRepresentable: UIViewRepresentable {
         private var mapDirectManipRecognizerActiveIds = Set<ObjectIdentifier>()
         private var installedManipTargetGestureIds = Set<ObjectIdentifier>()
         var excludedManipulationTrackingGestureIds = Set<ObjectIdentifier>()
+        private weak var observedMapView: MKMapView?
+
+        /// Tiles whose disk cache was invalidated while generation is in flight; remount once when queue drains.
+        private var pendingProgressiveTileUpdates: [UUID: Set<String>] = [:]
+        /// Suppresses redundant scheduler viewport updates when MapKit emits micro region jitter while idle.
+        private var lastSchedulerViewportRect: MKMapRect?
+        private var lastSchedulerViewportZoom: Double?
+
+        override init() {
+            super.init()
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleProgressiveTilesDidUpdate(_:)),
+                name: .overlayProgressiveTilesDidUpdate,
+                object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleProgressiveQueueDidDrain(_:)),
+                name: .overlayProgressiveTilesQueueDidDrain,
+                object: nil
+            )
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        @objc private func handleProgressiveTilesDidUpdate(_ note: Notification) {
+            guard let idString = note.userInfo?["overlayID"] as? String,
+                  let overlayID = UUID(uuidString: idString) else { return }
+            let z = note.userInfo?["z"] as? Int ?? -1
+            let x = note.userInfo?["x"] as? Int ?? -1
+            let y = note.userInfo?["y"] as? Int ?? -1
+            let scale100 = note.userInfo?["scale100"] as? Int ?? -1
+            let tileLabel = "z\(z)/\(x)/\(y)@\(scale100)"
+            pendingProgressiveTileUpdates[overlayID, default: []].insert(tileLabel)
+            print("[TileDiag] tileReady.pendingRemount id=\(overlayID.uuidString.prefix(8)) tile=\(tileLabel) batch=\(pendingProgressiveTileUpdates[overlayID]?.count ?? 0)")
+
+            guard let mapView = observedMapView,
+                  let existing = mapView.overlays.compactMap({ $0 as? BakedImageMapTileOverlay }).first(where: { $0.overlayID == overlayID }),
+                  z >= 0, x >= 0, y >= 0 else { return }
+            let path = MKTileOverlayPath(
+                x: x,
+                y: y,
+                z: z,
+                contentScaleFactor: CGFloat(scale100) / 100
+            )
+            existing.invalidateDiskCacheForTile(path: path)
+        }
+
+        @objc private func handleProgressiveQueueDidDrain(_ note: Notification) {
+            guard let idString = note.userInfo?["overlayID"] as? String,
+                  let overlayID = UUID(uuidString: idString),
+                  let mapView = observedMapView else { return }
+            let tiles = pendingProgressiveTileUpdates.removeValue(forKey: overlayID) ?? []
+            guard !tiles.isEmpty else {
+                print("[TileDiag] overlayRefresh.skippedEmptyBatch id=\(overlayID.uuidString.prefix(8))")
+                return
+            }
+            print("[TileDiag] overlayRefresh.queueIdle id=\(overlayID.uuidString.prefix(8)) tiles=\(tiles.count) keys=\(tiles.sorted().prefix(8).joined(separator: ","))")
+            refreshTiledOverlay(overlayID: overlayID, on: mapView)
+        }
+
+        private func refreshTiledOverlay(overlayID: UUID, on mapView: MKMapView) {
+            guard let existing = mapView.overlays.compactMap({ $0 as? BakedImageMapTileOverlay }).first(where: { $0.overlayID == overlayID }) else {
+                return
+            }
+            OverlayTileRuntimeInstrumentation.recordOverlayReload(overlayID: overlayID)
+            print("[TileDiag] overlayRefresh.remount id=\(overlayID.uuidString.prefix(8))")
+            mapView.removeOverlay(existing)
+            mapView.addOverlay(existing, level: .aboveLabels)
+            mapBridge?.applyRasterOverlayRendererAlphas()
+        }
+
+        private func notifyProgressiveSchedulerViewport(on mapView: MKMapView) {
+            let visible = mapView.visibleMapRect
+            let zoom = mapBridge?.currentDebugZoomLevel ?? 0
+            if let lastRect = lastSchedulerViewportRect,
+               let lastZoom = lastSchedulerViewportZoom,
+               abs(lastZoom - zoom) < 0.08,
+               relativeMapRectDelta(lastRect, visible) < 0.025 {
+                return
+            }
+            lastSchedulerViewportRect = visible
+            lastSchedulerViewportZoom = zoom
+            for item in currentOverlays where item.usesTiledMapPresentation && item.tilePyramid != nil {
+                OverlayTileRuntimeScheduler.shared.updateViewport(
+                    overlayID: item.id,
+                    visibleMapRect: visible,
+                    currentZoom: zoom
+                )
+            }
+        }
+
+        private func relativeMapRectDelta(_ a: MKMapRect, _ b: MKMapRect) -> Double {
+            let dw = max(a.size.width, b.size.width, 1)
+            let dh = max(a.size.height, b.size.height, 1)
+            let dx = abs(a.origin.x - b.origin.x) / dw
+            let dy = abs(a.origin.y - b.origin.y) / dh
+            let dww = abs(a.size.width - b.size.width) / dw
+            let dhh = abs(a.size.height - b.size.height) / dh
+            return max(dx, dy, dww, dhh)
+        }
+
+        private func registerProgressiveRuntimeIfNeeded(for item: OverlayItem, on mapView: MKMapView) {
+            guard item.usesTiledMapPresentation,
+                  let runtime = item.tilePyramid,
+                  runtime.minimumZoom >= 0,
+                  let source = item.sourceRasterData,
+                  !source.isEmpty else { return }
+            guard !OverlayLibrary.isInSaveTransition(item.id) else {
+                print("[TileProg] register.deferredSaveTransition id=\(item.id.uuidString.prefix(8))")
+                return
+            }
+            OverlayTileRuntimeScheduler.shared.startProgressiveRuntime(
+                overlayID: item.id,
+                revision: runtime.revision,
+                corners: item.corners,
+                sourceRaster: source,
+                bakedFallback: item.mapDisplayImage,
+                tileContentScale: OverlayLibrary.tileContentScaleForCurrentDevice(),
+                visibleMapRect: mapView.visibleMapRect,
+                currentZoom: mapBridge?.currentDebugZoomLevel ?? 0
+            )
+        }
 
         func syncMapObjectsFromBindingUpdate(on mapView: MKMapView, overlays: [OverlayItem]) {
             deferredRegionSyncWorkItem?.cancel()
@@ -244,6 +370,7 @@ struct MapViewRepresentable: UIViewRepresentable {
 
         func applySyncMapObjects(on mapView: MKMapView, overlays: [OverlayItem]) {
             guard let rasterBag = mapBridge?.rasterOpacity else { return }
+            observedMapView = mapView
             currentOverlays = overlays
             let quadItems = overlays.filter { $0.corners.count == 4 }
             let cullViewport = expandedVisibleMapRectForCulling(on: mapView)
@@ -326,6 +453,9 @@ struct MapViewRepresentable: UIViewRepresentable {
                     }
                 )
                 mapView.addOverlay(presentation.mkOverlay, level: .aboveLabels)
+                if item.usesTiledMapPresentation {
+                    registerProgressiveRuntimeIfNeeded(for: item, on: mapView)
+                }
             }
             mapBridge?.updateRasterTileOverlayPresence(anyRasterTileOnMap)
             let snapOverlays = mapView.overlays.compactMap { $0 as? SnapRasterMapOverlay }
@@ -461,7 +591,9 @@ struct MapViewRepresentable: UIViewRepresentable {
 
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
             mapBridge?.noteMapRegionChangedWhileWaitingForEdit()
+            mapBridge?.noteMapRegionChangedWhileWaitingForPostSave()
             mapBridge?.notifyMapLayoutChanged()
+            notifyProgressiveSchedulerViewport(on: mapView)
             let sel = #selector(mapDirectManipState(_:))
             addManipTargetsRecursively(on: mapView, selector: sel)
             refreshGestureManipulationAggregate()

@@ -15,11 +15,14 @@
 		69B2C7A02FAE246A00328C9F /* SnapToMapModel.xcdatamodeld in Sources */ = {isa = PBXBuildFile; fileRef = 69B2C79E2FAE246A00328C9F /* SnapToMapModel.xcdatamodeld */; };
 		99702B0D9F6541D8327220D2 /* OverlayModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73FB23DC65473206083E68C0 /* OverlayModels.swift */; };
 		9A5972EAC9706CDA48CB9D9A /* MapViewBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0152501D7FD80FEE395C167 /* MapViewBridge.swift */; };
-		A10BBUILDOPCV01 /* OpenCVBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFOPCV01 /* OpenCVBridge.swift */; };
 		A10BBUILDHEIF01 /* OverlayTileHEIFEncoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFHEIF01 /* OverlayTileHEIFEncoding.swift */; };
+		A10BBUILDMTL01 /* OverlayMetalTilePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFMTL01 /* OverlayMetalTilePipeline.swift */; };
+		A10BBUILDMTLK01 /* WarpedTileKernel.metal in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFMTLK01 /* WarpedTileKernel.metal */; };
+		A10BBUILDMTLK02 /* WarpedTileChunkKernel.metal in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFMTLK02 /* WarpedTileChunkKernel.metal */; };
+		A10BBUILDOPCV01 /* OpenCVBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFOPCV01 /* OpenCVBridge.swift */; };
 		A10BBUILDPROF01 /* OverlayTileBuildProfiling.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFPROF01 /* OverlayTileBuildProfiling.swift */; };
-		A10BBUILDREND01 /* OverlayTileRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFREND01 /* OverlayTileRenderer.swift */; };
 		A10BBUILDPYR03 /* OverlayTilePyramid.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFPYR03 /* OverlayTilePyramid.swift */; };
+		A10BBUILDREND01 /* OverlayTileRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFREND01 /* OverlayTileRenderer.swift */; };
 		A10BBUILDSTM02 /* STMOpenCVBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFMMM02 /* STMOpenCVBridge.mm */; settings = {COMPILER_FLAGS = "-Wno-quoted-include-in-framework-header -Wno-documentation"; }; };
 		B04EBEEFCAFE0005D0D00005 /* BakedHEIFEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */; };
 		B75CE877AA783FF5FF55098E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2B288C6F420232C2216E201E /* Assets.xcassets */; };
@@ -47,6 +50,9 @@
 		A10FREFBRGH03 /* SnapToMap-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SnapToMap-Bridging-Header.h"; sourceTree = "<group>"; };
 		A10FREFHEIF01 /* OverlayTileHEIFEncoding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTileHEIFEncoding.swift; sourceTree = "<group>"; };
 		A10FREFMMM02 /* STMOpenCVBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = STMOpenCVBridge.mm; sourceTree = "<group>"; };
+		A10FREFMTL01 /* OverlayMetalTilePipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMetalTilePipeline.swift; sourceTree = "<group>"; };
+		A10FREFMTLK01 /* WarpedTileKernel.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = WarpedTileKernel.metal; sourceTree = "<group>"; };
+		A10FREFMTLK02 /* WarpedTileChunkKernel.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = WarpedTileChunkKernel.metal; sourceTree = "<group>"; };
 		A10FREFOPCV01 /* OpenCVBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenCVBridge.swift; sourceTree = "<group>"; };
 		A10FREFPROF01 /* OverlayTileBuildProfiling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTileBuildProfiling.swift; sourceTree = "<group>"; };
 		A10FREFPYR03 /* OverlayTilePyramid.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayTilePyramid.swift; sourceTree = "<group>"; };
@@ -90,6 +96,9 @@
 				A10FREFHEIF01 /* OverlayTileHEIFEncoding.swift */,
 				A10FREFPROF01 /* OverlayTileBuildProfiling.swift */,
 				A10FREFREND01 /* OverlayTileRenderer.swift */,
+				A10FREFMTL01 /* OverlayMetalTilePipeline.swift */,
+				A10FREFMTLK01 /* WarpedTileKernel.metal */,
+				A10FREFMTLK02 /* WarpedTileChunkKernel.metal */,
 				A10FREFOPCV01 /* OpenCVBridge.swift */,
 				A10FREFSTMH01 /* STMOpenCVBridge.h */,
 				A10FREFMMM02 /* STMOpenCVBridge.mm */,
@@ -157,7 +166,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 2640;
+				LastUpgradeCheck = 2650;
 			};
 			buildConfigurationList = CB7E98BB09F7A6D332C66CE8 /* Build configuration list for PBXProject "SnapToMap" */;
 			developmentRegion = en;
@@ -235,6 +244,9 @@
 				A10BBUILDHEIF01 /* OverlayTileHEIFEncoding.swift in Sources */,
 				A10BBUILDPROF01 /* OverlayTileBuildProfiling.swift in Sources */,
 				A10BBUILDREND01 /* OverlayTileRenderer.swift in Sources */,
+				A10BBUILDMTL01 /* OverlayMetalTilePipeline.swift in Sources */,
+				A10BBUILDMTLK01 /* WarpedTileKernel.metal in Sources */,
+				A10BBUILDMTLK02 /* WarpedTileChunkKernel.metal in Sources */,
 				A10BBUILDPYR03 /* OverlayTilePyramid.swift in Sources */,
 				D01MAPRES0001BUILD001 /* OverlayMapPresentation.swift in Sources */,
 				2010B0010000PERS5000FILE /* PersistenceController.swift in Sources */,
@@ -377,8 +389,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				INFOPLIST_FILE = SnapToMap/Info.plist;
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Select an image to overlay on the map.";
@@ -401,8 +413,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				INFOPLIST_FILE = SnapToMap/Info.plist;
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Show your current position on the map.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Select an image to overlay on the map.";

@@ -9,6 +9,14 @@ import UniformTypeIdentifiers
 
 extension Notification.Name {
     static let overlayTilePyramidRefinementDidComplete = Notification.Name("overlayTilePyramidRefinementDidComplete")
+    /// Posted when one lazily generated tile was persisted (**`userInfo["overlayID"]`**, **`z/x/y/scale100`**).
+    static let overlayProgressiveTilesDidUpdate = Notification.Name("overlayProgressiveTilesDidUpdate")
+    /// Posted when an overlay's runtime work queue has fully drained (**`userInfo["overlayID"]`**).
+    static let overlayProgressiveTilesQueueDidDrain = Notification.Name("overlayProgressiveTilesQueueDidDrain")
+    /// Posted after post-save zoom-to-overlay animation settles (**`userInfo["overlayID"]`**).
+    static let overlaySaveTransitionZoomDidSettle = Notification.Name("overlaySaveTransitionZoomDidSettle")
+    /// Posted when the minZ overview tile is ready after save (**`userInfo["overlayID"]`**, **`userInfo["minZ"]`**).
+    static let overlayTilePyramidMinZReady = Notification.Name("overlayTilePyramidMinZReady")
 }
 
 /// Grep Xcode console for **`[SnapMem]`** while chasing jetsam / **`EXC_RESOURCE`** spikes.
@@ -41,12 +49,156 @@ enum OverlayLibrary {
     /// Logical MapKit tile edge length in points.
     static let logicalTileSizePoints: CGFloat = 512
     static let logicalTileSize = CGSize(width: logicalTileSizePoints, height: logicalTileSizePoints)
-    /// Legacy 1× label kept for diagnostics; native max-zoom math must match **`MKTileOverlay`** **`contentScaleFactor`** on device.
-    static let tileDetailReferenceScale: CGFloat = 1
 
-    /// Screen scale for pyramid native-max and per-tile pixel budgets (typically **2** or **3** on iPhone).
+    /// Rounds a screen/content scale to a positive integer (**1**, **2**, **3**, …).
+    static func normalizedTileContentScale(_ scale: CGFloat) -> CGFloat {
+        CGFloat(max(1, Int(scale.rounded())))
+    }
+
+    /// Single source of truth for tile generation: **`logicalTileSizePoints ×` device scale** (e.g. 1536 px @3×).
+    static func tileContentScaleForCurrentDevice() -> CGFloat {
+        normalizedTileContentScale(UIScreen.main.scale)
+    }
+
+    /// Physical output tile edge in pixels (**`logicalTileSizePoints × tileContentScale`**).
+    static func physicalTileSizePixels(tileContentScale: CGFloat? = nil) -> Int {
+        let scale = tileContentScale ?? tileContentScaleForCurrentDevice()
+        return max(1, Int((logicalTileSizePoints * normalizedTileContentScale(scale)).rounded()))
+    }
+
+    /// Alias for **`tileContentScaleForCurrentDevice()`** — used when scheduling pyramid builds and z_max math.
     static func tileDetailScreenScaleForNativeMaxZoom() -> CGFloat {
-        max(1, UIScreen.main.scale)
+        tileContentScaleForCurrentDevice()
+    }
+
+    /// On-disk metadata for one pyramid revision directory.
+    struct TilePyramidMetadata {
+        let formatVersion: Int
+        let yIndexMode: String
+        let tileContentScale: CGFloat
+        let physicalTileSizePixels: Int
+        let logicalTileSizePoints: CGFloat
+        let minZ: Int?
+        let maxZ: Int?
+        let sourceWidth: Int?
+        let sourceHeight: Int?
+        let progressiveConfig: OverlayProgressiveTileConfig?
+        let progressiveGeneration: Bool
+
+        var sourceChunkSize: Int {
+            progressiveConfig?.sourceChunkSize ?? OverlayProgressiveTileConfig.default.sourceChunkSize
+        }
+    }
+
+    static func readTilePyramidMetadata(pyramidRoot: URL) -> TilePyramidMetadata? {
+        let metaURL = pyramidRoot.appendingPathComponent("pyramid-meta.json", isDirectory: false)
+        guard let data = try? Data(contentsOf: metaURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let yIndexMode = obj["yIndexMode"] as? String else {
+            return nil
+        }
+        let formatVersion = obj["formatVersion"] as? Int ?? 1
+        let logicalPoints = (obj["logicalTileSizePoints"] as? NSNumber).map { CGFloat($0.doubleValue) }
+            ?? logicalTileSizePoints
+        let contentScale: CGFloat
+        if let scaleNum = obj["tileContentScale"] as? NSNumber {
+            contentScale = normalizedTileContentScale(CGFloat(scaleNum.doubleValue))
+        } else if let physicalNum = obj["physicalTileSizePixels"] as? NSNumber, logicalPoints > 0 {
+            contentScale = normalizedTileContentScale(CGFloat(physicalNum.doubleValue) / logicalPoints)
+        } else {
+            return nil
+        }
+        let physicalPx = (obj["physicalTileSizePixels"] as? NSNumber).map { $0.intValue }
+            ?? physicalTileSizePixels(tileContentScale: contentScale)
+        let minZ = (obj["minZ"] as? NSNumber).map { $0.intValue }
+        let maxZ = (obj["maxZ"] as? NSNumber).map { $0.intValue }
+        let sourceWidth = (obj["sourceWidth"] as? NSNumber).map { $0.intValue }
+        let sourceHeight = (obj["sourceHeight"] as? NSNumber).map { $0.intValue }
+        let progressiveGeneration = (obj["progressiveGeneration"] as? Bool) ?? (formatVersion >= 3)
+        let progressiveConfig: OverlayProgressiveTileConfig? = {
+            guard obj["prewarmLookaheadZooms"] != nil
+                    || obj["sourceChunkSize"] != nil
+                    || obj["earlyComfortDepth"] != nil else { return nil }
+            return OverlayProgressiveTileConfig(
+                prewarmLookaheadZooms: (obj["prewarmLookaheadZooms"] as? NSNumber)?.intValue
+                    ?? OverlayProgressiveTileConfig.default.prewarmLookaheadZooms,
+                earlyComfortDepth: (obj["earlyComfortDepth"] as? NSNumber)?.intValue
+                    ?? OverlayProgressiveTileConfig.default.earlyComfortDepth,
+                cheapLevelTileLimit: (obj["cheapLevelTileLimit"] as? NSNumber)?.intValue
+                    ?? OverlayProgressiveTileConfig.default.cheapLevelTileLimit,
+                prewarmMarginScreens: (obj["prewarmMarginScreens"] as? NSNumber).map { $0.doubleValue }
+                    ?? OverlayProgressiveTileConfig.default.prewarmMarginScreens,
+                maxConcurrentSourceChunkJobs: (obj["maxConcurrentSourceChunkJobs"] as? NSNumber)?.intValue
+                    ?? OverlayProgressiveTileConfig.default.maxConcurrentSourceChunkJobs,
+                maxConcurrentOutputTileJobs: (obj["maxConcurrentOutputTileJobs"] as? NSNumber)?.intValue
+                    ?? OverlayProgressiveTileConfig.default.maxConcurrentOutputTileJobs,
+                maxResidentSourceChunks: (obj["maxResidentSourceChunks"] as? NSNumber)?.intValue
+                    ?? OverlayProgressiveTileConfig.default.maxResidentSourceChunks,
+                sourceChunkSize: (obj["sourceChunkSize"] as? NSNumber)?.intValue
+                    ?? OverlayProgressiveTileConfig.default.sourceChunkSize
+            )
+        }()
+        return TilePyramidMetadata(
+            formatVersion: formatVersion,
+            yIndexMode: yIndexMode,
+            tileContentScale: contentScale,
+            physicalTileSizePixels: physicalPx,
+            logicalTileSizePoints: logicalPoints,
+            minZ: minZ,
+            maxZ: maxZ,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            progressiveConfig: progressiveConfig,
+            progressiveGeneration: progressiveGeneration
+        )
+    }
+
+    static func writeTilePyramidMetadata(
+        to pyramidRoot: URL,
+        yIndexMode: String,
+        tileContentScale: CGFloat,
+        minZ: Int? = nil,
+        maxZ: Int? = nil,
+        sourceWidth: Int? = nil,
+        sourceHeight: Int? = nil,
+        progressiveConfig: OverlayProgressiveTileConfig = .default,
+        progressiveGeneration: Bool = true
+    ) throws {
+        let scale = normalizedTileContentScale(tileContentScale)
+        let physicalPx = physicalTileSizePixels(tileContentScale: scale)
+        let metaURL = pyramidRoot.appendingPathComponent("pyramid-meta.json", isDirectory: false)
+        var payload: [String: Any] = [
+            "formatVersion": 3,
+            "yIndexMode": yIndexMode,
+            "logicalTileSizePoints": Double(logicalTileSizePoints),
+            "tileContentScale": Double(scale),
+            "physicalTileSizePixels": physicalPx,
+            "progressiveGeneration": progressiveGeneration,
+            "sourceChunkSize": progressiveConfig.sourceChunkSize,
+            "prewarmLookaheadZooms": progressiveConfig.prewarmLookaheadZooms,
+            "earlyComfortDepth": progressiveConfig.earlyComfortDepth,
+            "cheapLevelTileLimit": progressiveConfig.cheapLevelTileLimit,
+            "prewarmMarginScreens": progressiveConfig.prewarmMarginScreens,
+            "maxConcurrentSourceChunkJobs": progressiveConfig.maxConcurrentSourceChunkJobs,
+            "maxConcurrentOutputTileJobs": progressiveConfig.maxConcurrentOutputTileJobs,
+            "maxResidentSourceChunks": progressiveConfig.maxResidentSourceChunks,
+        ]
+        if let minZ { payload["minZ"] = minZ }
+        if let maxZ { payload["maxZ"] = maxZ }
+        if let sourceWidth { payload["sourceWidth"] = sourceWidth }
+        if let sourceHeight { payload["sourceHeight"] = sourceHeight }
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: metaURL, options: .atomic)
+    }
+
+    static func sourceChunkCacheDirectoryURL(pyramidRoot: URL) -> URL {
+        pyramidRoot.appendingPathComponent("source-chunks", isDirectory: true)
+    }
+
+    static func sourceChunkCacheFileURL(pyramidRoot: URL, chunkX: Int, chunkY: Int) -> URL {
+        sourceChunkCacheDirectoryURL(pyramidRoot: pyramidRoot)
+            .appendingPathComponent("cx\(chunkX)", isDirectory: true)
+            .appendingPathComponent("cy\(chunkY).heic", isDirectory: false)
     }
 
     private static let metadataFilename = "saved-overlays.json"
@@ -61,9 +213,9 @@ enum OverlayLibrary {
     private static let bakedPersistencePixelBudget: CGFloat = 9_437_184
     /// Baked storage budget for very large overlays (~16.8 MP; equivalent to 4096²).
     /// Runtime tile LOD restores zoom detail from source raster without persisting huge bakes.
-    private static let bakedPersistencePixelBudgetHighRes: CGFloat = 16_777_216
+    static let bakedPersistencePixelBudgetHighRes: CGFloat = 16_777_216
     /// Source raster size threshold that switches bake/persistence into high-res budgets.
-    static let largeRasterOverlayPixelThresholdExclusive: Int64 = 100_000_000
+    static let largeRasterOverlayPixelThresholdExclusive: Int64 = 20_000_000
     private static let bakedDownscaleCIContext = CIContext(options: [.highQualityDownsample: true])
     /// Base quality for smaller **source** images before megapixel scaling.
     private static let heifQualitySourceBase: CGFloat = 0.88
@@ -106,6 +258,49 @@ enum OverlayLibrary {
         let legacy = tileLegacyPNGFileURL(pyramidRoot: pyramidRoot, path: path)
         guard preferred.path != legacy.path else { return [preferred] }
         return [preferred, legacy]
+    }
+
+    /// In-progress tile write path — readers must ignore **`*.part`** files.
+    static func tilePartFileURL(finalURL: URL) -> URL {
+        finalURL.deletingPathExtension().appendingPathExtension(finalURL.pathExtension + ".part")
+    }
+
+    /// Returns **`true`** when a persisted tile file exists and looks complete (not a partial write).
+    static func isReadableTileFile(at url: URL) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path),
+              url.lastPathComponent.contains(".part") == false else { return false }
+        guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber else { return false }
+        return size.intValue > 64
+    }
+
+    /// Write tile bytes atomically: temp **`*.part`** → fsync → rename into final HEIC/PNG slot.
+    static func atomicWriteTileData(_ data: Data, to finalURL: URL) throws {
+        let fm = FileManager.default
+        let dir = finalURL.deletingLastPathComponent()
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let partURL = tilePartFileURL(finalURL: finalURL)
+        if fm.fileExists(atPath: partURL.path) {
+            try? fm.removeItem(at: partURL)
+        }
+        try data.write(to: partURL, options: .noFileProtection)
+        if let handle = try? FileHandle(forWritingTo: partURL) {
+            try handle.synchronize()
+            try handle.close()
+        }
+        if fm.fileExists(atPath: finalURL.path) {
+            try fm.removeItem(at: finalURL)
+        }
+        try fm.moveItem(at: partURL, to: finalURL)
+        guard isReadableTileFile(at: finalURL) else {
+            try? fm.removeItem(at: finalURL)
+            throw NSError(
+                domain: "OverlayLibrary",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Tile write verification failed at \(finalURL.path)"]
+            )
+        }
     }
 
     /// Debug-only helper for simulator investigations: counts persisted tile PNGs by z-level.
@@ -194,6 +389,91 @@ enum OverlayLibrary {
     private static var pyramidSuppressedOverlayIDs = Set<UUID>()
     private static let pyramidBuildRevisionLock = NSLock()
     private static var activePyramidBuildRevisionByOverlayID: [UUID: Int64] = [:]
+
+    private static let saveTransitionLock = NSLock()
+    private static var saveTransitionOverlayIDs = Set<UUID>()
+    private static var deferredMinZBuildJobs: [(overlayID: UUID, revision: Int64)] = []
+
+    /// Marks an overlay entering save-after-edit; defers minZ build and disables runtime prewarm until zoom settles.
+    static func beginSaveTransition(overlayID: UUID) {
+        saveTransitionLock.lock()
+        saveTransitionOverlayIDs.insert(overlayID)
+        saveTransitionLock.unlock()
+        OverlayTileRuntimeScheduler.shared.enterSaveTransition(overlayID: overlayID)
+        OverlaySaveTransitionLog.stage("save.started", overlayID: overlayID)
+    }
+
+    static func isInSaveTransition(_ overlayID: UUID) -> Bool {
+        saveTransitionLock.lock()
+        let active = saveTransitionOverlayIDs.contains(overlayID)
+        saveTransitionLock.unlock()
+        return active
+    }
+
+    /// Runs deferred minZ build after Core Data persist completes and edit resources were released on main.
+    static func runDeferredMinZBuildAfterSaveTransition(
+        overlayID: UUID,
+        container: NSPersistentContainer,
+        tileContentScale: CGFloat = tileContentScaleForCurrentDevice()
+    ) {
+        saveTransitionLock.lock()
+        let jobs = deferredMinZBuildJobs.filter { $0.overlayID == overlayID }
+        deferredMinZBuildJobs.removeAll { $0.overlayID == overlayID }
+        saveTransitionLock.unlock()
+        guard !jobs.isEmpty else {
+            OverlaySaveTransitionLog.stage("minZ.deferred.none", overlayID: overlayID)
+            return
+        }
+        OverlaySaveTransitionLog.stage("metadata.persisted", overlayID: overlayID, extra: "jobs=\(jobs.count)")
+        for job in jobs {
+            scheduleMinZBuildOnly(
+                overlayID: job.overlayID,
+                revision: job.revision,
+                container: container,
+                tileContentScale: tileContentScale
+            )
+        }
+    }
+
+    /// Enables runtime prewarm after post-save zoom animation completes.
+    static func enablePrewarmAfterSaveZoomSettled(
+        overlayID: UUID,
+        container: NSPersistentContainer,
+        visibleMapRect: MKMapRect?,
+        currentZoom: Double,
+        tileContentScale: CGFloat = tileContentScaleForCurrentDevice()
+    ) {
+        saveTransitionLock.lock()
+        saveTransitionOverlayIDs.remove(overlayID)
+        saveTransitionLock.unlock()
+        OverlaySaveTransitionLog.stage("prewarm.enabling", overlayID: overlayID)
+        refinementQueue.async {
+            container.performBackgroundTask { context in
+                let fr = StoredMapOverlay.fetchRequest()
+                fr.fetchLimit = 1
+                fr.predicate = NSPredicate(format: "uuid == %@", overlayID as CVarArg)
+                guard let row = try? context.fetch(fr).first,
+                      let source = row.sourceImageData,
+                      let corners = decodeCorners(from: row.cornersJSON ?? ""),
+                      corners.count == 4,
+                      let bakedBlob = bakedImageDataFromDisk(id: overlayID),
+                      let bakedImg = UIImage(data: bakedBlob) else { return }
+                OverlayTileRuntimeScheduler.shared.startProgressiveRuntime(
+                    overlayID: overlayID,
+                    revision: row.tilePyramidRevision,
+                    corners: corners,
+                    sourceRaster: source,
+                    bakedFallback: bakedImg,
+                    tileContentScale: tileContentScale,
+                    visibleMapRect: visibleMapRect,
+                    currentZoom: currentZoom,
+                    enablePrewarm: true,
+                    saveTransitionRecovery: true
+                )
+                OverlaySaveTransitionLog.stage("prewarm.enabled", overlayID: overlayID)
+            }
+        }
+    }
 
     /// While **`true`**, background pyramid preview/refinement for this overlay is skipped (edit mode must not compete with tile builds).
     static func setPyramidBuildSuppressed(_ overlayID: UUID, suppressed: Bool) {
@@ -291,6 +571,40 @@ enum OverlayLibrary {
         try? fm.removeItem(at: root)
     }
 
+    /// Shared with **`loadOverlays`** and launch resume — **`nil`** when the row is heavy but has no usable on-disk pyramid.
+    private static func tilePyramidRuntimeInfo(from row: StoredMapOverlay, overlayID: UUID) -> OverlayTilePyramidRuntimeInfo? {
+        let rev = row.tilePyramidRevision
+        guard rev > 0,
+              row.tileMinimumZoom >= 0,
+              row.tileMaximumZoom >= row.tileMinimumZoom else { return nil }
+        let disk = tilePyramidRevisionDirectoryURL(id: overlayID, revision: rev)
+        guard FileManager.default.fileExists(atPath: disk.path) else { return nil }
+        let previewMax = row.tileMaximumZoomPreview >= 0 ? row.tileMaximumZoomPreview : row.tileMaximumZoom
+        let fullMax = row.tileMaximumZoomFull >= 0 ? row.tileMaximumZoomFull : row.tileMaximumZoom
+        return OverlayTilePyramidRuntimeInfo(
+            revision: rev,
+            minimumZoom: row.tileMinimumZoom,
+            maximumZoom: row.tileMaximumZoom,
+            previewMaximumZoom: previewMax,
+            fullMaximumZoom: fullMax,
+            refinementInProgress: row.tileRefinementInProgress
+        )
+    }
+
+    private static func rowMissingTilePyramidRuntime(row: StoredMapOverlay, overlayID: UUID, sourcePixels: Int64) -> Bool {
+        guard sourcePixels > largeRasterOverlayPixelThresholdExclusive else { return false }
+        return tilePyramidRuntimeInfo(from: row, overlayID: overlayID) == nil
+    }
+
+    private static func missingTilePyramidRuntimeReason(row: StoredMapOverlay, overlayID: UUID, sourcePixels: Int64) -> String {
+        guard sourcePixels > largeRasterOverlayPixelThresholdExclusive else { return "notHeavy" }
+        if row.tilePyramidRevision <= 0 { return "neverStartedRev0" }
+        if row.tileMinimumZoom < 0 || row.tileMaximumZoom < row.tileMinimumZoom { return "metadataPlaceholder" }
+        let disk = tilePyramidRevisionDirectoryURL(id: overlayID, revision: row.tilePyramidRevision)
+        if !FileManager.default.fileExists(atPath: disk.path) { return "diskMissing" }
+        return "unknown"
+    }
+
     /// Loads overlay rows. Pass **`intersectingMapRect`** to fetch only rows whose stored bounds overlap the map viewport (skips loading off-screen blobs from SQLite where possible).
     static func loadOverlays(
         viewContext: NSManagedObjectContext,
@@ -332,8 +646,8 @@ enum OverlayLibrary {
             }
 
             let placement = decodePlacementCamera(from: row.placementCameraJSON)
-            /// Stored bake may predate high-res mercator / tiling; huge source + undersized baked blob → rebake on load.
-            let minHighResBakedPixelCount: CGFloat = 150_994_944 // 12288² legacy-equivalent floor.
+            /// Reject only legacy undersized bakes (pre–high-res persist cap). Current tiled overlays persist ~16 MP bakes by design.
+            let minAcceptableBakedPixelCount = bakedPersistencePixelBudgetHighRes * 0.85
             let mapDisplay: UIImage
             if isHeavy {
                 let bakedOK: UIImage? = {
@@ -341,7 +655,7 @@ enum OverlayLibrary {
                           let img = UIImage(data: baked),
                           bakedImageLikelyPreservesAlpha(img) else { return nil }
                     let bakedPixels = (img.size.width * img.scale) * (img.size.height * img.scale)
-                    return bakedPixels >= minHighResBakedPixelCount ? img : nil
+                    return bakedPixels >= minAcceptableBakedPixelCount ? img : nil
                 }()
                 if let bakedOK {
                     mapDisplay = bakedOK
@@ -359,22 +673,7 @@ enum OverlayLibrary {
             }
             let tilePyramidRuntime: OverlayTilePyramidRuntimeInfo? = {
                 guard isHeavy else { return nil }
-                let rev = row.tilePyramidRevision
-                guard rev > 0,
-                      row.tileMinimumZoom >= 0,
-                      row.tileMaximumZoom >= row.tileMinimumZoom else { return nil }
-                let disk = tilePyramidRevisionDirectoryURL(id: uuid, revision: rev)
-                guard FileManager.default.fileExists(atPath: disk.path) else { return nil }
-                let previewMax = row.tileMaximumZoomPreview >= 0 ? row.tileMaximumZoomPreview : row.tileMaximumZoom
-                let fullMax = row.tileMaximumZoomFull >= 0 ? row.tileMaximumZoomFull : row.tileMaximumZoom
-                return OverlayTilePyramidRuntimeInfo(
-                    revision: rev,
-                    minimumZoom: row.tileMinimumZoom,
-                    maximumZoom: row.tileMaximumZoom,
-                    previewMaximumZoom: previewMax,
-                    fullMaximumZoom: fullMax,
-                    refinementInProgress: row.tileRefinementInProgress
-                )
+                return tilePyramidRuntimeInfo(from: row, overlayID: uuid)
             }()
             if isHeavy {
                 let runtimeLabel: String
@@ -384,7 +683,8 @@ enum OverlayLibrary {
                     let levels = counts.keys.sorted().map { "z\($0):\(counts[$0] ?? 0)" }.joined(separator: ",")
                     runtimeLabel = "rev=\(runtime.revision) minZ=\(runtime.minimumZoom) maxZ=\(runtime.maximumZoom) previewMax=\(runtime.previewMaximumZoom) fullMax=\(runtime.fullMaximumZoom) refining=\(runtime.refinementInProgress) rootExists=\(FileManager.default.fileExists(atPath: root.path)) levels=[\(levels)]"
                 } else {
-                    runtimeLabel = "missing runtime (rowRev=\(row.tilePyramidRevision) rowMinZ=\(row.tileMinimumZoom) rowMaxZ=\(row.tileMaximumZoom))"
+                    let reason = missingTilePyramidRuntimeReason(row: row, overlayID: uuid, sourcePixels: sourcePixels)
+                    runtimeLabel = "missing runtime (rowRev=\(row.tilePyramidRevision) rowMinZ=\(row.tileMinimumZoom) rowMaxZ=\(row.tileMaximumZoom) reason=\(reason))"
                 }
                 print("[TileDiag] load.row id=\(uuid.uuidString.prefix(8)) heavy=true \(runtimeLabel)")
             }
@@ -435,13 +735,65 @@ enum OverlayLibrary {
         }
     }
 
+    /// On app restart, log every persisted source's pixel dimensions (threshold / tiled-path audit).
+    static func logPersistedSourceRasterPixelCounts(
+        in container: NSPersistentContainer,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
+        container.performBackgroundTask { context in
+            let request = StoredMapOverlay.fetchRequest()
+            request.sortDescriptors = [NSSortDescriptor(keyPath: \StoredMapOverlay.sortOrder, ascending: true)]
+            let rows = (try? context.fetch(request)) ?? []
+            let threshold = largeRasterOverlayPixelThresholdExclusive
+            print(
+                "[TileDiag] persistedSourceAudit begin count=\(rows.count) thresholdExclusive=\(threshold) (sources with count > \(threshold) use MKTileOverlay / tiled path)"
+            )
+            for (index, row) in rows.enumerated() {
+                let idLabel = row.uuid.map { String($0.uuidString.prefix(8)) } ?? "nil-uuid"
+                guard let id = row.uuid else {
+                    print("[TileDiag] persistedSourceAudit[\(index)] id=nil sortOrder=\(row.sortOrder) skipped=missingUUID")
+                    continue
+                }
+                guard let sourceData = row.sourceImageData else {
+                    print("[TileDiag] persistedSourceAudit[\(index)] id=\(idLabel) sortOrder=\(row.sortOrder) skipped=missingSource")
+                    continue
+                }
+                guard let sourcePixels = UIImage.logRasterPixelCount(forCompressedImageData: sourceData) else {
+                    print(
+                        "[TileDiag] persistedSourceAudit[\(index)] id=\(idLabel) sortOrder=\(row.sortOrder) skipped=metadataUnreadable bytes=\(sourceData.count)"
+                    )
+                    continue
+                }
+                let isHeavy = sourcePixels > threshold
+                let hasRuntime = tilePyramidRuntimeInfo(from: row, overlayID: id) != nil
+                let needsPyramid = rowMissingTilePyramidRuntime(row: row, overlayID: id, sourcePixels: sourcePixels)
+                let presentation: String = {
+                    guard isHeavy else { return "ImageRasterMapOverlay" }
+                    if hasRuntime { return "MKTileOverlay(runtimeOK)" }
+                    return "MKTileOverlay(expected,missingPyramid)"
+                }()
+                let migrationNote: String = {
+                    guard isHeavy, row.tilePyramidRevision <= 0 else { return "" }
+                    return " thresholdMigrationCandidate"
+                }()
+                print(
+                    "[TileDiag] persistedSourceAudit[\(index)] id=\(idLabel) sortOrder=\(row.sortOrder) heavy=\(isHeavy) presentation=\(presentation)\(migrationNote) needsInitialPyramid=\(needsPyramid) rowRev=\(row.tilePyramidRevision) rowMinZ=\(row.tileMinimumZoom) rowMaxZ=\(row.tileMaximumZoom) refining=\(row.tileRefinementInProgress)"
+                )
+            }
+            print("[TileDiag] persistedSourceAudit end")
+            DispatchQueue.main.async {
+                completion?()
+            }
+        }
+    }
+
     /// On app restart, continue any interrupted refinement jobs where possible and clear stale flags
     /// when the row is already complete or required assets are missing.
     static func resumePendingRefinements(
         in container: NSPersistentContainer,
         completion: (@Sendable () -> Void)? = nil
     ) {
-        let referenceScreenScale = tileDetailScreenScaleForNativeMaxZoom()
+        let tileContentScale = tileContentScaleForCurrentDevice()
         container.performBackgroundTask { context in
             let fr = StoredMapOverlay.fetchRequest()
             fr.predicate = NSPredicate(format: "tileRefinementInProgress == YES")
@@ -460,6 +812,9 @@ enum OverlayLibrary {
                 if hasValidRange, hasRevision, hasSource, hasCorners, hasBaked {
                     jobs.append((id: id, revision: row.tilePyramidRevision))
                 } else {
+                    print(
+                        "[TileDiag] resume.refineClear id=\(id.uuidString.prefix(8)) rev=\(row.tilePyramidRevision) hasValidRange=\(hasValidRange) hasRevision=\(hasRevision) hasSource=\(hasSource) hasCorners=\(hasCorners) hasBaked=\(hasBaked)"
+                    )
                     row.tileRefinementInProgress = false
                 }
             }
@@ -467,11 +822,67 @@ enum OverlayLibrary {
                 try? context.save()
             }
             if !jobs.isEmpty {
+                print("[TileDiag] resume.refineScheduled count=\(jobs.count) ids=\(jobs.map { $0.id.uuidString.prefix(8) }.joined(separator: ","))")
                 scheduleBackgroundRefinement(
                     jobs: jobs,
                     container: container,
-                    referenceScreenScale: referenceScreenScale
+                    tileContentScale: tileContentScale
                 )
+            }
+            DispatchQueue.main.async {
+                completion?()
+            }
+        }
+    }
+
+    /// Heavy overlays whose Core Data / on-disk pyramid state would leave **`OverlayItem.tilePyramid == nil`** at load — schedule an initial build on relaunch (e.g. **`rowRev == 0`** after an interrupted first save).
+    static func resumeMissingInitialPyramidBuilds(
+        in container: NSPersistentContainer,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
+        let tileContentScale = tileContentScaleForCurrentDevice()
+        container.performBackgroundTask { context in
+            let rows = (try? context.fetch(StoredMapOverlay.fetchRequest())) ?? []
+            var pyramidJobs: [UUID: Int64] = [:]
+            for row in rows {
+                guard let id = row.uuid,
+                      let source = row.sourceImageData,
+                      let corners = decodeCorners(from: row.cornersJSON ?? ""),
+                      corners.count == 4,
+                      bakedImageDataFromDisk(id: id) != nil else { continue }
+                let sourcePixels = UIImage.rasterPixelCount(forCompressedImageData: source) ?? 0
+                guard rowMissingTilePyramidRuntime(row: row, overlayID: id, sourcePixels: sourcePixels) else { continue }
+
+                let reason = missingTilePyramidRuntimeReason(row: row, overlayID: id, sourcePixels: sourcePixels)
+                if row.tilePyramidRevision <= 0 {
+                    row.tilePyramidRevision = 1
+                    removeTilePyramidFolderFromDisk(id: id)
+                } else if row.tileMinimumZoom >= 0 {
+                    removeTilePyramidFolderFromDisk(id: id)
+                    row.tileMinimumZoom = -1
+                    row.tileMaximumZoom = -1
+                    row.tileMaximumZoomPreview = -1
+                    row.tileMaximumZoomFull = -1
+                }
+                row.tileRefinementInProgress = true
+                noteActivePyramidBuildRevision(id, revision: row.tilePyramidRevision)
+                pyramidJobs[id] = row.tilePyramidRevision
+                print(
+                    "[TileDiag] resume.initialPyramid id=\(id.uuidString.prefix(8)) rev=\(row.tilePyramidRevision) sourcePx=\(sourcePixels) reason=\(reason)"
+                )
+            }
+            if context.hasChanges {
+                try? context.save()
+            }
+            if !pyramidJobs.isEmpty {
+                print("[TileDiag] resume.initialPyramidScheduled count=\(pyramidJobs.count)")
+                scheduleBackgroundPyramidBuild(
+                    pyramidJobsByOverlayID: pyramidJobs,
+                    container: container,
+                    tileContentScale: tileContentScale
+                )
+            } else {
+                print("[TileDiag] resume.initialPyramidScheduled count=0")
             }
             DispatchQueue.main.async {
                 completion?()
@@ -493,7 +904,7 @@ enum OverlayLibrary {
         let forceS = batch.forceRewriteSource
         let forceB = batch.forceRewriteBaked
         let batchCompletions = batch.completions
-        let referenceScreenScale = tileDetailScreenScaleForNativeMaxZoom()
+        let tileContentScale = tileContentScaleForCurrentDevice()
 
         container.performBackgroundTask { context in
             context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
@@ -515,11 +926,25 @@ enum OverlayLibrary {
                 SnapMemoryInstrumentation.checkpoint("persist.bg.afterContextSave pyramidJobKeys=\(pyramidJobs.count)")
 
                 if !pyramidJobs.isEmpty {
-                    scheduleBackgroundPreviewBuild(
-                        pyramidJobsByOverlayID: pyramidJobs,
-                        container: container,
-                        referenceScreenScale: referenceScreenScale
-                    )
+                    saveTransitionLock.lock()
+                    let deferred = pyramidJobs.filter { saveTransitionOverlayIDs.contains($0.key) }
+                    let immediate = pyramidJobs.filter { !saveTransitionOverlayIDs.contains($0.key) }
+                    for (overlayID, revision) in deferred {
+                        deferredMinZBuildJobs.append((overlayID: overlayID, revision: revision))
+                        OverlaySaveTransitionLog.stage(
+                            "metadata.persisted.deferredMinZ",
+                            overlayID: overlayID,
+                            extra: "rev=\(revision)"
+                        )
+                    }
+                    saveTransitionLock.unlock()
+                    if !immediate.isEmpty {
+                        scheduleBackgroundPyramidBuild(
+                            pyramidJobsByOverlayID: Dictionary(uniqueKeysWithValues: immediate.map { ($0.key, $0.value) }),
+                            container: container,
+                            tileContentScale: tileContentScale
+                        )
+                    }
                 }
             } catch {
                 #if DEBUG
@@ -531,7 +956,27 @@ enum OverlayLibrary {
 
     // MARK: - Private
 
+    /// Encodes a mercator bake for disk persistence (call off main during save draft to avoid peak RSS in **`persist`**).
+    static func encodeBakedImageForPersist(_ image: UIImage) throws -> Data {
+        try encodeBakedImage(image)
+    }
+
+    /// Bake + encode + disk write on a background thread during save draft; returns **`true`** when readable on disk.
+    static func persistBakedImageToDiskDuringSaveDraft(_ image: UIImage, overlayID: UUID) -> Bool {
+        (try? autoreleasepool {
+            let data = try encodeBakedImageForPersist(image)
+            writeBakedImageDataToDisk(data, id: overlayID)
+            return bakedImageExistsOnDisk(id: overlayID)
+        }) ?? false
+    }
+
     /// Always writes source rows as **HEIC**.
+    private static func bakedBlobForPersist(from overlay: OverlayItem) throws -> Data {
+        return try autoreleasepool {
+            try Self.encodeBakedImage(overlay.mapDisplayImage)
+        }
+    }
+
     private static func encodeSourceImage(_ image: UIImage) throws -> Data {
         let q = heifQualityForMegapixels(of: image, baseQuality: heifQualitySourceBase)
         // Source photos are typically opaque; encode without alpha to reduce decode RAM and file size.
@@ -701,7 +1146,8 @@ enum OverlayLibrary {
             // Source bytes only when missing or forced — **not** when only corners/camera change (_pixels unchanged).
             // Baked mercator texture depends on **quad corners** only; **`placementCamera`** is map framing metadata and must not force a baked HEIC re-encode (that was making “cancel” / placement-only saves as slow as a full bake).
             let needsSourceWrite = forceRewriteSource || row.sourceImageData == nil
-            let needsBakedWrite = forceRewriteBaked || cornersChanged || !bakedImageExistsOnDisk(id: o.id)
+            let bakedContentChanged = forceRewriteBaked || cornersChanged || !bakedImageExistsOnDisk(id: o.id)
+            let needsBakedWrite = bakedContentChanged && !o.bakedImagePreWrittenToDisk
 
             let sourceBlob: Data?
             let bakedBlob: Data?
@@ -716,9 +1162,7 @@ enum OverlayLibrary {
                         try Self.encodeSourceImage(o.sourceImage)
                     }
                 }
-                bakedBlob = try autoreleasepool {
-                    try Self.encodeBakedImage(o.mapDisplayImage)
-                }
+                bakedBlob = try bakedBlobForPersist(from: o)
             case (true, false):
                 if let preserved = o.preservedSourceFileData {
                     sourceBlob = preserved
@@ -732,9 +1176,7 @@ enum OverlayLibrary {
                 bakedBlob = nil
             case (false, true):
                 sourceBlob = nil
-                bakedBlob = try autoreleasepool {
-                    try Self.encodeBakedImage(o.mapDisplayImage)
-                }
+                bakedBlob = try bakedBlobForPersist(from: o)
             case (false, false):
                 sourceBlob = nil
                 bakedBlob = nil
@@ -748,7 +1190,7 @@ enum OverlayLibrary {
             }
 
             let heavyTiled = o.usesTiledMapPresentation
-            if needsBakedWrite && heavyTiled {
+            if bakedContentChanged && heavyTiled {
                 // New edit session invalidates all previous revision outputs for this overlay.
                 row.tilePyramidRevision += 1
                 noteActivePyramidBuildRevision(o.id, revision: row.tilePyramidRevision)
@@ -773,134 +1215,137 @@ enum OverlayLibrary {
         return pyramidRebuildJobs
     }
 
-    /// After a device-scale fix, extend existing pyramids whose stored **`tileMaximumZoomFull`** underestimated native detail (~1.6 z on 3× iPhone).
+    /// Extend existing pyramids when stored or on-disk max **`z`** is below recomputed native detail (e.g. after a ceiling fix).
     static func resumeUnderestimatedPyramidCeilings(
         in container: NSPersistentContainer,
         completion: (@Sendable () -> Void)? = nil
     ) {
-        let referenceScreenScale = tileDetailScreenScaleForNativeMaxZoom()
+        let tileContentScale = tileContentScaleForCurrentDevice()
         container.performBackgroundTask { context in
             let fr = StoredMapOverlay.fetchRequest()
             let rows = (try? context.fetch(fr)) ?? []
-            var jobs: [(id: UUID, revision: Int64, fromZ: Int, toZ: Int)] = []
             for row in rows {
                 guard let id = row.uuid,
                       row.tilePyramidRevision > 0,
                       !row.tileRefinementInProgress,
                       let source = row.sourceImageData,
                       let corners = decodeCorners(from: row.cornersJSON ?? ""),
-                      corners.count == 4 else { continue }
+                      corners.count == 4,
+                      let bakedBlob = bakedImageDataFromDisk(id: id),
+                      let bakedImg = UIImage(data: bakedBlob) else { continue }
                 let storedFull = row.tileMaximumZoomFull >= 0 ? Int(row.tileMaximumZoomFull) : Int(row.tileMaximumZoom)
                 let storedAdvertised = row.tileMaximumZoom >= 0 ? Int(row.tileMaximumZoom) : storedFull
                 let bbox = OverlayMapBake.mapBoundingMapRect(for: corners)
-                let recomputed = OverlayMapBake.nativeMaxZoomLevelFromSourceRaster(
+                let recomputed = OverlayMapBake.nativeOverresolveMaxZoomLevelFromSourceRaster(
                     sourceRaster: source,
                     mapBoundingRect: bbox,
                     tileSizePoints: logicalTileSizePoints,
-                    screenScale: referenceScreenScale
+                    screenScale: tileContentScale
                 )
                 let disk = tilePyramidRevisionDirectoryURL(id: id, revision: row.tilePyramidRevision)
                 let diskMaxZ = FileManager.default.fileExists(atPath: disk.path) ? diskMaximumZoomLevel(pyramidRoot: disk) : -1
                 // Extend from what is actually on disk; stored full Z can already match recomputed while tiles stop early (~14).
                 let builtThroughZ = diskMaxZ >= 0 ? diskMaxZ : max(storedFull, storedAdvertised)
                 print(
-                    "[TileDiag] pyramid.ceilingAudit id=\(id.uuidString.prefix(8))… storedFull=\(storedFull) advertised=\(storedAdvertised) diskMaxZ=\(diskMaxZ) builtThroughZ=\(builtThroughZ) recomputedSource=\(recomputed) scale=\(referenceScreenScale)"
+                    "[TileDiag] pyramid.ceilingAudit id=\(id.uuidString.prefix(8))… storedFull=\(storedFull) advertised=\(storedAdvertised) diskMaxZ=\(diskMaxZ) builtThroughZ=\(builtThroughZ) recomputedSource=\(recomputed) tileContentScale=\(tileContentScale) physicalTilePx=\(physicalTileSizePixels(tileContentScale: tileContentScale))"
                 )
                 guard FileManager.default.fileExists(atPath: disk.path) else { continue }
-                guard recomputed > builtThroughZ else { continue }
-                jobs.append((id: id, revision: row.tilePyramidRevision, fromZ: builtThroughZ + 1, toZ: recomputed))
-                print("[TileDiag] pyramid.extendCeiling id=\(id.uuidString.prefix(8))… fromZ=\(builtThroughZ + 1) toZ=\(recomputed)")
-            }
-            if !jobs.isEmpty {
-                scheduleBackgroundPyramidExtension(jobs: jobs, container: container, referenceScreenScale: referenceScreenScale)
+                guard recomputed > storedFull || recomputed > builtThroughZ else { continue }
+                row.tileMaximumZoom = Int32(recomputed)
+                row.tileMaximumZoomFull = Int32(recomputed)
+                row.tileRefinementInProgress = true
+                try? context.save()
+                OverlayTileRuntimeScheduler.shared.startProgressiveRuntime(
+                    overlayID: id,
+                    revision: row.tilePyramidRevision,
+                    corners: corners,
+                    sourceRaster: source,
+                    bakedFallback: bakedImg,
+                    tileContentScale: tileContentScale,
+                    visibleMapRect: nil,
+                    currentZoom: 0
+                )
+                print("[TileDiag] pyramid.extendCeiling.progressive id=\(id.uuidString.prefix(8))… newMaxZ=\(recomputed) builtThroughZ=\(builtThroughZ)")
             }
             DispatchQueue.main.async { completion?() }
         }
     }
 
-    private static func scheduleBackgroundPreviewBuild(
-        pyramidJobsByOverlayID: [UUID: Int64],
+    private static func scheduleMinZBuildOnly(
+        overlayID: UUID,
+        revision: Int64,
         container: NSPersistentContainer,
-        referenceScreenScale: CGFloat
+        tileContentScale: CGFloat
     ) {
-        for (overlayID, revision) in pyramidJobsByOverlayID {
-            let overlayID = overlayID
-            let revision = revision
-            refinementQueue.async(execute: DispatchWorkItem {
-                guard !isPyramidBuildSuppressed(overlayID) else {
-                    print("[TileDiag] pyramid.skipPreview id=\(overlayID.uuidString.prefix(8))… suppressedDuringEdit")
+        refinementQueue.async {
+            guard !isPyramidBuildSuppressed(overlayID) else {
+                print("[TileDiag] pyramid.skipMinZ id=\(overlayID.uuidString.prefix(8))… suppressedDuringEdit")
+                return
+            }
+            OverlaySaveTransitionLog.stage("minZ.generation.started", overlayID: overlayID, extra: "rev=\(revision)")
+            OverlayMetalTilePipeline.clearSessionCache()
+            OverlayMapBake.endThumbnailCacheScope()
+            container.performBackgroundTask { context in
+                let fr = StoredMapOverlay.fetchRequest()
+                fr.fetchLimit = 1
+                fr.predicate = NSPredicate(format: "uuid == %@", overlayID as CVarArg)
+                guard let row = try? context.fetch(fr).first else {
+                    OverlaySaveTransitionLog.stage("minZ.generation.aborted", overlayID: overlayID, extra: "rowNotFound")
                     return
                 }
-                container.performBackgroundTask { context in
-                    let fr = StoredMapOverlay.fetchRequest()
-                    fr.fetchLimit = 1
-                    fr.predicate = NSPredicate(format: "uuid == %@", overlayID as CVarArg)
-                    guard let row = try? context.fetch(fr).first,
-                          row.tilePyramidRevision == revision,
-                          let source = row.sourceImageData,
-                          let corners = decodeCorners(from: row.cornersJSON ?? ""),
-                          corners.count == 4,
-                          let bakedBlob = bakedImageDataFromDisk(id: overlayID),
-                          let bakedImg = UIImage(data: bakedBlob) else {
-                        return
-                    }
-                    SnapMemoryInstrumentation.checkpoint("pyramid.batch.begin jobs=1 id=\(overlayID.uuidString.prefix(8))… rev=\(revision)")
-                    let bbox = OverlayMapBake.mapBoundingMapRect(for: corners)
-                    let intrinsic = intrinsicPixelSize(from: source) ?? (
-                        width: max(1, Int((bakedImg.size.width * bakedImg.scale).rounded())),
-                        height: max(1, Int((bakedImg.size.height * bakedImg.scale).rounded()))
-                    )
-                    let mercator = (
-                        width: max(1, bakedImg.cgImage?.width ?? intrinsic.width),
-                        height: max(1, bakedImg.cgImage?.height ?? intrinsic.height)
-                    )
-                    let ceilings = OverlayTilePyramidBuilder.computeZoomCeilings(
-                        sourceIntrinsicSize: intrinsic,
-                        mercatorSize: mercator,
-                        mapBoundingRect: bbox,
-                        referenceScreenScale: referenceScreenScale
-                    )
-                    try? OverlayTilePyramidBuilder.buildAndPersistRow(
-                        overlayID: overlayID,
-                        revision: revision,
-                        sourceRaster: source,
-                        corners: corners,
-                        bakedMercatorDisplay: bakedImg,
-                        geometryFlipped: false,
-                        referenceScreenScale: referenceScreenScale,
-                        phase: .preview,
-                        buildMinimumZoom: ceilings.minimumZ,
-                        buildMaximumZoom: ceilings.previewMaximumZ,
-                        advertisedAvailableMaximumZoom: ceilings.previewMaximumZ,
-                        targetFullMaximumZoom: ceilings.fullMaximumZ,
-                        previewMaximumZoom: ceilings.previewMaximumZ,
-                        row: row,
-                        context: context
-                    )
-                    SnapMemoryInstrumentation.checkpoint("pyramid.batch.afterJob id=\(overlayID.uuidString.prefix(8))… rev=\(revision)")
-                    if ceilings.fullMaximumZ > ceilings.previewMaximumZ {
-                        scheduleBackgroundRefinement(
-                            jobs: [(id: overlayID, revision: revision)],
-                            container: container,
-                            referenceScreenScale: referenceScreenScale
-                        )
-                    }
-                    DispatchQueue.main.async {
-                        NotificationCenter.default.post(
-                            name: .overlayTilePyramidRefinementDidComplete,
-                            object: nil,
-                            userInfo: ["overlayID": overlayID.uuidString]
-                        )
-                    }
+                guard row.tilePyramidRevision == revision else {
+                    OverlaySaveTransitionLog.stage("minZ.generation.aborted", overlayID: overlayID, extra: "revisionMismatch")
+                    return
                 }
-            })
+                guard let source = row.sourceImageData else {
+                    OverlaySaveTransitionLog.stage("minZ.generation.aborted", overlayID: overlayID, extra: "missingSource")
+                    return
+                }
+                guard let corners = decodeCorners(from: row.cornersJSON ?? ""), corners.count == 4 else {
+                    OverlaySaveTransitionLog.stage("minZ.generation.aborted", overlayID: overlayID, extra: "missingCorners")
+                    return
+                }
+                guard let bakedBlob = bakedImageDataFromDisk(id: overlayID),
+                      let bakedImg = UIImage(data: bakedBlob) else {
+                    OverlaySaveTransitionLog.stage("minZ.generation.aborted", overlayID: overlayID, extra: "missingBaked")
+                    return
+                }
+                SnapMemoryInstrumentation.checkpoint("saveTransition.minZ.beforeBuild id=\(overlayID.uuidString.prefix(8))… rev=\(revision)")
+                try? OverlayTilePyramidBuilder.buildMinZOverviewAndPersistRow(
+                    overlayID: overlayID,
+                    revision: revision,
+                    sourceRaster: source,
+                    corners: corners,
+                    bakedMercatorDisplay: bakedImg,
+                    geometryFlipped: false,
+                    tileContentScale: tileContentScale,
+                    row: row,
+                    context: context
+                )
+                OverlaySaveTransitionLog.stage("minZ.generation.finished", overlayID: overlayID, extra: "rev=\(revision)")
+            }
+        }
+    }
+
+    private static func scheduleBackgroundPyramidBuild(
+        pyramidJobsByOverlayID: [UUID: Int64],
+        container: NSPersistentContainer,
+        tileContentScale: CGFloat
+    ) {
+        for (overlayID, revision) in pyramidJobsByOverlayID {
+            scheduleMinZBuildOnly(
+                overlayID: overlayID,
+                revision: revision,
+                container: container,
+                tileContentScale: tileContentScale
+            )
         }
     }
 
     private static func scheduleBackgroundRefinement(
         jobs: [(id: UUID, revision: Int64)],
         container: NSPersistentContainer,
-        referenceScreenScale: CGFloat
+        tileContentScale: CGFloat
     ) {
         for job in jobs {
             refinementQueue.async {
@@ -912,13 +1357,27 @@ enum OverlayLibrary {
                     let fr = StoredMapOverlay.fetchRequest()
                     fr.fetchLimit = 1
                     fr.predicate = NSPredicate(format: "uuid == %@", job.id as CVarArg)
-                    guard let row = try? context.fetch(fr).first,
-                          row.tilePyramidRevision == job.revision,
-                          let source = row.sourceImageData,
-                          let corners = decodeCorners(from: row.cornersJSON ?? ""),
-                          corners.count == 4,
-                          let bakedBlob = bakedImageDataFromDisk(id: job.id),
+                    guard let row = try? context.fetch(fr).first else {
+                        print("[TileDiag] pyramid.skipRefine id=\(job.id.uuidString.prefix(8))… rev=\(job.revision) reason=rowNotFound")
+                        return
+                    }
+                    guard row.tilePyramidRevision == job.revision else {
+                        print(
+                            "[TileDiag] pyramid.skipRefine id=\(job.id.uuidString.prefix(8))… expectedRev=\(job.revision) rowRev=\(row.tilePyramidRevision) reason=revisionMismatch"
+                        )
+                        return
+                    }
+                    guard let source = row.sourceImageData else {
+                        print("[TileDiag] pyramid.skipRefine id=\(job.id.uuidString.prefix(8))… rev=\(job.revision) reason=missingSource")
+                        return
+                    }
+                    guard let corners = decodeCorners(from: row.cornersJSON ?? ""), corners.count == 4 else {
+                        print("[TileDiag] pyramid.skipRefine id=\(job.id.uuidString.prefix(8))… rev=\(job.revision) reason=missingCorners")
+                        return
+                    }
+                    guard let bakedBlob = bakedImageDataFromDisk(id: job.id),
                           let bakedImg = UIImage(data: bakedBlob) else {
+                        print("[TileDiag] pyramid.skipRefine id=\(job.id.uuidString.prefix(8))… rev=\(job.revision) reason=missingOrUndecodableBaked")
                         return
                     }
                     let bbox = OverlayMapBake.mapBoundingMapRect(for: corners)
@@ -934,33 +1393,27 @@ enum OverlayLibrary {
                         sourceIntrinsicSize: intrinsic,
                         mercatorSize: mercator,
                         mapBoundingRect: bbox,
-                        referenceScreenScale: referenceScreenScale
+                        tileContentScale: tileContentScale
                     )
-                    guard ceilings.fullMaximumZ > ceilings.previewMaximumZ else { return }
-                    try? OverlayTilePyramidBuilder.buildAndPersistRow(
+                    guard ceilings.firstMultiTileZoom <= ceilings.fullMaximumZ else {
+                        print(
+                            "[TileDiag] pyramid.skipRefine id=\(job.id.uuidString.prefix(8))… rev=\(job.revision) reason=noMultiTileRange firstMulti=\(ceilings.firstMultiTileZoom) fullMax=\(ceilings.fullMaximumZ)"
+                        )
+                        row.tileRefinementInProgress = ceilings.fullMaximumZ > ceilings.highestSingleTileZoom
+                        try? context.save()
+                        return
+                    }
+                    OverlayTileRuntimeScheduler.shared.startProgressiveRuntime(
                         overlayID: job.id,
                         revision: job.revision,
-                        sourceRaster: source,
                         corners: corners,
-                        bakedMercatorDisplay: bakedImg,
-                        geometryFlipped: false,
-                        referenceScreenScale: referenceScreenScale,
-                        phase: .refine,
-                        buildMinimumZoom: ceilings.previewMaximumZ + 1,
-                        buildMaximumZoom: ceilings.fullMaximumZ,
-                        advertisedAvailableMaximumZoom: ceilings.fullMaximumZ,
-                        targetFullMaximumZoom: ceilings.fullMaximumZ,
-                        previewMaximumZoom: ceilings.previewMaximumZ,
-                        row: row,
-                        context: context
+                        sourceRaster: source,
+                        bakedFallback: bakedImg,
+                        tileContentScale: tileContentScale,
+                        visibleMapRect: nil,
+                        currentZoom: 0
                     )
-                    DispatchQueue.main.async {
-                        NotificationCenter.default.post(
-                            name: .overlayTilePyramidRefinementDidComplete,
-                            object: nil,
-                            userInfo: ["overlayID": job.id.uuidString]
-                        )
-                    }
+                    print("[TileDiag] pyramid.resumeProgressive id=\(job.id.uuidString.prefix(8))… rev=\(job.revision) minZ=\(ceilings.highestSingleTileZoom) maxZ=\(ceilings.fullMaximumZ)")
                 }
             }
         }
@@ -969,7 +1422,7 @@ enum OverlayLibrary {
     private static func scheduleBackgroundPyramidExtension(
         jobs: [(id: UUID, revision: Int64, fromZ: Int, toZ: Int)],
         container: NSPersistentContainer,
-        referenceScreenScale: CGFloat
+        tileContentScale: CGFloat
     ) {
         for job in jobs {
             refinementQueue.async {
@@ -996,8 +1449,7 @@ enum OverlayLibrary {
                         corners: corners,
                         bakedMercatorDisplay: bakedImg,
                         geometryFlipped: false,
-                        referenceScreenScale: referenceScreenScale,
-                        phase: .refine,
+                        tileContentScale: tileContentScale,
                         buildMinimumZoom: job.fromZ,
                         buildMaximumZoom: job.toZ,
                         advertisedAvailableMaximumZoom: job.toZ,
@@ -1006,13 +1458,6 @@ enum OverlayLibrary {
                         row: row,
                         context: context
                     )
-                    DispatchQueue.main.async {
-                        NotificationCenter.default.post(
-                            name: .overlayTilePyramidRefinementDidComplete,
-                            object: nil,
-                            userInfo: ["overlayID": job.id.uuidString]
-                        )
-                    }
                 }
             }
         }

@@ -153,7 +153,7 @@ enum OverlayMapBake {
         return drawn.cgImage
     }
 
-    /// Mercator output pixel positions for geographic **`corners`** index order (TL, TR, BR, BL), matching **`CIFilter.perspectiveTransform`** in **`bakeMercatorDisplayTexture`** (UIKit-style Y down).
+    /// Mercator output pixel positions for geographic **`corners`** index order (TL, TR, BR, BL), matching **`CIFilter.perspectiveTransform`** in **`bakeMercatorDisplayTexture`** (Core Image bottom-left origin).
     static func mercatorDestinationPixelPoints(width W: Int, height H: Int, corners: [CLLocationCoordinate2D]) -> [CGPoint]? {
         guard corners.count == 4, W >= 2, H >= 2 else { return nil }
         let bbox = mapBoundingMapRect(for: corners)
@@ -175,6 +175,129 @@ enum OverlayMapBake {
             out.append(ciPt)
         }
         return out
+    }
+
+    /// Same corner order as **`mercatorDestinationPixelPoints`**, UIKit / Metal top-down **Y**.
+    static func mercatorDestinationPixelPointsTopDown(
+        width W: Int,
+        height H: Int,
+        corners: [CLLocationCoordinate2D]
+    ) -> [CGPoint]? {
+        guard corners.count == 4, W >= 2, H >= 2 else { return nil }
+        let bbox = mapBoundingMapRect(for: corners)
+        let ox = bbox.origin.x
+        let oy = bbox.origin.y
+        let bw = bbox.size.width
+        let bh = bbox.size.height
+        guard bw.isFinite, bh.isFinite, bw > 0, bh > 0 else { return nil }
+
+        let mapPts = corners.map { MKMapPoint($0) }
+        var out: [CGPoint] = []
+        out.reserveCapacity(4)
+        for i in 0..<4 {
+            let mp = mapPts[i]
+            let px = (mp.x - ox) / bw * CGFloat(W)
+            let pyFromNorth = (mp.y - oy) / bh * CGFloat(H)
+            out.append(CGPoint(x: px, y: pyFromNorth))
+        }
+        return out
+    }
+
+    /// Per-tile layout for inverse Metal rendering (map tile → mercator pixel rect → source sample).
+    struct MercatorTileLayout {
+        let textureCrop: CGRect
+        /// Fractional mercator/source pixel crop origin (avoids `.integral` seam drift).
+        let exactCropOriginX: CGFloat
+        let exactCropOriginY: CGFloat
+        let exactCropWidth: CGFloat
+        let exactCropHeight: CGFloat
+        let outputWidth: Int
+        let outputHeight: Int
+        let destX: CGFloat
+        let destY: CGFloat
+        let destWidth: CGFloat
+        let destHeight: CGFloat
+
+        /// Destination-space basis for Metal **`renderWarpedTile`** (top-down image Y).
+        func destinationBasis() -> (origin: SIMD2<Float>, stepX: SIMD2<Float>, stepY: SIMD2<Float>) {
+            let invDestW = 1 / max(destWidth, 1)
+            let invDestH = 1 / max(destHeight, 1)
+            let stepX = SIMD2<Float>(Float(exactCropWidth * invDestW), 0)
+            let stepY = SIMD2<Float>(0, Float(exactCropHeight * invDestH))
+            let origin = SIMD2<Float>(
+                Float(exactCropOriginX) - Float(destX) * stepX.x,
+                Float(exactCropOriginY) - Float(destY) * stepY.y
+            )
+            return (origin, stepX, stepY)
+        }
+
+        var tileFullyCoversOutput: Bool {
+            destX <= 0.5
+                && destY <= 0.5
+                && (destX + destWidth) >= CGFloat(outputWidth) - 0.5
+                && (destY + destHeight) >= CGFloat(outputHeight) - 0.5
+        }
+    }
+
+#if DEBUG
+    /// Builds a layout for identity-transform tests (**`destCoord == source pixel`**) on a source crop.
+    static func debugIdentityTileLayout(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        crop: CGRect,
+        outputWidth: Int,
+        outputHeight: Int
+    ) -> MercatorTileLayout? {
+        guard sourceWidth >= 1, sourceHeight >= 1,
+              outputWidth >= 1, outputHeight >= 1,
+              crop.width >= 1, crop.height >= 1 else { return nil }
+        return MercatorTileLayout(
+            textureCrop: crop.integral,
+            exactCropOriginX: crop.origin.x,
+            exactCropOriginY: crop.origin.y,
+            exactCropWidth: crop.width,
+            exactCropHeight: crop.height,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight,
+            destX: 0,
+            destY: 0,
+            destWidth: CGFloat(outputWidth),
+            destHeight: CGFloat(outputHeight)
+        )
+    }
+#endif
+
+    static func mercatorTileLayout(
+        mercatorWidth: Int,
+        mercatorHeight: Int,
+        tileRect: MKMapRect,
+        bbox: MKMapRect,
+        clipped: MKMapRect,
+        tileSize: CGSize,
+        contentScale: CGFloat
+    ) -> MercatorTileLayout? {
+        guard let geom = mercatorTileGeometry(
+            mercatorWidth: CGFloat(mercatorWidth),
+            mercatorHeight: CGFloat(mercatorHeight),
+            tileRect: tileRect,
+            bbox: bbox,
+            clipped: clipped,
+            tileSize: tileSize,
+            contentScale: contentScale
+        ) else { return nil }
+        return MercatorTileLayout(
+            textureCrop: geom.textureCrop,
+            exactCropOriginX: geom.exactCropOriginX,
+            exactCropOriginY: geom.exactCropOriginY,
+            exactCropWidth: geom.exactCropWidth,
+            exactCropHeight: geom.exactCropHeight,
+            outputWidth: Int(geom.outputWidth),
+            outputHeight: Int(geom.outputHeight),
+            destX: geom.destX,
+            destY: geom.destY,
+            destWidth: geom.destWidth,
+            destHeight: geom.destHeight
+        )
     }
 
     // MARK: - Per-tile LOD from compressed source (ImageIO)
@@ -212,7 +335,7 @@ enum OverlayMapBake {
         thumbnailCache.removeAllObjects()
     }
 
-    /// One map tile as HEIF: Mercator warp matches **`bakeMercatorDisplayTexture`**, but **`sourceRaster`** is decoded via **`ImageIO`** only as large as this zoom needs.
+    /// One map tile as HEIF via Metal inverse rendering from **`sourceRaster`** (delegates to **`OverlayTileRenderer`**).
     static func mercatorTileHEIFDataFromSourceRaster(
         sourceRaster: Data,
         corners: [CLLocationCoordinate2D],
@@ -226,130 +349,20 @@ enum OverlayMapBake {
         maxThumbnailDecodeSideOverride: Int? = nil,
         thumbnailCacheScope: String = ""
     ) -> Data? {
-        guard corners.count == 4, W >= 1, H >= 1 else { return nil }
-        guard let geom = mercatorTileGeometry(
-            mercatorWidth: CGFloat(W),
-            mercatorHeight: CGFloat(H),
+        _ = maxThumbnailDecodeSideOverride
+        let request = OverlayTileRenderer.SourceTileRequest(
+            sourceRaster: sourceRaster,
+            corners: corners,
+            mercatorPixelWidth: W,
+            mercatorPixelHeight: H,
             tileRect: tileRect,
             bbox: bbox,
             clipped: clipped,
             tileSize: tileSize,
-            contentScale: contentScale
-        ) else { return nil }
-
-        guard let intrinsic = intrinsicPixelSize(from: sourceRaster) else { return nil }
-        let nativeMaxSide = max(intrinsic.width, intrinsic.height)
-        let cw = max(geom.textureCrop.width, 1)
-        let ch = max(geom.textureCrop.height, 1)
-        let decodeNeeded = max(
-            geom.outputWidth * CGFloat(W) / cw,
-            geom.outputHeight * CGFloat(H) / ch
+            contentScale: contentScale,
+            thumbnailCacheScope: thumbnailCacheScope
         )
-        let decodeSideCap = max(1, maxThumbnailDecodeSideOverride ?? maxThumbnailDecodeSide)
-        let targetDecodeSide = Int(min(CGFloat(decodeSideCap), max(1, decodeNeeded * 1.18)).rounded(.up))
-        let thumbnailSide = max(1, min(nativeMaxSide, targetDecodeSide))
-        let quantizedSide = max(
-            1,
-            min(
-                nativeMaxSide,
-                ((thumbnailSide + thumbnailDecodeBucket - 1) / thumbnailDecodeBucket) * thumbnailDecodeBucket
-            )
-        )
-
-        let decodeStart = CFAbsoluteTimeGetCurrent()
-        guard let cgThumb = cachedCGImageThumbnail(
-            from: sourceRaster,
-            maxPixelSize: quantizedSide,
-            cacheScope: thumbnailCacheScope
-        ) else { return nil }
-        OverlayTileBuildProfiling.record(.decode, seconds: CFAbsoluteTimeGetCurrent() - decodeStart)
-        let ciInput = CIImage(cgImage: cgThumb)
-
-        let bboxRect = mapBoundingMapRect(for: corners)
-        let ox = bboxRect.origin.x
-        let oy = bboxRect.origin.y
-        let bw = bboxRect.size.width
-        let bh = bboxRect.size.height
-        guard bw.isFinite, bh.isFinite, bw > 0, bh > 0 else { return nil }
-
-        let mapPts = corners.map { MKMapPoint($0) }
-        let ciH = CGFloat(H)
-        let cropRect = geom.textureCrop.integral
-        guard cropRect.width >= 2, cropRect.height >= 2 else { return nil }
-        let localW = cropRect.width
-        let localH = cropRect.height
-        // geom.textureCrop is in top-down texture coordinates; convert its origin to CI space
-        // so localY math stays consistent with ciPt (bottom-left origin).
-        let cropRectCIOriginY = ciH - (cropRect.origin.y + cropRect.height)
-
-        let filter = CIFilter.perspectiveTransform()
-        filter.inputImage = ciInput
-        for i in 0..<4 {
-            let mp = mapPts[i]
-            let px = (mp.x - ox) / bw * CGFloat(W)
-            let pyFromNorth = (mp.y - oy) / bh * CGFloat(H)
-            // Render in crop-local mercator space to avoid allocating full W×H intermediates per tile.
-            let localX = px - cropRect.origin.x
-            let localY = (ciH - pyFromNorth) - cropRectCIOriginY
-            let ciPt = CGPoint(x: localX, y: localY)
-            switch i {
-            case 0: filter.topLeft = ciPt
-            case 1: filter.topRight = ciPt
-            case 2: filter.bottomRight = ciPt
-            case 3: filter.bottomLeft = ciPt
-            default: break
-            }
-        }
-
-        guard let warped = filter.outputImage else { return nil }
-        let targetExtent = CGRect(x: 0, y: 0, width: localW, height: localH)
-        let croppedWarp = warped.cropped(to: targetExtent)
-        let clearBackdrop = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: targetExtent)
-        let composite = CIFilter.sourceOverCompositing()
-        composite.inputImage = croppedWarp
-        composite.backgroundImage = clearBackdrop
-        guard let composited = composite.outputImage?.cropped(to: targetExtent) else { return nil }
-
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        let warpStart = CFAbsoluteTimeGetCurrent()
-        guard let cgSlice = tileRenderCIContext.createCGImage(composited, from: targetExtent, format: .RGBA8, colorSpace: colorSpace)
-                ?? tileRenderCIContext.createCGImage(composited, from: targetExtent) else {
-            return nil
-        }
-
-        let tileFullyCoversOutput =
-            geom.destX <= 0.5
-            && geom.destY <= 0.5
-            && (geom.destX + geom.destWidth) >= geom.outputWidth - 0.5
-            && (geom.destY + geom.destHeight) >= geom.outputHeight - 0.5
-        let bitmapInfo = tileFullyCoversOutput
-            ? CGImageAlphaInfo.noneSkipLast.rawValue
-            : CGImageAlphaInfo.premultipliedLast.rawValue
-        guard let outSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let ctx = CGContext(
-                  data: nil,
-                  width: Int(geom.outputWidth),
-                  height: Int(geom.outputHeight),
-                  bitsPerComponent: 8,
-                  bytesPerRow: 0,
-                  space: outSpace,
-                  bitmapInfo: bitmapInfo
-              ) else { return nil }
-        ctx.interpolationQuality = .high
-        if tileFullyCoversOutput {
-            ctx.draw(cgSlice, in: CGRect(x: geom.destX, y: geom.outputHeight - (geom.destY + geom.destHeight), width: geom.destWidth, height: geom.destHeight))
-        } else {
-            ctx.clear(CGRect(x: 0, y: 0, width: geom.outputWidth, height: geom.outputHeight))
-            let drawY = geom.outputHeight - (geom.destY + geom.destHeight)
-            ctx.draw(cgSlice, in: CGRect(x: geom.destX, y: drawY, width: geom.destWidth, height: geom.destHeight))
-        }
-        guard let outCg = ctx.makeImage() else { return nil }
-        OverlayTileBuildProfiling.record(.warp, seconds: CFAbsoluteTimeGetCurrent() - warpStart)
-
-        let encodeStart = CFAbsoluteTimeGetCurrent()
-        let data = heifData(from: outCg, knownOpaque: tileFullyCoversOutput)
-        OverlayTileBuildProfiling.record(.encode, seconds: CFAbsoluteTimeGetCurrent() - encodeStart)
-        return data
+        return OverlayTileRenderer.mercatorTileHEIFData(from: request)
     }
 
     /// Backward-compatible name; prefer **`mercatorTileHEIFDataFromSourceRaster`**.
@@ -395,7 +408,7 @@ enum OverlayMapBake {
         )
     }
 
-    /// Same detail limit as **`nativeMaxZoomLevelFromSourceRaster`**, but accepts decoded intrinsic dimensions directly.
+    /// Highest zoom where physical tile resolution still **underresolves** native source (**legacy ceiling**).
     static func nativeMaxZoomLevel(
         intrinsicPixelWidth: Int,
         intrinsicPixelHeight: Int,
@@ -403,6 +416,59 @@ enum OverlayMapBake {
         tileSizePoints: CGFloat,
         screenScale: CGFloat
     ) -> Int {
+        let raw = nativeMaxZoomRawValue(
+            intrinsicPixelWidth: intrinsicPixelWidth,
+            intrinsicPixelHeight: intrinsicPixelHeight,
+            mapBoundingRect: mapBoundingRect,
+            tileSizePoints: tileSizePoints,
+            screenScale: screenScale
+        )
+        guard raw.isFinite else { return 0 }
+        return max(0, Int(floor(raw)))
+    }
+
+    /// **maxZ** for runtime-progressive pyramids: lowest zoom that **reaches or exceeds** native source resolution.
+    static func nativeOverresolveMaxZoomLevel(
+        intrinsicPixelWidth: Int,
+        intrinsicPixelHeight: Int,
+        mapBoundingRect: MKMapRect,
+        tileSizePoints: CGFloat,
+        screenScale: CGFloat
+    ) -> Int {
+        let raw = nativeMaxZoomRawValue(
+            intrinsicPixelWidth: intrinsicPixelWidth,
+            intrinsicPixelHeight: intrinsicPixelHeight,
+            mapBoundingRect: mapBoundingRect,
+            tileSizePoints: tileSizePoints,
+            screenScale: screenScale
+        )
+        guard raw.isFinite else { return 0 }
+        return max(0, Int(ceil(raw)))
+    }
+
+    static func nativeOverresolveMaxZoomLevelFromSourceRaster(
+        sourceRaster: Data,
+        mapBoundingRect: MKMapRect,
+        tileSizePoints: CGFloat,
+        screenScale: CGFloat
+    ) -> Int {
+        guard let sz = intrinsicPixelSize(from: sourceRaster) else { return 0 }
+        return nativeOverresolveMaxZoomLevel(
+            intrinsicPixelWidth: sz.width,
+            intrinsicPixelHeight: sz.height,
+            mapBoundingRect: mapBoundingRect,
+            tileSizePoints: tileSizePoints,
+            screenScale: screenScale
+        )
+    }
+
+    private static func nativeMaxZoomRawValue(
+        intrinsicPixelWidth: Int,
+        intrinsicPixelHeight: Int,
+        mapBoundingRect: MKMapRect,
+        tileSizePoints: CGFloat,
+        screenScale: CGFloat
+    ) -> Double {
         let pxW = max(1, CGFloat(intrinsicPixelWidth))
         let pxH = max(1, CGFloat(intrinsicPixelHeight))
         let bw = max(1, CGFloat(mapBoundingRect.size.width))
@@ -410,13 +476,15 @@ enum OverlayMapBake {
         let sourcePixelsPerMapPoint = min(pxW / bw, pxH / bh)
         let tilePixels = max(1, tileSizePoints * max(1, screenScale))
         let world = CGFloat(MKMapRect.world.size.width)
-        let raw = log2((sourcePixelsPerMapPoint * world) / tilePixels)
-        guard raw.isFinite else { return 0 }
-        return max(0, Int(floor(raw)))
+        return log2((sourcePixelsPerMapPoint * world) / tilePixels)
     }
 
     private struct MercatorTileGeometry {
         let textureCrop: CGRect
+        let exactCropOriginX: CGFloat
+        let exactCropOriginY: CGFloat
+        let exactCropWidth: CGFloat
+        let exactCropHeight: CGFloat
         let outputWidth: CGFloat
         let outputHeight: CGFloat
         let destX: CGFloat
@@ -441,13 +509,18 @@ enum OverlayMapBake {
         let v0 = CGFloat((clipped.origin.y - bbox.origin.y) / bbox.size.height)
         let v1 = CGFloat((clipped.maxY - bbox.origin.y) / bbox.size.height)
 
+        let exactCropOriginX = u0 * iw
+        let exactCropOriginY = v0 * ih
+        let exactCropWidth = max(u1 - u0, 0) * iw
+        let exactCropHeight = max(v1 - v0, 0) * ih
         let textureCrop = CGRect(
-            x: u0 * iw,
-            y: v0 * ih,
-            width: max(u1 - u0, 0) * iw,
-            height: max(v1 - v0, 0) * ih
+            x: exactCropOriginX,
+            y: exactCropOriginY,
+            width: exactCropWidth,
+            height: exactCropHeight
         ).integral
-        guard textureCrop.width >= 1, textureCrop.height >= 1 else { return nil }
+        guard textureCrop.width >= 1, textureCrop.height >= 1,
+              exactCropWidth >= 0.5, exactCropHeight >= 0.5 else { return nil }
 
         let tw = max(tileRect.width, 1)
         let th = max(tileRect.height, 1)
@@ -461,6 +534,10 @@ enum OverlayMapBake {
 
         return MercatorTileGeometry(
             textureCrop: textureCrop,
+            exactCropOriginX: exactCropOriginX,
+            exactCropOriginY: exactCropOriginY,
+            exactCropWidth: exactCropWidth,
+            exactCropHeight: exactCropHeight,
             outputWidth: ow,
             outputHeight: oh,
             destX: dx,
@@ -470,7 +547,7 @@ enum OverlayMapBake {
         )
     }
 
-    private static func intrinsicPixelSize(from data: Data) -> (width: Int, height: Int)? {
+    static func intrinsicPixelSize(from data: Data) -> (width: Int, height: Int)? {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = props[kCGImagePropertyPixelWidth] as? NSNumber,

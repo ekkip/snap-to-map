@@ -35,6 +35,21 @@ extension UIImage {
         }
         return Int64(w.intValue) * Int64(h.intValue)
     }
+
+    /// Same **`rasterPixelCount() – W × H = N`** line as the instance method, from compressed bytes (**ImageIO** metadata only).
+    @discardableResult
+    static func logRasterPixelCount(forCompressedImageData data: Data) -> Int64? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? NSNumber,
+              let h = props[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return nil
+        }
+        let width = Int64(w.intValue)
+        let height = Int64(h.intValue)
+        print("rasterPixelCount() – \(width) × \(height) = \(width * height)")
+        return width * height
+    }
 }
 
 /// Georeferenced image via `MKOverlay` / `MKOverlayRenderer`. Heavy sources use **`OverlayMapPresentation`** → **`BakedImageMapTileOverlay`** (see **`sourceImage.rasterExceedsLargeOverlayPixelThreshold`**).

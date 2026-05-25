@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import MapKit
 import PhotosUI
 import CoreImage
@@ -43,8 +44,6 @@ struct ContentView: View {
     @State private var debugPyramidIterationTileTotal: Int?
     /// Debug-only elapsed seconds in current pyramid level.
     @State private var debugPyramidIterationElapsedSeconds: Double?
-    /// Debug-only phase label (`preview` / `refine` / `full`) for pyramid progress.
-    @State private var debugPyramidIterationPhase: String?
     @StateObject private var mapBridge = MapViewBridge()
     private let persistence = PersistenceController.shared
     private let ciContext = CIContext()
@@ -169,37 +168,38 @@ struct ContentView: View {
             }
             .onChange(of: overlayPersistenceInFlight) { _, inFlight in
                 if inFlight <= 0, !hasRefiningPyramids {
-                    debugPyramidIterationZoomLevel = nil
-                    debugPyramidIterationTileIndex = nil
-                    debugPyramidIterationTileTotal = nil
-                    debugPyramidIterationElapsedSeconds = nil
-                    debugPyramidIterationPhase = nil
+                    clearDebugPyramidIterationState()
                 }
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+                OverlayTileRuntimeScheduler.shared.handleMemoryWarning()
+            }
             .onAppear {
+                OverlayTileRuntimeScheduler.shared.attach(container: persistence.container)
                 mapBridge.requestLocationAuthorizationIfNeeded()
                 mapBridge.rasterOpacity.committed = CGFloat(min(max(mapRasterOpacityCommitted, 0), 1))
                 mapBridge.rasterOpacity.clearDragging()
                 mapBridge.applyRasterOverlayRendererAlphas()
                 if !hasAttemptedRestore {
                     hasAttemptedRestore = true
-                    OverlayLibrary.resumePendingRefinements(in: persistence.container) {
-                        OverlayLibrary.resumeUnderestimatedPyramidCeilings(in: persistence.container) {
-                            restorePersistedOverlay()
+                    OverlayLibrary.logPersistedSourceRasterPixelCounts(in: persistence.container) {
+                        OverlayLibrary.resumePendingRefinements(in: persistence.container) {
+                            OverlayLibrary.resumeMissingInitialPyramidBuilds(in: persistence.container) {
+                                OverlayLibrary.resumeUnderestimatedPyramidCeilings(in: persistence.container) {
+                                    restorePersistedOverlay()
+                                }
+                            }
                         }
                     }
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .overlayTilePyramidIterationDidChange)) { note in
+                if (note.userInfo?[OverlayTilePyramidBuilder.debugIterationResetKey] as? Bool) == true {
+                    clearDebugPyramidIterationState()
+                }
                 let finished = (note.userInfo?[OverlayTilePyramidBuilder.debugIterationFinishedKey] as? Bool) ?? false
                 if finished {
-                    if !hasRefiningPyramids && overlayPersistenceInFlight <= 0 {
-                        debugPyramidIterationZoomLevel = nil
-                        debugPyramidIterationTileIndex = nil
-                        debugPyramidIterationTileTotal = nil
-                        debugPyramidIterationElapsedSeconds = nil
-                        debugPyramidIterationPhase = nil
-                    }
+                    clearDebugPyramidIterationState()
                     return
                 }
                 if let z = note.userInfo?[OverlayTilePyramidBuilder.debugIterationZoomLevelKey] as? Int {
@@ -214,12 +214,36 @@ struct ContentView: View {
                 if let elapsed = note.userInfo?[OverlayTilePyramidBuilder.debugIterationElapsedSecondsKey] as? Double {
                     debugPyramidIterationElapsedSeconds = elapsed
                 }
-                if let phase = note.userInfo?[OverlayTilePyramidBuilder.debugIterationPhaseKey] as? String {
-                    debugPyramidIterationPhase = phase
-                }
             }
             .onReceive(NotificationCenter.default.publisher(for: .overlayTilePyramidRefinementDidComplete)) { _ in
                 restorePersistedOverlay()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .overlayTilePyramidMinZReady)) { note in
+                guard let idString = note.userInfo?["overlayID"] as? String,
+                      let id = UUID(uuidString: idString),
+                      let mapView = mapBridge.mapView else { return }
+                restorePersistedOverlay()
+                guard let item = overlays.first(where: { $0.id == id }) else { return }
+                OverlaySaveTransitionLog.stage("overlay.displayed", overlayID: id)
+                let targetRect = mapRect(for: item.corners)
+                let padding = UIEdgeInsets(top: 100, left: 50, bottom: 120, right: 50)
+                let expectedVisible = mapView.mapRectThatFits(targetRect, edgePadding: padding)
+                mapView.setVisibleMapRect(targetRect, edgePadding: padding, animated: true)
+                mapBridge.armPostSavePrewarmAfterZoomSettles(overlayID: id, expectedVisibleMapRect: expectedVisible)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .overlaySaveTransitionZoomDidSettle)) { note in
+                guard let idString = note.userInfo?["overlayID"] as? String,
+                      let id = UUID(uuidString: idString),
+                      let mapView = mapBridge.mapView else { return }
+                OverlayLibrary.enablePrewarmAfterSaveZoomSettled(
+                    overlayID: id,
+                    container: persistence.container,
+                    visibleMapRect: mapView.visibleMapRect,
+                    currentZoom: mapBridge.currentDebugZoomLevel
+                )
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .overlayProgressiveTilesDidUpdate)) { _ in
+                // Overlay remount handled in MapViewRepresentable; reload model if Core Data row changed.
             }
             .onChange(of: mapRasterOpacityCommitted) { _, _ in
                 if !isEditing, mapRasterOpacityDragging == nil {
@@ -355,26 +379,14 @@ struct ContentView: View {
         VStack(alignment: .trailing, spacing: 4) {
             if let z = debugPyramidIterationZoomLevel {
                 let progressLabel: String = {
-                    let phasePrefix: String = {
-                        switch debugPyramidIterationPhase {
-                        case OverlayTilePyramidBuilder.BuildPhase.preview.rawValue:
-                            return "Preview"
-                        case OverlayTilePyramidBuilder.BuildPhase.refine.rawValue:
-                            return "Refine"
-                        case OverlayTilePyramidBuilder.BuildPhase.full.rawValue:
-                            return "Build"
-                        default:
-                            return "PyrDown"
-                        }
-                    }()
                     let elapsedSuffix: String = {
                         guard let elapsed = debugPyramidIterationElapsedSeconds else { return "" }
                         return String(format: " %.1fs", elapsed)
                     }()
                     if let x = debugPyramidIterationTileIndex, let total = debugPyramidIterationTileTotal, total > 0 {
-                        return "\(phasePrefix) z\(z)\n\(x)/\(total)\(elapsedSuffix)"
+                        return "Build z\(z)\n\(x)/\(total)\(elapsedSuffix)"
                     }
-                    return "\(phasePrefix) z\(z)\n\(elapsedSuffix)"
+                    return "Build z\(z)\n\(elapsedSuffix)"
                 }()
                 Text(progressLabel)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -391,6 +403,13 @@ struct ContentView: View {
                     .accessibilityLabel("Saving")
             }
         }
+    }
+
+    private func clearDebugPyramidIterationState() {
+        debugPyramidIterationZoomLevel = nil
+        debugPyramidIterationTileIndex = nil
+        debugPyramidIterationTileTotal = nil
+        debugPyramidIterationElapsedSeconds = nil
     }
 
     private var hasRefiningPyramids: Bool {
@@ -644,7 +663,7 @@ struct ContentView: View {
         guard size.width > 0, size.height > 0, quad.count == 4 else { return nil }
         let maxSideCap: CGFloat = largeRaster ? 2048 : 4096 // mirrors editWarpMaxSourceSideLargeRaster / editWarpMaxSourceSide
         guard let cgIn = OverlayMapBake.normalizedCGImage(from: image) else { return nil }
-        var ciImage = CIImage(cgImage: cgIn)
+        let ciImage = CIImage(cgImage: cgIn)
         let extent = ciImage.extent
         guard extent.width >= 1, extent.height >= 1 else { return nil }
         let maxSide = max(extent.width, extent.height)
@@ -690,20 +709,38 @@ struct ContentView: View {
         finalizeDraftRasterOpacityGestureEnd()
         primaryCTAShowsActivity = true
         overlayPersistenceInFlight += 1
+        OverlayLibrary.beginSaveTransition(overlayID: overlayID)
 
         Task {
             SnapMemoryInstrumentation.checkpoint("saveDraft.Task.begin overlayID=\(overlayID.uuidString.prefix(8))…")
             let rasterBytesForBake = preservedPick ?? editingOverlayBackup?.sourceRasterData
-            let mapDisplayImage = await Task.detached(priority: .userInitiated) {
+            let bakedPreWritten = await Task.detached(priority: .userInitiated) {
+                let mapDisplayImage: UIImage
                 if let rasterBytesForBake,
                    let px = UIImage.rasterPixelCount(forCompressedImageData: rasterBytesForBake),
                    px > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive,
                    let subsampled = OverlayLibrary.uiImageSubsampling(from: rasterBytesForBake, maxPixelDimension: 4096) {
-                    return OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: subsampled, corners: corners) ?? subsampled
+                    mapDisplayImage = OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: subsampled, corners: corners) ?? subsampled
+                } else {
+                    mapDisplayImage = OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: draftImage, corners: corners) ?? draftImage
                 }
-                return OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: draftImage, corners: corners) ?? draftImage
+                return OverlayLibrary.persistBakedImageToDiskDuringSaveDraft(mapDisplayImage, overlayID: overlayID)
             }.value
-            SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))…")
+            SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))… preWritten=\(bakedPreWritten)")
+            await MainActor.run {
+                self.warpedDraftUpdateTask?.cancel()
+                self.warpedDraftCGImage = nil
+                self.draftImage = nil
+                draftSourceFileData = nil
+                draftQuad = []
+                initialDraftQuad = []
+                draftAnchoredToMap = false
+                draftGeoCorners = []
+                initialDraftGeoCorners = []
+                editingOverlayBackup = nil
+                OverlayMapBake.endThumbnailCacheScope()
+                OverlayMetalTilePipeline.clearSessionCache()
+            }
             let placementCamera = await MainActor.run { persistMapCameraSnapshot() }
             let rasterBytes = preservedPick ?? editingOverlayBackup?.sourceRasterData
             let intrinsicPixels: Int64 = {
@@ -727,41 +764,30 @@ struct ContentView: View {
                 )
                 : nil
             await MainActor.run {
-                overlays.append(
-                    OverlayItem(
-                        id: overlayID,
-                        sourceImage: sourceImageForModel,
-                        mapDisplayImage: mapDisplayImage,
-                        corners: corners,
-                        placementCamera: placementCamera,
-                        preservedSourceFileData: preservedPick,
-                        sourceRasterData: rasterBytes,
-                        tilePyramid: pendingPyramid
-                    )
-                )
-                SnapMemoryInstrumentation.checkpoint(
-                    "saveDraft.overlayAppendedMainActor id=\(overlayID.uuidString.prefix(8))… tiled=\(overlays.last?.usesTiledMapPresentation ?? false) overlays.count=\(overlays.count)"
-                )
-
-                self.warpedDraftUpdateTask?.cancel()
-                OverlayLibrary.setPyramidBuildSuppressed(overlayID, suppressed: false)
-                self.draftImage = nil
-                draftSourceFileData = nil
-                draftQuad = []
-                initialDraftQuad = []
-                draftAnchoredToMap = false
-                draftGeoCorners = []
-                initialDraftGeoCorners = []
-                editingOverlayBackup = nil
-
+                OverlaySaveTransitionLog.stage("editResources.released", overlayID: overlayID)
                 browserOpacitySliderCollapsed = true
                 isEditing = false
                 primaryCTAShowsActivity = false
                 selectedItem = nil
                 finalizeBrowsingRasterOpacityInteraction()
 
-                let snap = overlays
-                SnapMemoryInstrumentation.checkpoint("saveDraft.beforeOverlayLibrary.saveOverlays overlayCount=\(snap.count)")
+                var snap = overlays
+                snap.append(
+                    OverlayItem(
+                        id: overlayID,
+                        sourceImage: sourceImageForModel,
+                        mapDisplayImage: OverlayItem.browseSourceMemoryPlaceholder(),
+                        corners: corners,
+                        placementCamera: placementCamera,
+                        preservedSourceFileData: preservedPick,
+                        bakedImagePreWrittenToDisk: bakedPreWritten,
+                        sourceRasterData: rasterBytes,
+                        tilePyramid: pendingPyramid
+                    )
+                )
+                SnapMemoryInstrumentation.checkpoint(
+                    "saveDraft.beforeOverlayLibrary.saveOverlays overlayCount=\(snap.count) visibleOverlays=\(overlays.count)"
+                )
                 OverlayLibrary.saveOverlays(
                     snap,
                     in: persistence.container,
@@ -770,11 +796,12 @@ struct ContentView: View {
                 ) { success in
                     SnapMemoryInstrumentation.checkpoint("saveDraft.saveOverlays.completion success=\(success) id=\(overlayID.uuidString.prefix(8))…")
                     Task { @MainActor in
-                        if let idx = overlays.firstIndex(where: { $0.id == overlayID }) {
-                            overlays[idx].preservedSourceFileData = nil
-                        }
                         if success {
-                            restorePersistedOverlay()
+                            OverlayLibrary.setPyramidBuildSuppressed(overlayID, suppressed: false)
+                            OverlayLibrary.runDeferredMinZBuildAfterSaveTransition(
+                                overlayID: overlayID,
+                                container: persistence.container
+                            )
                         }
                         overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
                     }

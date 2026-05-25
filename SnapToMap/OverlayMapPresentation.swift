@@ -22,7 +22,7 @@ enum TileDiagFileLog {
             guard let data = (line + "\n").data(using: .utf8) else { return }
             if let handle = try? FileHandle(forWritingTo: url) {
                 defer { try? handle.close() }
-                try? handle.seekToEnd()
+                _ = try? handle.seekToEnd()
                 try? handle.write(contentsOf: data)
             } else {
                 try? data.write(to: url, options: .atomic)
@@ -105,13 +105,16 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         case legacyFlipped
     }
     private let tilePyramidYIndexMode: TilePyramidYIndexMode
+    /// Content scale used when this pyramid revision was built (**`512 pt × scale`** px tiles on disk).
+    private let pyramidTileContentScale: CGFloat?
+    private let pyramidPhysicalTileSizePixels: Int?
     /// Compared against **`OverlayTilePyramidRuntimeInfo.revision`** when deciding whether to recycle an existing renderer instance.
     let tilePyramidIdentityRevision: Int64
     let tilePyramidRuntimeInfo: OverlayTilePyramidRuntimeInfo?
     /// Metadata/native ceiling used for overzoom parent lookup (may exceed what is on disk yet).
     private let persistedPyramidMaximumZ: Int?
-    /// Highest **`z`** directory with tile files on disk for this revision.
-    private let diskPyramidMaximumZ: Int
+    /// Highest **`z`** directory with tile files on disk for this revision (refreshed on progressive updates).
+    private var diskPyramidMaximumZ: Int
     /// True while full-resolution levels are still being materialized in background.
     private let persistedPyramidRefinementInProgress: Bool
     private let tileDiskReadQueue = DispatchQueue(label: "snap-to-map.tile-disk-read", qos: .userInitiated)
@@ -166,7 +169,10 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
             return root
         }()
         self.tilePyramidDiskRoot = resolvedPyramidRoot
-        self.tilePyramidYIndexMode = Self.resolvePyramidYIndexMode(pyramidRoot: resolvedPyramidRoot)
+        let pyramidMetadata = resolvedPyramidRoot.flatMap { OverlayLibrary.readTilePyramidMetadata(pyramidRoot: $0) }
+        self.tilePyramidYIndexMode = Self.resolvePyramidYIndexMode(pyramidMetadata: pyramidMetadata)
+        self.pyramidTileContentScale = pyramidMetadata?.tileContentScale
+        self.pyramidPhysicalTileSizePixels = pyramidMetadata?.physicalTileSizePixels
         self.tilePyramidIdentityRevision = tilePyramidRuntime?.revision ?? -1
         self.tilePyramidRuntimeInfo = tilePyramidRuntime
         let metaCeiling = tilePyramidRuntime.map { Int($0.fullMaximumZoom >= 0 ? $0.fullMaximumZoom : $0.maximumZoom) }
@@ -175,9 +181,15 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         self.persistedPyramidMaximumZ = (resolvedPyramidRoot != nil) ? metaCeiling : nil
         self.persistedPyramidRefinementInProgress = tilePyramidRuntime?.refinementInProgress ?? false
         let overlayTag = String(overlayID.uuidString.prefix(8))
+        let runtimeContentScale = OverlayLibrary.tileContentScaleForCurrentDevice()
         if let runtime = tilePyramidRuntime {
             let rootLabel = resolvedPyramidRoot?.path ?? "(nil)"
-            print("[TileDiag] tileOverlay.init id=\(overlayTag) runtimeRev=\(runtime.revision) minZ=\(runtime.minimumZoom) advertisedMaxZ=\(runtime.maximumZoom) fullMaxZ=\(runtime.fullMaximumZoom) diskMaxZ=\(scannedDiskMaxZ) yMode=\(tilePyramidYIndexMode.rawValue) root=\(rootLabel)")
+            let storedScaleLabel = pyramidTileContentScale.map { String(format: "%.0f", $0) } ?? "unknown"
+            let storedPxLabel = pyramidPhysicalTileSizePixels.map(String.init) ?? "unknown"
+            print("[TileDiag] tileOverlay.init id=\(overlayTag) runtimeRev=\(runtime.revision) minZ=\(runtime.minimumZoom) advertisedMaxZ=\(runtime.maximumZoom) fullMaxZ=\(runtime.fullMaximumZoom) diskMaxZ=\(scannedDiskMaxZ) yMode=\(tilePyramidYIndexMode.rawValue) pyramidScale=\(storedScaleLabel) pyramidPx=\(storedPxLabel) deviceScale=\(runtimeContentScale) devicePx=\(OverlayLibrary.physicalTileSizePixels(tileContentScale: runtimeContentScale)) root=\(rootLabel)")
+            if let pyramidTileContentScale, pyramidTileContentScale != runtimeContentScale {
+                print("[TileDiag] tileOverlay.scaleMismatch id=\(overlayTag) pyramidBuiltAt=\(pyramidTileContentScale) deviceRequests=\(runtimeContentScale) — rebuild pyramid on this device for native resolution")
+            }
         } else {
             print("[TileDiag] tileOverlay.init id=\(overlayTag) runtime=nil yMode=\(tilePyramidYIndexMode.rawValue)")
         }
@@ -189,8 +201,8 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         // Persisted-pyramid loading includes a legacy y-flip fallback.
         isGeometryFlipped = false
         if resolvedPyramidRoot != nil, let runtime = tilePyramidRuntime {
-            minimumZ = Int(runtime.minimumZoom)
-            // Allow renderer requests above persisted max so custom overzoom path can serve tiles.
+            // Allow MapKit to request below z_min and above z_max; clamp inside loadTile.
+            minimumZ = 0
             maximumZ = 22
         } else {
             minimumZ = 0
@@ -207,6 +219,63 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
 
     override var coordinate: CLLocationCoordinate2D {
         MKMapPoint(x: imageBoundingMapRect.midX, y: imageBoundingMapRect.midY).coordinate
+    }
+
+    /// Drops cached bytes for a tile slot so MapKit reload serves the freshly persisted exact tile.
+    func invalidateDiskCacheForTile(path: MKTileOverlayPath) {
+        guard let root = tilePyramidDiskRoot else { return }
+        let remapped = remappedPyramidTileRequest(for: path)
+        let diskPaths = pyramidDiskPathCandidates(for: remapped.diskPath)
+        for diskPath in diskPaths {
+            let preferred = Self.path(diskPath, remappedFor: tilePyramidYIndexMode) ?? diskPath
+            var urls = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: preferred)
+            if let yFlip = Self.yFlippedPath(diskPath) {
+                let flipCandidates = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: yFlip)
+                let existing = Set(urls.map(\.path))
+                for url in flipCandidates where !existing.contains(url.path) {
+                    urls.append(url)
+                }
+            }
+            for url in urls {
+                diskTileMemoryCache.removeObject(forKey: NSString(string: url.path))
+            }
+        }
+        if let scanned = tilePyramidDiskRoot.map({ OverlayLibrary.diskMaximumZoomLevel(pyramidRoot: $0) }),
+           scanned > diskPyramidMaximumZ {
+            diskPyramidMaximumZ = scanned
+        }
+        OverlayTileRuntimeInstrumentation.recordTileInvalidation(overlayID: overlayID, z: path.z, x: path.x, y: path.y)
+        print("[TileDiag] tileOverlay.cacheInvalidate id=\(overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) diskMaxZ=\(diskPyramidMaximumZ)")
+    }
+
+    private func runtimeTileState(for path: MKTileOverlayPath) -> OverlayRuntimeTileState {
+        guard let runtime = tilePyramidRuntimeInfo else { return .missing }
+        let scale100 = Int((path.contentScaleFactor * 100).rounded())
+        return OverlayTileRuntimeScheduler.shared.runtimeTileState(
+            overlayID: overlayID,
+            revision: runtime.revision,
+            z: path.z,
+            x: path.x,
+            y: path.y,
+            scale100: scale100
+        )
+    }
+
+    private func enqueueExactTileIfNeeded(path: MKTileOverlayPath) {
+        guard path.z <= (persistedPyramidMaximumZ ?? path.z) else { return }
+        guard tileIntersectsOverlay(path: path) else { return }
+        let state = runtimeTileState(for: path)
+        guard state != .generating, state != .ready else { return }
+        OverlayTileRuntimeScheduler.shared.enqueueVisibleExactTile(overlayID: overlayID, path: path)
+    }
+
+    private func tileIntersectsOverlay(path: MKTileOverlayPath) -> Bool {
+        let tileRect = Self.mercatorMapRectForOfflinePyramid(
+            path: path,
+            geometryFlipped: isGeometryFlipped
+        )
+        let clipped = imageBoundingMapRect.intersection(tileRect)
+        return !clipped.isNull && !clipped.isEmpty
     }
 
     override func url(forTilePath path: MKTileOverlayPath) -> URL {
@@ -267,72 +336,105 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
             // #endregion
         }
         if let root = tilePyramidDiskRoot {
-            let preferredPath = Self.path(path, remappedFor: tilePyramidYIndexMode) ?? path
-            let fallbackPath = Self.yFlippedPath(path)
+            let remapped = remappedPyramidTileRequest(for: path)
+            let preferredPath = Self.path(remapped.diskPath, remappedFor: tilePyramidYIndexMode) ?? remapped.diskPath
+            let fallbackPath = Self.yFlippedPath(remapped.diskPath)
             tileDiskReadQueue.async { [weak self] in
                 guard let self else {
                     result(nil, nil)
                     return
                 }
-                let preferredCandidateURLs = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: preferredPath)
-                var candidateURLs = preferredCandidateURLs
-                if let fallbackPath {
-                    let fallbackCandidates = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: fallbackPath)
-                    let existing = Set(candidateURLs.map(\.path))
-                    for url in fallbackCandidates where !existing.contains(url.path) {
-                        candidateURLs.append(url)
+                var loadedData: Data?
+                var loadedKind = ""
+                var loadedAtScale = remapped.diskPath.contentScaleFactor
+                let diskPaths = self.pyramidDiskPathCandidates(for: remapped.diskPath)
+                outer: for diskPath in diskPaths {
+                    let preferred = Self.path(diskPath, remappedFor: self.tilePyramidYIndexMode) ?? diskPath
+                    let yFlip = Self.yFlippedPath(diskPath)
+                    var candidateURLs = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: preferred)
+                    if let yFlip {
+                        let fallbackCandidates = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: yFlip)
+                        let existing = Set(candidateURLs.map(\.path))
+                        for url in fallbackCandidates where !existing.contains(url.path) {
+                            candidateURLs.append(url)
+                        }
+                    }
+                    for (idx, candidateURL) in candidateURLs.enumerated() {
+                        let pathKey = NSString(string: candidateURL.path)
+                        if let cached = self.diskTileMemoryCache.object(forKey: pathKey) {
+                            loadedData = cached as Data
+                            loadedAtScale = diskPath.contentScaleFactor
+                            loadedKind = idx == 0
+                                ? "pyramid.memCacheHit.\(self.tilePyramidYIndexMode.rawValue)"
+                                : "pyramid.memCacheHit.yFlipFallback"
+                            break outer
+                        }
+                        if let data = try? Data(contentsOf: candidateURL),
+                           OverlayLibrary.isReadableTileFile(at: candidateURL) {
+                            loadedData = data
+                            loadedAtScale = diskPath.contentScaleFactor
+                            loadedKind = idx == 0
+                                ? "pyramid.diskRead.\(self.tilePyramidYIndexMode.rawValue)"
+                                : "pyramid.diskRead.yFlipFallback"
+                            self.diskTileMemoryCache.setObject(data as NSData, forKey: pathKey, cost: data.count)
+                            break outer
+                        }
                     }
                 }
-                for (idx, candidateURL) in candidateURLs.enumerated() {
-                    let pathKey = NSString(string: candidateURL.path)
-                    if let cached = self.diskTileMemoryCache.object(forKey: pathKey) {
-                        let data = cached as Data
-                        let kind: String
-                        if idx == 0 {
-                            kind = "pyramid.memCacheHit.\(self.tilePyramidYIndexMode.rawValue)"
-                        } else {
-                            kind = "pyramid.memCacheHit.yFlipFallback"
-                        }
-                        self.registerTileLoadSample(kind: kind, path: path, byteCount: data.count)
-                        result(data, nil)
-                        return
+                if let loadedData {
+                    if loadedAtScale != path.contentScaleFactor {
+                        print("[TileDiag] tileOverlay.scaleFallback id=\(self.overlayID.uuidString.prefix(8)) loadedScale=\(loadedAtScale) requestedScale=\(path.contentScaleFactor)")
                     }
-                    if let data = try? Data(contentsOf: candidateURL) {
-                        let kind: String
-                        if idx == 0 {
-                            kind = "pyramid.diskRead.\(self.tilePyramidYIndexMode.rawValue)"
-                        } else {
-                            kind = "pyramid.diskRead.yFlipFallback"
-                        }
-                        self.registerTileLoadSample(kind: kind, path: path, byteCount: data.count)
-                        self.diskTileMemoryCache.setObject(data as NSData, forKey: pathKey, cost: data.count)
-                        result(data, nil)
-                        return
-                    }
-                }
-                if path.z > 0 {
-                    let startParentZ = self.diskPyramidMaximumZ >= 0
-                        ? min(path.z - 1, self.diskPyramidMaximumZ)
-                        : path.z - 1
-                    if let overzoomed = self.overzoomedTileFromNearestDiskParent(
-                        path: path,
-                        pyramidRoot: root,
-                        startParentZ: startParentZ
+                    if let served = self.servedPyramidTileData(
+                        loadedData,
+                        remapped: remapped,
+                        requestedPath: path,
+                        loadedAtContentScale: loadedAtScale
                     ) {
-                        self.registerTileLoadSample(kind: "pyramid.overzoomFromDiskParent", path: path, byteCount: overzoomed.count)
-                        for url in preferredCandidateURLs {
-                            self.diskTileMemoryCache.setObject(overzoomed as NSData, forKey: NSString(string: url.path), cost: overzoomed.count)
+                        if !loadedKind.isEmpty {
+                            self.registerTileLoadSample(kind: loadedKind, path: path, byteCount: served.count)
                         }
-                        result(overzoomed, nil)
+                        if remapped.shift == 0 {
+                            let state = self.runtimeTileState(for: path)
+                            OverlayTileRuntimeInstrumentation.recordTileServed(
+                                overlayID: self.overlayID,
+                                z: path.z,
+                                x: path.x,
+                                y: path.y,
+                                kind: "exact.\(loadedKind)"
+                            )
+                            print("[TileDiag] tileOverlay.exact id=\(self.overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) kind=\(loadedKind) state=\(state)")
+                        }
+                        result(served, nil)
                         return
                     }
+                }
+                if path.z > 0, remapped.shift == 0,
+                   let fallback = self.closestParentFallbackTile(
+                    path: path,
+                    pyramidRoot: root
+                   ) {
+                    let state = self.runtimeTileState(for: path)
+                    print("[TileDiag] tileOverlay.fallback id=\(self.overlayID.uuidString.prefix(8)) requested z=\(path.z) x=\(path.x) y=\(path.y) fallback z=\(fallback.parentZ) x=\(fallback.parentX) y=\(fallback.parentY) delta=\(path.z - fallback.parentZ) state=\(state)")
+                    TileDiagFileLog.append("[TileDiagFile] fallback id=\(self.overlayID.uuidString.prefix(8)) req z=\(path.z) x=\(path.x) y=\(path.y) fb z=\(fallback.parentZ) x=\(fallback.parentX) y=\(fallback.parentY) delta=\(path.z - fallback.parentZ) state=\(state)")
+                    self.registerTileLoadSample(kind: "pyramid.parentFallback", path: path, byteCount: fallback.data.count)
+                    OverlayTileRuntimeInstrumentation.recordTileServed(
+                        overlayID: self.overlayID,
+                        z: path.z,
+                        x: path.x,
+                        y: path.y,
+                        kind: "parentFallback.z\(fallback.parentZ)"
+                    )
+                    self.enqueueExactTileIfNeeded(path: path)
+                    result(fallback.data, nil)
+                    return
                 }
                 let preferredExists = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: preferredPath).contains {
-                    FileManager.default.fileExists(atPath: $0.path)
+                    OverlayLibrary.isReadableTileFile(at: $0)
                 }
                 let fallbackExists = fallbackPath.map { fallback in
                     OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: fallback).contains { url in
-                        FileManager.default.fileExists(atPath: url.path)
+                        OverlayLibrary.isReadableTileFile(at: url)
                     }
                 } ?? false
                 print("\(#function) – path: \(path) – no data (mode=\(self.tilePyramidYIndexMode.rawValue), preferredExists=\(preferredExists), fallbackExists=\(fallbackExists))")
@@ -342,17 +444,12 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                 Self.tileLoadDiagGate.unlock()
                 if missN <= 24 || missN % 64 == 0 {
                     let preferredLabel = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: preferredPath).map(\.lastPathComponent).joined(separator: "|")
-                    print("[TileDiag] tileOverlay.miss id=\(self.overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) scale=\(path.contentScaleFactor) mode=\(self.tilePyramidYIndexMode.rawValue) preferred=\(preferredLabel) preferredExists=\(preferredExists) fallbackExists=\(fallbackExists) miss#\(missN)")
-                    TileDiagFileLog.append("[TileDiagFile] miss id=\(self.overlayID.uuidString.prefix(8)) n=\(missN) z=\(path.z) x=\(path.x) y=\(path.y) scale=\(path.contentScaleFactor) mode=\(self.tilePyramidYIndexMode.rawValue) preferredExists=\(preferredExists) fallbackExists=\(fallbackExists)")
+                    let state = self.runtimeTileState(for: path)
+                    print("[TileDiag] tileOverlay.miss id=\(self.overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) scale=\(path.contentScaleFactor) mode=\(self.tilePyramidYIndexMode.rawValue) preferred=\(preferredLabel) preferredExists=\(preferredExists) fallbackExists=\(fallbackExists) state=\(state) miss#\(missN)")
+                    TileDiagFileLog.append("[TileDiagFile] miss id=\(self.overlayID.uuidString.prefix(8)) n=\(missN) z=\(path.z) x=\(path.x) y=\(path.y) scale=\(path.contentScaleFactor) mode=\(self.tilePyramidYIndexMode.rawValue) preferredExists=\(preferredExists) fallbackExists=\(fallbackExists) state=\(state)")
                 }
-                // Fallback: if persisted pyramid misses, render on-demand from lazy tile cache
-                // rather than serving transparent gaps at higher zoom levels.
+                self.enqueueExactTileIfNeeded(path: path)
                 self.tileCache.loadTile(path: path, tileSize: self.tileSize, geometryFlipped: self.isGeometryFlipped) { fallbackData in
-                    if self.persistedPyramidRefinementInProgress, path.z > self.diskPyramidMaximumZ {
-                        // During refinement, avoid decoding the full source for levels not on disk yet.
-                        result(self.transparentTilePNG(points: self.tileSize, scale: path.contentScaleFactor), nil)
-                        return
-                    }
                     if let fallbackData {
                         self.registerTileLoadSample(kind: "pyramid.missFallback.lazy", path: path, byteCount: fallbackData.count)
                         TileDiagFileLog.append("[TileDiagFile] missFallback.lazy id=\(self.overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) scale=\(path.contentScaleFactor) bytes=\(fallbackData.count)")
@@ -428,13 +525,9 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         return sourceRasterForTileLOD
     }
 
-    private static func resolvePyramidYIndexMode(pyramidRoot: URL?) -> TilePyramidYIndexMode {
-        guard let pyramidRoot else { return .xyzTopDown }
-        let metaURL = pyramidRoot.appendingPathComponent("pyramid-meta.json", isDirectory: false)
-        guard let data = try? Data(contentsOf: metaURL),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let yIndexModeRaw = obj["yIndexMode"] as? String,
-              let yIndexMode = TilePyramidYIndexMode(rawValue: yIndexModeRaw) else {
+    private static func resolvePyramidYIndexMode(pyramidMetadata: OverlayLibrary.TilePyramidMetadata?) -> TilePyramidYIndexMode {
+        guard let pyramidMetadata,
+              let yIndexMode = TilePyramidYIndexMode(rawValue: pyramidMetadata.yIndexMode) else {
             // Old on-disk pyramids had flipped y indexing and no metadata.
             return .legacyFlipped
         }
@@ -528,15 +621,192 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         return encodePNG(cgImage: cg)
     }
 
+    /// Disk lookup paths: requested MapKit scale first, then pyramid's persisted build scale.
+    private func pyramidDiskPathCandidates(for diskPath: MKTileOverlayPath) -> [MKTileOverlayPath] {
+        var paths = [diskPath]
+        if let storedScale = pyramidTileContentScale,
+           OverlayLibrary.normalizedTileContentScale(storedScale)
+               != OverlayLibrary.normalizedTileContentScale(diskPath.contentScaleFactor) {
+            paths.append(MKTileOverlayPath(
+                x: diskPath.x,
+                y: diskPath.y,
+                z: diskPath.z,
+                contentScaleFactor: storedScale
+            ))
+        }
+        return paths
+    }
+
+    private func servedPyramidTileData(
+        _ loadedData: Data,
+        remapped: RemappedPyramidTileRequest,
+        requestedPath: MKTileOverlayPath,
+        loadedAtContentScale: CGFloat
+    ) -> Data? {
+        let requestedScale = OverlayLibrary.normalizedTileContentScale(requestedPath.contentScaleFactor)
+        var tileData: Data?
+        if remapped.shift > 0 {
+            tileData = Self.makeRemappedChildTileFromParentData(
+                parentTileData: loadedData,
+                shift: remapped.shift,
+                childX: remapped.childX,
+                childY: remapped.childY,
+                contentScale: requestedScale,
+                tileSize: tileSize
+            )
+            if tileData != nil {
+                let kind = remapped.requestedZ < remapped.sourceZ ? "pyramid.underzoom" : "pyramid.overzoom"
+                print("[TileDiag] \(kind) requestedZ=\(remapped.requestedZ) sourceZ=\(remapped.sourceZ) shift=\(remapped.shift) x=\(requestedPath.x) y=\(requestedPath.y)")
+            }
+        } else {
+            tileData = loadedData
+        }
+        guard var tileData else { return nil }
+        let loadedScale = OverlayLibrary.normalizedTileContentScale(loadedAtContentScale)
+        if remapped.shift == 0, loadedScale != requestedScale {
+            if let resampled = Self.resampledTileData(
+                tileData,
+                fromContentScale: loadedScale,
+                toContentScale: requestedScale,
+                tileSize: tileSize
+            ) {
+                tileData = resampled
+            }
+        }
+        return tileData
+    }
+
+    private static func resampledTileData(
+        _ tileData: Data,
+        fromContentScale sourceScale: CGFloat,
+        toContentScale destScale: CGFloat,
+        tileSize: CGSize
+    ) -> Data? {
+        let srcScale = OverlayLibrary.normalizedTileContentScale(sourceScale)
+        let dstScale = OverlayLibrary.normalizedTileContentScale(destScale)
+        guard srcScale != dstScale,
+              let src = CGImageSourceCreateWithData(tileData as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            return nil
+        }
+        let outW = Int(max(1, (tileSize.width * dstScale).rounded()))
+        let outH = Int(max(1, (tileSize.height * dstScale).rounded()))
+        guard outW >= 1, outH >= 1 else { return nil }
+        guard let ctx = CGContext(
+            data: nil,
+            width: outW,
+            height: outH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.clear(CGRect(x: 0, y: 0, width: outW, height: outH))
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+        guard let out = ctx.makeImage() else { return nil }
+        return encodePNG(cgImage: out)
+    }
+
+    /// Remaps a MapKit request to the stored pyramid zoom range (**`z_min … z_max`**) for disk lookup.
+    private struct RemappedPyramidTileRequest {
+        let requestedZ: Int
+        let sourceZ: Int
+        let diskPath: MKTileOverlayPath
+        let shift: Int
+        let childX: Int
+        let childY: Int
+    }
+
+    private func remappedPyramidTileRequest(for path: MKTileOverlayPath) -> RemappedPyramidTileRequest {
+        let zMin = tilePyramidRuntimeInfo.map { Int($0.minimumZoom) } ?? minimumZ
+        let zMax = tilePyramidRuntimeInfo.map {
+            Int($0.fullMaximumZoom >= 0 ? $0.fullMaximumZoom : $0.maximumZoom)
+        } ?? (persistedPyramidMaximumZ ?? maximumZ)
+        let clampedMin = max(0, zMin)
+        let clampedMax = max(clampedMin, zMax)
+        let sourceZ = min(max(path.z, clampedMin), clampedMax)
+        let shift = abs(path.z - sourceZ)
+        if shift == 0 {
+            return RemappedPyramidTileRequest(
+                requestedZ: path.z,
+                sourceZ: sourceZ,
+                diskPath: path,
+                shift: 0,
+                childX: 0,
+                childY: 0
+            )
+        }
+        let divisor = 1 << shift
+        let sourceX = path.x / divisor
+        let sourceY = path.y / divisor
+        let childMask = divisor - 1
+        return RemappedPyramidTileRequest(
+            requestedZ: path.z,
+            sourceZ: sourceZ,
+            diskPath: MKTileOverlayPath(
+                x: sourceX,
+                y: sourceY,
+                z: sourceZ,
+                contentScaleFactor: path.contentScaleFactor
+            ),
+            shift: shift,
+            childX: path.x & childMask,
+            childY: path.y & childMask
+        )
+    }
+
+    private static func makeRemappedChildTileFromParentData(
+        parentTileData: Data,
+        shift: Int,
+        childX: Int,
+        childY: Int,
+        contentScale: CGFloat,
+        tileSize: CGSize
+    ) -> Data? {
+        makeOverzoomedChildTileFromParentData(
+            parentTileData: parentTileData,
+            shift: shift,
+            childX: childX,
+            childY: childY,
+            contentScale: contentScale,
+            tileSize: tileSize
+        )
+    }
+
+    private struct ParentFallbackTile {
+        let data: Data
+        let parentZ: Int
+        let parentX: Int
+        let parentY: Int
+    }
+
+    /// Serves the nearest available parent tile (z−1, z−2, … down to minZ) — never skips intermediate levels.
+    private func closestParentFallbackTile(
+        path: MKTileOverlayPath,
+        pyramidRoot: URL
+    ) -> ParentFallbackTile? {
+        guard path.z > 0 else { return nil }
+        if let match = overzoomedTileFromNearestDiskParent(
+            path: path,
+            pyramidRoot: pyramidRoot,
+            startParentZ: path.z - 1
+        ) {
+            return match
+        }
+        return nil
+    }
+
     /// Overzoom helper for persisted disk pyramids when MKMapView requests z > maximumZ.
     /// Walk **`parentZ`** downward from **`startParentZ`** until a parent tile exists on disk, then crop/upscale for **`path`**.
     private func overzoomedTileFromNearestDiskParent(
         path: MKTileOverlayPath,
         pyramidRoot: URL,
         startParentZ: Int
-    ) -> Data? {
+    ) -> ParentFallbackTile? {
         let minZ = tilePyramidRuntimeInfo.map { Int($0.minimumZoom) } ?? 0
-        var parentZ = startParentZ
+        var parentZ = min(startParentZ, path.z - 1)
         while parentZ >= minZ {
             let shift = path.z - parentZ
             guard shift > 0, shift < 31 else { break }
@@ -563,17 +833,22 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                 }
             }
             for parentURL in parentCandidates {
-                if let parentData = try? Data(contentsOf: parentURL),
-                   let overzoomed = Self.makeOverzoomedChildTileFromParentData(
-                    parentTileData: parentData,
-                    shift: shift,
-                    childX: childX,
-                    childY: childY,
-                    contentScale: path.contentScaleFactor,
-                    tileSize: tileSize
-                   ) {
-                    return overzoomed
-                }
+                guard OverlayLibrary.isReadableTileFile(at: parentURL),
+                      let parentData = try? Data(contentsOf: parentURL),
+                      let overzoomed = Self.makeOverzoomedChildTileFromParentData(
+                        parentTileData: parentData,
+                        shift: shift,
+                        childX: childX,
+                        childY: childY,
+                        contentScale: path.contentScaleFactor,
+                        tileSize: tileSize
+                       ) else { continue }
+                return ParentFallbackTile(
+                    data: overzoomed,
+                    parentZ: parentZ,
+                    parentX: parentX,
+                    parentY: parentY
+                )
             }
             parentZ -= 1
         }
@@ -645,6 +920,7 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         private let rasterBacking: RasterBacking
         private let mapBoundingRect: MKMapRect
         private let nativeMaxZ: Int
+        private let nativeMinZ: Int
         fileprivate var nativeMaximumZoomForOverlay: Int { nativeMaxZ }
         private let memoryCache = NSCache<NSString, NSData>()
         private let ioQueue = DispatchQueue(label: "snap-to-map.tile-cache", qos: .userInitiated)
@@ -662,14 +938,23 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
             self.mapBoundingRect = mapBoundingRect
             let dims = Self.displayTexturePixelDimensions(displayReferenceImage)
             if let lodData = sourceRasterForTileLOD, !lodData.isEmpty, geographicCorners.count == 4 {
-                self.rasterBacking = .sourceLOD(lodData, corners: geographicCorners, mercatorWidth: dims.width, mercatorHeight: dims.height)
-                // Source LOD decoding can use intrinsic raster detail, so keep native max zoom
-                // aligned with source metadata rather than the browse texture dimensions.
+                let sourceIntrinsic = OverlayMapBake.intrinsicPixelSize(from: lodData) ?? dims
+                self.rasterBacking = .sourceLOD(
+                    lodData,
+                    corners: geographicCorners,
+                    mercatorWidth: sourceIntrinsic.width,
+                    mercatorHeight: sourceIntrinsic.height
+                )
                 self.nativeMaxZ = OverlayMapBake.nativeMaxZoomLevelFromSourceRaster(
                     sourceRaster: lodData,
                     mapBoundingRect: mapBoundingRect,
                     tileSizePoints: OverlayLibrary.logicalTileSizePoints,
                     screenScale: OverlayLibrary.tileDetailScreenScaleForNativeMaxZoom()
+                )
+                self.nativeMinZ = OverlayTilePyramidBuilder.highestSingleTileZoomLevel(
+                    mapBoundingRect: mapBoundingRect,
+                    geometryFlipped: false,
+                    through: nativeMaxZ
                 )
             } else if let cg = displayReferenceImage.cgImage {
                 self.rasterBacking = .bakedTexture(cg)
@@ -678,6 +963,11 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                     mapBoundingRect: mapBoundingRect,
                     tileSizePoints: OverlayLibrary.logicalTileSizePoints,
                     screenScale: OverlayLibrary.tileDetailScreenScaleForNativeMaxZoom()
+                )
+                self.nativeMinZ = OverlayTilePyramidBuilder.highestSingleTileZoomLevel(
+                    mapBoundingRect: mapBoundingRect,
+                    geometryFlipped: false,
+                    through: nativeMaxZ
                 )
             } else if let ci = CIImage(image: displayReferenceImage) {
                 let extent = ci.extent.integral
@@ -690,15 +980,22 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                         tileSizePoints: OverlayLibrary.logicalTileSizePoints,
                         screenScale: OverlayLibrary.tileDetailScreenScaleForNativeMaxZoom()
                     )
+                    self.nativeMinZ = OverlayTilePyramidBuilder.highestSingleTileZoomLevel(
+                        mapBoundingRect: mapBoundingRect,
+                        geometryFlipped: false,
+                        through: nativeMaxZ
+                    )
                 } else {
                     let fallback = Self.make1x1TransparentCGImage()
                     self.rasterBacking = .bakedTexture(fallback)
                     self.nativeMaxZ = 0
+                    self.nativeMinZ = 0
                 }
             } else {
                 let fallback = Self.make1x1TransparentCGImage()
                 self.rasterBacking = .bakedTexture(fallback)
                 self.nativeMaxZ = 0
+                self.nativeMinZ = 0
             }
             self.cacheRootURL = Self.makeCacheRootURL(
                 overlayID: overlayID,
@@ -763,12 +1060,12 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         }
 
         private func clampedRequest(for path: MKTileOverlayPath) -> ClampedRequest {
-            let z = min(path.z, nativeMaxZ)
-            let shift = max(0, path.z - z)
+            let sourceZ = min(max(path.z, nativeMinZ), nativeMaxZ)
+            let shift = abs(path.z - sourceZ)
             let scale = 1 << shift
             let x = path.x / scale
             let y = path.y / scale
-            let childMask = (1 << shift) - 1
+            let childMask = scale - 1
             let childX = shift == 0 ? 0 : (path.x & childMask)
             let childY = shift == 0 ? 0 : (path.y & childMask)
             let scale100 = Int((path.contentScaleFactor * 100).rounded())
@@ -781,7 +1078,8 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                     message: "lazy path clamped request",
                     data: [
                         "requestedZ": path.z,
-                        "clampedZ": z,
+                        "sourceZ": sourceZ,
+                        "nativeMinZ": nativeMinZ,
                         "nativeMaxZ": nativeMaxZ,
                         "shift": shift,
                         "requestedX": path.x,
@@ -794,7 +1092,7 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                 )
                 // #endregion
             }
-            return ClampedRequest(z: z, x: x, y: y, shift: shift, childX: childX, childY: childY, scale100: scale100)
+            return ClampedRequest(z: sourceZ, x: x, y: y, shift: shift, childX: childX, childY: childY, scale100: scale100)
         }
 
         private func loadOrRenderExactTile(path: MKTileOverlayPath, tileSize: CGSize, geometryFlipped: Bool) -> Data? {

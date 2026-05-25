@@ -156,6 +156,13 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     /// Previous **`MapVisualState`** during stability polling; **`nil`** = next tick only seeds the baseline.
     private var editHandoffStabilityPrevious: MapVisualState?
 
+    /// Post-save zoom-to-overlay settle before enabling runtime prewarm.
+    private var pendingPostSavePrewarmOverlayID: UUID?
+    private var pendingPostSaveExpectedVisibleMapRect: MKMapRect?
+    private var postSaveSettleDeadline: Date?
+    private var postSaveSettleStabilityPrevious: MapVisualState?
+    private var postSaveSettleIdleWorkItem: DispatchWorkItem?
+
     private var draftStickSettleIdleWorkItem: DispatchWorkItem?
     private var draftStickSettleStabilityPrevious: MapVisualState?
     private var draftStickSettleDeadline: Date?
@@ -180,6 +187,133 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     func noteMapRegionChangedWhileWaitingForEdit() {
         guard pendingFitForEditOverlay != nil else { return }
         scheduleEditHandoffDebounce()
+    }
+
+    /// Called from **`MKMapViewDelegate.mapView(_:regionDidChangeAnimated:)`** during post-save zoom settle.
+    func noteMapRegionChangedWhileWaitingForPostSave() {
+        guard pendingPostSavePrewarmOverlayID != nil else { return }
+        schedulePostSaveSettleDebounce()
+    }
+
+    func armPostSavePrewarmAfterZoomSettles(overlayID: UUID, expectedVisibleMapRect: MKMapRect) {
+        pendingPostSavePrewarmOverlayID = overlayID
+        pendingPostSaveExpectedVisibleMapRect = expectedVisibleMapRect
+        postSaveSettleDeadline = Date().addingTimeInterval(MapRegionSettleTiming.maxWait)
+        postSaveSettleStabilityPrevious = nil
+        OverlaySaveTransitionLog.stage("zoom.animation.started", overlayID: overlayID)
+        schedulePostSaveSettleDebounce()
+    }
+
+    func cancelPendingPostSavePrewarm() {
+        postSaveSettleIdleWorkItem?.cancel()
+        postSaveSettleIdleWorkItem = nil
+        postSaveSettleStabilityPrevious = nil
+        pendingPostSavePrewarmOverlayID = nil
+        pendingPostSaveExpectedVisibleMapRect = nil
+        postSaveSettleDeadline = nil
+    }
+
+    private func schedulePostSaveSettleDebounce() {
+        postSaveSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.evaluatePostSaveSettleIfMapMatchesExpectedFit()
+        }
+        postSaveSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.debounceAfterLastChange, execute: work)
+    }
+
+    private func schedulePostSaveSettleRetryPoll() {
+        postSaveSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.evaluatePostSaveSettleIfMapMatchesExpectedFit()
+        }
+        postSaveSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + editHandoffRetryInterval, execute: work)
+    }
+
+    private func schedulePostSaveSettleStabilityTick() {
+        postSaveSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.tickPostSaveSettleStabilityPoll()
+        }
+        postSaveSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.stabilityPollInterval, execute: work)
+    }
+
+    private func evaluatePostSaveSettleIfMapMatchesExpectedFit() {
+        postSaveSettleIdleWorkItem = nil
+        guard let overlayID = pendingPostSavePrewarmOverlayID, let mapView else {
+            clearPendingPostSavePrewarmOnly()
+            return
+        }
+
+        let timedOut = Date() >= (postSaveSettleDeadline ?? .distantFuture)
+        let matches = postSaveExpectedFitMatches(mapView)
+
+        if timedOut {
+            deliverPostSaveZoomSettled(overlayID: overlayID)
+        } else if matches {
+            postSaveSettleStabilityPrevious = nil
+            schedulePostSaveSettleStabilityTick()
+        } else {
+            postSaveSettleStabilityPrevious = nil
+            schedulePostSaveSettleRetryPoll()
+        }
+    }
+
+    private func tickPostSaveSettleStabilityPoll() {
+        postSaveSettleIdleWorkItem = nil
+        guard let overlayID = pendingPostSavePrewarmOverlayID, let mapView else {
+            clearPendingPostSavePrewarmOnly()
+            return
+        }
+
+        let timedOut = Date() >= (postSaveSettleDeadline ?? .distantFuture)
+        if timedOut {
+            deliverPostSaveZoomSettled(overlayID: overlayID)
+            return
+        }
+
+        guard postSaveExpectedFitMatches(mapView) else {
+            postSaveSettleStabilityPrevious = nil
+            schedulePostSaveSettleRetryPoll()
+            return
+        }
+
+        let now = MapVisualState(mapView)
+        if let prev = postSaveSettleStabilityPrevious, prev.isNearlyFrozen(comparedTo: now) {
+            deliverPostSaveZoomSettled(overlayID: overlayID)
+            return
+        }
+
+        postSaveSettleStabilityPrevious = now
+        schedulePostSaveSettleStabilityTick()
+    }
+
+    private func postSaveExpectedFitMatches(_ mapView: MKMapView) -> Bool {
+        guard let expected = pendingPostSaveExpectedVisibleMapRect else { return true }
+        return Self.visibleMapRectApproximatelyEqual(
+            mapView.visibleMapRect,
+            expected,
+            relativeTolerance: editHandoffRectRelativeTolerance
+        )
+    }
+
+    private func deliverPostSaveZoomSettled(overlayID: UUID) {
+        clearPendingPostSavePrewarmOnly()
+        OverlaySaveTransitionLog.stage("zoom.animation.finished", overlayID: overlayID)
+        NotificationCenter.default.post(
+            name: .overlaySaveTransitionZoomDidSettle,
+            object: nil,
+            userInfo: ["overlayID": overlayID.uuidString]
+        )
+    }
+
+    private func clearPendingPostSavePrewarmOnly() {
+        postSaveSettleStabilityPrevious = nil
+        pendingPostSavePrewarmOverlayID = nil
+        pendingPostSaveExpectedVisibleMapRect = nil
+        postSaveSettleDeadline = nil
     }
 
     private func scheduleEditHandoffDebounce() {
@@ -564,6 +698,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         pendingEditExpectedVisibleMapRect = nil
         editHandoffDeadline = nil
         mapEditHandoff = nil
+        cancelPendingPostSavePrewarm()
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

@@ -1,5 +1,29 @@
 import CoreLocation
+import Foundation
 import UIKit
+
+/// Runtime-progressive tile generation defaults (also persisted in **`pyramid-meta.json`**).
+struct OverlayProgressiveTileConfig: Equatable, Codable {
+    var prewarmLookaheadZooms: Int
+    var earlyComfortDepth: Int
+    var cheapLevelTileLimit: Int
+    var prewarmMarginScreens: Double
+    var maxConcurrentSourceChunkJobs: Int
+    var maxConcurrentOutputTileJobs: Int
+    var maxResidentSourceChunks: Int
+    var sourceChunkSize: Int
+
+    static let `default` = OverlayProgressiveTileConfig(
+        prewarmLookaheadZooms: 2,
+        earlyComfortDepth: 2,
+        cheapLevelTileLimit: 32,
+        prewarmMarginScreens: 1.5,
+        maxConcurrentSourceChunkJobs: 1,
+        maxConcurrentOutputTileJobs: 1,
+        maxResidentSourceChunks: 6,
+        sourceChunkSize: 4096
+    )
+}
 
 /// Map framing when the overlay was last committed (**«Done»**), so re-opening edit can restore heading / zoom / center.
 struct PersistedMapCamera: Codable, Equatable {
@@ -11,6 +35,24 @@ struct PersistedMapCamera: Codable, Equatable {
     var centerCoordinateDistance: CLLocationDistance
     /// Degrees; stored as `Double` for stable JSON (`MKMapCamera.pitch`).
     var pitch: Double
+}
+
+/// Stable identity for a single pyramid output tile (runtime dedup / state).
+struct OverlayTileCoordinateKey: Hashable {
+    let overlayID: UUID
+    let revision: Int64
+    let z: Int
+    let x: Int
+    let y: Int
+    let scale100: Int
+}
+
+/// Explicit runtime lifecycle for lazily generated output tiles.
+enum OverlayRuntimeTileState: Equatable {
+    case missing
+    case generating
+    case ready
+    case failed
 }
 
 /// Disk-backed **`MKTileOverlay`** pyramid metadata (**`-1`** zoom sentinel ⇒ pyramid rebuild in flight).
@@ -36,6 +78,8 @@ struct OverlayItem: Identifiable {
     let placementCamera: PersistedMapCamera?
     /// Camera-roll file bytes from **`PhotosPicker`** kept only in memory for immediate editing workflows; persistence writes re-encode from `sourceImage`.
     var preservedSourceFileData: Data?
+    /// Set when save draft already wrote derived baked HEIC to disk; **`persist`** skips re-encode.
+    var bakedImagePreWrittenToDisk: Bool = false
     /// Compressed source raster (**JPEG** / **HEIC** …) for **`ImageIO`** subsampled tile draws on huge overlays; avoids decoding the full bitmap while zoomed in.
     let sourceRasterData: Data?
     /// Present after **`OverlayTilePyramidBuilder`** completes; **`nil`** uses lazy **`TileCache`** rasterizing until pyramid metadata arrives from persistence reload.
@@ -48,12 +92,14 @@ struct OverlayItem: Identifiable {
         corners: [CLLocationCoordinate2D],
         placementCamera: PersistedMapCamera?,
         preservedSourceFileData: Data? = nil,
+        bakedImagePreWrittenToDisk: Bool = false,
         sourceRasterData: Data? = nil,
         tilePyramid: OverlayTilePyramidRuntimeInfo? = nil
     ) {
         self.id = id
         self.sourceImage = sourceImage
         self.mapDisplayImage = mapDisplayImage
+        self.bakedImagePreWrittenToDisk = bakedImagePreWrittenToDisk
         let tiledPixels: Int64 = {
             if let data = sourceRasterData, !data.isEmpty,
                let n = UIImage.rasterPixelCount(forCompressedImageData: data) {
