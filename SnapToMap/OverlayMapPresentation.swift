@@ -125,6 +125,17 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
         return c
     }()
 
+    private struct DisplayedTileEntry {
+        let quality: TileDisplayQualityRank
+        let data: Data
+        let kindLabel: String
+    }
+
+    /// Best-quality tile bytes already shown for each MapKit path — prevents exact→fallback regressions on reload.
+    private let displayedTileLock = NSRecursiveLock()
+    private var displayedTilesByKey: [String: DisplayedTileEntry] = [:]
+    private let displayedTileMaxEntries = 512
+
     private static let tileLoadDiagGate = NSLock()
     private static var tileLoadDiagCounter = 0
     private static var tileMissDiagCounter = 0
@@ -244,8 +255,398 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
            scanned > diskPyramidMaximumZ {
             diskPyramidMaximumZ = scanned
         }
-        OverlayTileRuntimeInstrumentation.recordTileInvalidation(overlayID: overlayID, z: path.z, x: path.x, y: path.y)
+        let priorQuality = priorDisplayedQuality(for: path)
+        OverlayTileRuntimeInstrumentation.recordTileInvalidation(
+            overlayID: overlayID,
+            z: path.z,
+            x: path.x,
+            y: path.y,
+            priorDisplayedQuality: priorQuality
+        )
         print("[TileDiag] tileOverlay.cacheInvalidate id=\(overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) diskMaxZ=\(diskPyramidMaximumZ)")
+        tileDiskReadQueue.async { [weak self] in
+            self?.seedDisplayedCacheFromDiskExact(path: path)
+        }
+    }
+
+    /// After invalidation, keep monotonic bytes if the exact tile is already on disk.
+    private func seedDisplayedCacheFromDiskExact(path: MKTileOverlayPath) {
+        guard let root = tilePyramidDiskRoot else { return }
+        let remapped = remappedPyramidTileRequest(for: path)
+        guard remapped.shift == 0 else { return }
+        guard let loaded = readPyramidTileDataFromDisk(path: remapped.diskPath, pyramidRoot: root) else { return }
+        guard let served = servedPyramidTileData(
+            loaded.data,
+            remapped: remapped,
+            requestedPath: path,
+            loadedAtContentScale: loaded.loadedAtScale
+        ) else { return }
+        let key = displayTileKey(for: path)
+        let entry = DisplayedTileEntry(
+            quality: .exact(requestedZ: path.z),
+            data: served,
+            kindLabel: "exact.seedFromDisk"
+        )
+        displayedTileLock.lock()
+        if let existing = displayedTilesByKey[key], existing.quality >= entry.quality {
+            displayedTileLock.unlock()
+            return
+        }
+        displayedTilesByKey[key] = entry
+        displayedTileLock.unlock()
+        print("[TileQuality] displayCache.seed id=\(overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y)")
+    }
+
+    private struct LoadedPyramidTileData {
+        let data: Data
+        let loadedAtScale: CGFloat
+        let kind: String
+    }
+
+    private func readPyramidTileDataFromDisk(path: MKTileOverlayPath, pyramidRoot: URL) -> LoadedPyramidTileData? {
+        let diskPaths = pyramidDiskPathCandidates(for: path)
+        for diskPath in diskPaths {
+            let preferred = Self.path(diskPath, remappedFor: tilePyramidYIndexMode) ?? diskPath
+            let yFlip = Self.yFlippedPath(diskPath)
+            var candidateURLs = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: pyramidRoot, path: preferred)
+            if let yFlip {
+                let flipCandidates = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: pyramidRoot, path: yFlip)
+                let existing = Set(candidateURLs.map(\.path))
+                for url in flipCandidates where !existing.contains(url.path) {
+                    candidateURLs.append(url)
+                }
+            }
+            for (idx, candidateURL) in candidateURLs.enumerated() {
+                if let cached = diskTileMemoryCache.object(forKey: NSString(string: candidateURL.path)) {
+                    return LoadedPyramidTileData(
+                        data: cached as Data,
+                        loadedAtScale: diskPath.contentScaleFactor,
+                        kind: idx == 0 ? "memCacheHit" : "memCacheHit.yFlip"
+                    )
+                }
+                if let data = try? Data(contentsOf: candidateURL),
+                   OverlayLibrary.isReadableTileFile(at: candidateURL) {
+                    diskTileMemoryCache.setObject(data as NSData, forKey: NSString(string: candidateURL.path), cost: data.count)
+                    return LoadedPyramidTileData(
+                        data: data,
+                        loadedAtScale: diskPath.contentScaleFactor,
+                        kind: idx == 0 ? "diskRead" : "diskRead.yFlip"
+                    )
+                }
+            }
+        }
+        return nil
+    }
+
+    private func bestDisplayedAncestorQuality(for path: MKTileOverlayPath) -> TileDisplayQualityRank? {
+        guard path.z > 0 else { return nil }
+        var best: TileDisplayQualityRank?
+        for parentZ in stride(from: path.z - 1, through: max(0, path.z - 4), by: -1) {
+            let shift = path.z - parentZ
+            guard shift > 0, shift < 31 else { continue }
+            let divisor = 1 << shift
+            let parentPath = MKTileOverlayPath(
+                x: path.x / divisor,
+                y: path.y / divisor,
+                z: parentZ,
+                contentScaleFactor: path.contentScaleFactor
+            )
+            guard let entry = displayedEntry(for: parentPath) else { continue }
+            let derived: TileDisplayQualityRank = {
+                switch entry.quality.tier {
+                case .exact, .remappedDisk:
+                    return .remappedDisk(requestedZ: path.z, sourceZ: parentZ)
+                default:
+                    return .parentFallback(requestedZ: path.z, parentZ: parentZ)
+                }
+            }()
+            if best == nil || derived > best! {
+                best = derived
+            }
+        }
+        return best
+    }
+
+    private struct ParentDerivedTile {
+        let data: Data
+        let quality: TileDisplayQualityRank
+        let kindLabel: String
+        let parentZ: Int
+    }
+
+    /// Highest **`parentZ`** first; prefers displayed-ancestor bytes over disk when both exist at the same level.
+    private func bestParentDerivedTile(
+        path: MKTileOverlayPath,
+        pyramidRoot: URL?,
+        preferDisplayedAncestors: Bool
+    ) -> ParentDerivedTile? {
+        guard path.z > 0 else { return nil }
+        let minZ = tilePyramidRuntimeInfo.map { Int($0.minimumZoom) } ?? 0
+        for parentZ in stride(from: path.z - 1, through: minZ, by: -1) {
+            let shift = path.z - parentZ
+            guard shift > 0, shift < 31 else { continue }
+            let divisor = 1 << shift
+            let parentX = path.x / divisor
+            let parentY = path.y / divisor
+            let childMask = divisor - 1
+            let childX = path.x & childMask
+            let childY = path.y & childMask
+            let parentPath = MKTileOverlayPath(
+                x: parentX,
+                y: parentY,
+                z: parentZ,
+                contentScaleFactor: path.contentScaleFactor
+            )
+
+            var bestAtLevel: ParentDerivedTile?
+
+            if preferDisplayedAncestors, let cached = displayedEntry(for: parentPath),
+               let overzoomed = Self.makeOverzoomedChildTileFromParentData(
+                parentTileData: cached.data,
+                shift: shift,
+                childX: childX,
+                childY: childY,
+                contentScale: path.contentScaleFactor,
+                tileSize: tileSize
+               ) {
+                let quality: TileDisplayQualityRank
+                let kind: String
+                switch cached.quality.tier {
+                case .exact, .remappedDisk:
+                    quality = .remappedDisk(requestedZ: path.z, sourceZ: parentZ)
+                    kind = "ancestorCache.exact.z\(parentZ)"
+                default:
+                    quality = .parentFallback(requestedZ: path.z, parentZ: parentZ)
+                    kind = "ancestorCache.fallback.z\(parentZ)"
+                }
+                bestAtLevel = ParentDerivedTile(data: overzoomed, quality: quality, kindLabel: kind, parentZ: parentZ)
+                print(
+                    "[TileQuality] crossZoomAncestor id=\(overlayID.uuidString.prefix(8)) reqZ=\(path.z) x=\(path.x) y=\(path.y) ancestorZ=\(parentZ) ancestorQuality=\(cached.quality) derived=\(quality)"
+                )
+            }
+
+            if let root = pyramidRoot,
+               let diskParent = overzoomedTileFromNearestDiskParent(
+                path: path,
+                pyramidRoot: root,
+                startParentZ: parentZ
+               ), diskParent.parentZ == parentZ {
+                let diskDerived = ParentDerivedTile(
+                    data: diskParent.data,
+                    quality: .parentFallback(requestedZ: path.z, parentZ: parentZ),
+                    kindLabel: "parentFallback.z\(parentZ)",
+                    parentZ: parentZ
+                )
+                if let current = bestAtLevel {
+                    if diskDerived.quality > current.quality {
+                        bestAtLevel = diskDerived
+                    }
+                } else {
+                    bestAtLevel = diskDerived
+                }
+            }
+
+            if let bestAtLevel {
+                return bestAtLevel
+            }
+        }
+        return nil
+    }
+
+    private func displayTileKey(for path: MKTileOverlayPath) -> String {
+        let scale100 = Int((path.contentScaleFactor * 100).rounded())
+        return "z\(path.z)/\(path.x)/\(path.y)@\(scale100)"
+    }
+
+    private func priorDisplayedQuality(for path: MKTileOverlayPath) -> TileDisplayQualityRank? {
+        let key = displayTileKey(for: path)
+        displayedTileLock.lock()
+        defer { displayedTileLock.unlock() }
+        return displayedTilesByKey[key]?.quality
+    }
+
+    private func displayedEntry(for path: MKTileOverlayPath) -> DisplayedTileEntry? {
+        let key = displayTileKey(for: path)
+        displayedTileLock.lock()
+        defer { displayedTileLock.unlock() }
+        return displayedTilesByKey[key]
+    }
+
+    private func trimDisplayedTileCacheIfNeeded() {
+        guard displayedTilesByKey.count > displayedTileMaxEntries else { return }
+        let overflow = displayedTilesByKey.count - displayedTileMaxEntries + 48
+        // Evict lowest-quality entries first; never trim exact/remapped tiers until budget exhausted.
+        let ranked = displayedTilesByKey.sorted { lhs, rhs in
+            if lhs.value.quality == rhs.value.quality {
+                return lhs.key < rhs.key
+            }
+            return lhs.value.quality < rhs.value.quality
+        }
+        var removed = 0
+        for (key, entry) in ranked {
+            guard removed < overflow else { break }
+            if entry.quality.tier == .exact || entry.quality.tier == .remappedDisk,
+               removed + 48 < overflow {
+                continue
+            }
+            displayedTilesByKey.removeValue(forKey: key)
+            removed += 1
+            OverlayTileRuntimeInstrumentation.recordDisplayCacheEviction(
+                overlayID: overlayID,
+                tileLabel: key,
+                quality: entry.quality
+            )
+        }
+    }
+
+    private struct MonotonicTileResolution {
+        let data: Data
+        let quality: TileDisplayQualityRank
+        let kindLabel: String
+        let reason: String
+        let proposedQuality: TileDisplayQualityRank?
+    }
+
+    /// Once a tile path has been displayed at quality Q, never replace it with lower quality.
+    private func resolveMonotonicTileServe(
+        path: MKTileOverlayPath,
+        proposedData: Data,
+        proposedQuality: TileDisplayQualityRank,
+        proposedKindLabel: String
+    ) -> MonotonicTileResolution {
+        let key = displayTileKey(for: path)
+        displayedTileLock.lock()
+        defer { displayedTileLock.unlock() }
+
+        if let existing = displayedTilesByKey[key] {
+            if proposedQuality < existing.quality {
+                return MonotonicTileResolution(
+                    data: existing.data,
+                    quality: existing.quality,
+                    kindLabel: existing.kindLabel,
+                    reason: "monotonicKeepPrior",
+                    proposedQuality: proposedQuality
+                )
+            }
+            if proposedQuality > existing.quality {
+                let entry = DisplayedTileEntry(quality: proposedQuality, data: proposedData, kindLabel: proposedKindLabel)
+                displayedTilesByKey[key] = entry
+                trimDisplayedTileCacheIfNeeded()
+                return MonotonicTileResolution(
+                    data: proposedData,
+                    quality: proposedQuality,
+                    kindLabel: proposedKindLabel,
+                    reason: "qualityUpgrade",
+                    proposedQuality: nil
+                )
+            }
+            let proposedIsExactDisk = proposedKindLabel.contains("exact.")
+                || proposedKindLabel.contains("diskRead")
+                || proposedKindLabel.contains("memCacheHit")
+            let existingIsFallback = existing.kindLabel.contains("fallback")
+                || existing.kindLabel.contains("parent")
+                || existing.kindLabel.contains("lazy")
+                || existing.kindLabel.contains("ancestorCache")
+            if proposedIsExactDisk && existingIsFallback {
+                let entry = DisplayedTileEntry(quality: proposedQuality, data: proposedData, kindLabel: proposedKindLabel)
+                displayedTilesByKey[key] = entry
+                return MonotonicTileResolution(
+                    data: proposedData,
+                    quality: proposedQuality,
+                    kindLabel: proposedKindLabel,
+                    reason: "exactReplacesFallback",
+                    proposedQuality: nil
+                )
+            }
+            if proposedIsExactDisk {
+                let entry = DisplayedTileEntry(quality: proposedQuality, data: proposedData, kindLabel: proposedKindLabel)
+                displayedTilesByKey[key] = entry
+                return MonotonicTileResolution(
+                    data: proposedData,
+                    quality: proposedQuality,
+                    kindLabel: proposedKindLabel,
+                    reason: "exactDiskRefresh",
+                    proposedQuality: nil
+                )
+            }
+            return MonotonicTileResolution(
+                data: existing.data,
+                quality: existing.quality,
+                kindLabel: existing.kindLabel,
+                reason: "monotonicKeepSameRank",
+                proposedQuality: proposedQuality
+            )
+        }
+
+        if let floor = bestDisplayedAncestorQuality(for: path),
+           proposedQuality < floor,
+           let ancestor = bestParentDerivedTile(path: path, pyramidRoot: tilePyramidDiskRoot, preferDisplayedAncestors: true),
+           ancestor.quality >= floor {
+            let entry = DisplayedTileEntry(quality: ancestor.quality, data: ancestor.data, kindLabel: ancestor.kindLabel)
+            displayedTilesByKey[key] = entry
+            trimDisplayedTileCacheIfNeeded()
+            return MonotonicTileResolution(
+                data: ancestor.data,
+                quality: ancestor.quality,
+                kindLabel: ancestor.kindLabel,
+                reason: "crossZoomAncestorFloor",
+                proposedQuality: proposedQuality
+            )
+        }
+
+        if (proposedQuality.tier == .parentFallback || proposedQuality.tier == .lazy),
+           let ancestor = bestParentDerivedTile(path: path, pyramidRoot: tilePyramidDiskRoot, preferDisplayedAncestors: true),
+           ancestor.quality > proposedQuality {
+            let entry = DisplayedTileEntry(quality: ancestor.quality, data: ancestor.data, kindLabel: ancestor.kindLabel)
+            displayedTilesByKey[key] = entry
+            trimDisplayedTileCacheIfNeeded()
+            return MonotonicTileResolution(
+                data: ancestor.data,
+                quality: ancestor.quality,
+                kindLabel: ancestor.kindLabel,
+                reason: "crossZoomAncestorFirstDisplay",
+                proposedQuality: proposedQuality
+            )
+        }
+
+        let entry = DisplayedTileEntry(quality: proposedQuality, data: proposedData, kindLabel: proposedKindLabel)
+        displayedTilesByKey[key] = entry
+        trimDisplayedTileCacheIfNeeded()
+        return MonotonicTileResolution(
+            data: proposedData,
+            quality: proposedQuality,
+            kindLabel: proposedKindLabel,
+            reason: "firstDisplay",
+            proposedQuality: nil
+        )
+    }
+
+    private func deliverMonotonicTile(
+        path: MKTileOverlayPath,
+        proposedData: Data,
+        proposedQuality: TileDisplayQualityRank,
+        proposedKindLabel: String,
+        result: @escaping (Data?, (any Error)?) -> Void
+    ) {
+        let resolved = resolveMonotonicTileServe(
+            path: path,
+            proposedData: proposedData,
+            proposedQuality: proposedQuality,
+            proposedKindLabel: proposedKindLabel
+        )
+        let scale100 = Int((path.contentScaleFactor * 100).rounded())
+        OverlayTileRuntimeInstrumentation.recordTileQualityServe(
+            overlayID: overlayID,
+            z: path.z,
+            x: path.x,
+            y: path.y,
+            scale100: scale100,
+            displayedQuality: resolved.quality,
+            replacementSource: resolved.kindLabel,
+            replacementReason: resolved.reason,
+            proposedQuality: resolved.proposedQuality
+        )
+        result(resolved.data, nil)
     }
 
     private func runtimeTileState(for path: MKTileOverlayPath) -> OverlayRuntimeTileState {
@@ -394,39 +795,43 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                         if !loadedKind.isEmpty {
                             self.registerTileLoadSample(kind: loadedKind, path: path, byteCount: served.count)
                         }
+                        let quality: TileDisplayQualityRank = remapped.shift == 0
+                            ? .exact(requestedZ: path.z)
+                            : .remappedDisk(requestedZ: remapped.requestedZ, sourceZ: remapped.sourceZ)
+                        let kindLabel = remapped.shift == 0 ? "exact.\(loadedKind)" : "remapped.\(loadedKind)"
                         if remapped.shift == 0 {
                             let state = self.runtimeTileState(for: path)
-                            OverlayTileRuntimeInstrumentation.recordTileServed(
-                                overlayID: self.overlayID,
-                                z: path.z,
-                                x: path.x,
-                                y: path.y,
-                                kind: "exact.\(loadedKind)"
-                            )
                             print("[TileDiag] tileOverlay.exact id=\(self.overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) kind=\(loadedKind) state=\(state)")
                         }
-                        result(served, nil)
+                        self.deliverMonotonicTile(
+                            path: path,
+                            proposedData: served,
+                            proposedQuality: quality,
+                            proposedKindLabel: kindLabel,
+                            result: result
+                        )
                         return
                     }
                 }
                 if path.z > 0, remapped.shift == 0,
-                   let fallback = self.closestParentFallbackTile(
+                   let derived = self.bestParentDerivedTile(
                     path: path,
-                    pyramidRoot: root
+                    pyramidRoot: root,
+                    preferDisplayedAncestors: true
                    ) {
                     let state = self.runtimeTileState(for: path)
-                    print("[TileDiag] tileOverlay.fallback id=\(self.overlayID.uuidString.prefix(8)) requested z=\(path.z) x=\(path.x) y=\(path.y) fallback z=\(fallback.parentZ) x=\(fallback.parentX) y=\(fallback.parentY) delta=\(path.z - fallback.parentZ) state=\(state)")
-                    TileDiagFileLog.append("[TileDiagFile] fallback id=\(self.overlayID.uuidString.prefix(8)) req z=\(path.z) x=\(path.x) y=\(path.y) fb z=\(fallback.parentZ) x=\(fallback.parentX) y=\(fallback.parentY) delta=\(path.z - fallback.parentZ) state=\(state)")
-                    self.registerTileLoadSample(kind: "pyramid.parentFallback", path: path, byteCount: fallback.data.count)
-                    OverlayTileRuntimeInstrumentation.recordTileServed(
-                        overlayID: self.overlayID,
-                        z: path.z,
-                        x: path.x,
-                        y: path.y,
-                        kind: "parentFallback.z\(fallback.parentZ)"
-                    )
+                    let delta = path.z - derived.parentZ
+                    print("[TileDiag] tileOverlay.fallback id=\(self.overlayID.uuidString.prefix(8)) requested z=\(path.z) x=\(path.x) y=\(path.y) fallback z=\(derived.parentZ) delta=\(delta) kind=\(derived.kindLabel) state=\(state)")
+                    TileDiagFileLog.append("[TileDiagFile] fallback id=\(self.overlayID.uuidString.prefix(8)) req z=\(path.z) x=\(path.x) y=\(path.y) fb z=\(derived.parentZ) delta=\(delta) kind=\(derived.kindLabel) state=\(state)")
+                    self.registerTileLoadSample(kind: derived.kindLabel, path: path, byteCount: derived.data.count)
                     self.enqueueExactTileIfNeeded(path: path)
-                    result(fallback.data, nil)
+                    self.deliverMonotonicTile(
+                        path: path,
+                        proposedData: derived.data,
+                        proposedQuality: derived.quality,
+                        proposedKindLabel: derived.kindLabel,
+                        result: result
+                    )
                     return
                 }
                 let preferredExists = OverlayLibrary.tileCandidateFileURLs(pyramidRoot: root, path: preferredPath).contains {
@@ -449,13 +854,41 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
                     TileDiagFileLog.append("[TileDiagFile] miss id=\(self.overlayID.uuidString.prefix(8)) n=\(missN) z=\(path.z) x=\(path.x) y=\(path.y) scale=\(path.contentScaleFactor) mode=\(self.tilePyramidYIndexMode.rawValue) preferredExists=\(preferredExists) fallbackExists=\(fallbackExists) state=\(state)")
                 }
                 self.enqueueExactTileIfNeeded(path: path)
+                if let derived = self.bestParentDerivedTile(
+                    path: path,
+                    pyramidRoot: root,
+                    preferDisplayedAncestors: true
+                ) {
+                    self.registerTileLoadSample(kind: derived.kindLabel, path: path, byteCount: derived.data.count)
+                    self.deliverMonotonicTile(
+                        path: path,
+                        proposedData: derived.data,
+                        proposedQuality: derived.quality,
+                        proposedKindLabel: derived.kindLabel,
+                        result: result
+                    )
+                    return
+                }
                 self.tileCache.loadTile(path: path, tileSize: self.tileSize, geometryFlipped: self.isGeometryFlipped) { fallbackData in
                     if let fallbackData {
                         self.registerTileLoadSample(kind: "pyramid.missFallback.lazy", path: path, byteCount: fallbackData.count)
                         TileDiagFileLog.append("[TileDiagFile] missFallback.lazy id=\(self.overlayID.uuidString.prefix(8)) z=\(path.z) x=\(path.x) y=\(path.y) scale=\(path.contentScaleFactor) bytes=\(fallbackData.count)")
-                        result(fallbackData, nil)
+                        self.deliverMonotonicTile(
+                            path: path,
+                            proposedData: fallbackData,
+                            proposedQuality: .lazy,
+                            proposedKindLabel: "pyramid.missFallback.lazy",
+                            result: result
+                        )
                     } else {
-                        result(self.transparentTilePNG(points: self.tileSize, scale: path.contentScaleFactor), nil)
+                        let transparent = self.transparentTilePNG(points: self.tileSize, scale: path.contentScaleFactor)
+                        self.deliverMonotonicTile(
+                            path: path,
+                            proposedData: transparent,
+                            proposedQuality: .transparent,
+                            proposedKindLabel: "transparent",
+                            result: result
+                        )
                     }
                 }
             }
@@ -468,10 +901,23 @@ final class BakedImageMapTileOverlay: MKTileOverlay, SnapRasterMapOverlay {
             }
             self.registerTileLoadSample(kind: "lazy.tileCache", path: path, byteCount: data?.count)
             guard let data else {
-                result(self.transparentTilePNG(points: self.tileSize, scale: path.contentScaleFactor), nil)
+                let transparent = self.transparentTilePNG(points: self.tileSize, scale: path.contentScaleFactor)
+                self.deliverMonotonicTile(
+                    path: path,
+                    proposedData: transparent,
+                    proposedQuality: .transparent,
+                    proposedKindLabel: "transparent",
+                    result: result
+                )
                 return
             }
-            result(data, nil)
+            self.deliverMonotonicTile(
+                path: path,
+                proposedData: data,
+                proposedQuality: .lazy,
+                proposedKindLabel: "lazy.tileCache",
+                result: result
+            )
         }
     }
 

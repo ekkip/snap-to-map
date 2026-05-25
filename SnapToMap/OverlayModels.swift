@@ -80,9 +80,9 @@ struct OverlayItem: Identifiable {
     var preservedSourceFileData: Data?
     /// Set when save draft already wrote derived baked HEIC to disk; **`persist`** skips re-encode.
     var bakedImagePreWrittenToDisk: Bool = false
-    /// Set when save draft staged source bytes on disk; **`persist`** reads staging and **`sourceRasterData`** may be **`nil`** to avoid duplicate RSS during **`context.save()`**.
+    /// Set when save draft wrote source bytes to Application Support; **`persist`** sets **`sourceImageOnDisk`** metadata only and **`sourceRasterData`** may be **`nil`** to avoid duplicate RSS during **`context.save()`**.
     var sourceImagePreWrittenToDisk: Bool = false
-    /// Pixel count when **`sourceRasterData`** is omitted after staging (heavy overlay save draft).
+    /// Pixel count when **`sourceRasterData`** is omitted after disk pre-write (heavy overlay save draft).
     let cachedSourceRasterPixels: Int64?
     /// Compressed source raster (**JPEG** / **HEIC** …) for **`ImageIO`** subsampled tile draws on huge overlays; avoids decoding the full bitmap while zoomed in.
     let sourceRasterData: Data?
@@ -127,6 +127,12 @@ struct OverlayItem: Identifiable {
     /// Decode path for **edit** UI only — prefer **`ImageIO`** subsampling so **`CIImage`** never sees a 400 MP backing.
     func editingPreviewUIImage(maxPixelDimension: CGFloat = 8192) -> UIImage? {
         if let data = sourceRasterData, !data.isEmpty {
+            return OverlayLibrary.uiImageSubsampling(from: data, maxPixelDimension: maxPixelDimension)
+                ?? UIImage(data: data)
+        }
+        if sourceImagePreWrittenToDisk,
+           let data = OverlayLibrary.persistedSourceRasterData(overlayID: id),
+           !data.isEmpty {
             return OverlayLibrary.uiImageSubsampling(from: data, maxPixelDimension: maxPixelDimension)
                 ?? UIImage(data: data)
         }

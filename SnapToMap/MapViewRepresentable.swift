@@ -251,9 +251,10 @@ struct MapViewRepresentable: UIViewRepresentable {
         private func registerProgressiveRuntimeIfNeeded(for item: OverlayItem, on mapView: MKMapView) {
             guard item.usesTiledMapPresentation,
                   let runtime = item.tilePyramid,
-                  runtime.minimumZoom >= 0,
-                  let source = item.sourceRasterData,
-                  !source.isEmpty else { return }
+                  runtime.minimumZoom >= 0 else { return }
+            let source = item.sourceRasterData
+                ?? (item.sourceImagePreWrittenToDisk ? OverlayLibrary.persistedSourceRasterData(overlayID: item.id) : nil)
+            guard let source, !source.isEmpty else { return }
             guard !OverlayLibrary.isInSaveTransition(item.id) else {
                 print("[TileProg] register.deferredSaveTransition id=\(item.id.uuidString.prefix(8))")
                 return

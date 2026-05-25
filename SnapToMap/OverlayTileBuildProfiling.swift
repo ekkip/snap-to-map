@@ -103,7 +103,67 @@ enum OverlayTileBuildProfiling {
     }
 }
 
-/// Runtime progressive pipeline counters — grep console for **`[TileRuntime]`**.
+/// Quality ordering for monotonic tile display: exact **`z_n` > parent `z_n-1` > … > lazy > transparent.
+struct TileDisplayQualityRank: Comparable, CustomStringConvertible {
+    let requestedZ: Int
+    let sourceZ: Int
+    let tier: Tier
+
+    enum Tier: Int, Comparable {
+        case transparent = 0
+        case lazy = 1
+        case parentFallback = 2
+        case remappedDisk = 3
+        case exact = 4
+
+        static func < (lhs: Tier, rhs: Tier) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    private var compositeRank: Int {
+        max(sourceZ, 0) * 10 + tier.rawValue
+    }
+
+    static func < (lhs: TileDisplayQualityRank, rhs: TileDisplayQualityRank) -> Bool {
+        if lhs.compositeRank != rhs.compositeRank { return lhs.compositeRank < rhs.compositeRank }
+        return lhs.sourceZ < rhs.sourceZ
+    }
+
+    var fallbackDelta: Int { max(0, requestedZ - sourceZ) }
+
+    var description: String {
+        switch tier {
+        case .exact:
+            return "exact@z\(sourceZ)"
+        case .remappedDisk:
+            return "remapped@z\(sourceZ) reqZ=\(requestedZ)"
+        case .parentFallback:
+            return "parent@z\(sourceZ) delta=\(fallbackDelta)"
+        case .lazy:
+            return "lazy"
+        case .transparent:
+            return "transparent"
+        }
+    }
+
+    static func exact(requestedZ: Int) -> TileDisplayQualityRank {
+        TileDisplayQualityRank(requestedZ: requestedZ, sourceZ: requestedZ, tier: .exact)
+    }
+
+    static func remappedDisk(requestedZ: Int, sourceZ: Int) -> TileDisplayQualityRank {
+        TileDisplayQualityRank(requestedZ: requestedZ, sourceZ: sourceZ, tier: .remappedDisk)
+    }
+
+    static func parentFallback(requestedZ: Int, parentZ: Int) -> TileDisplayQualityRank {
+        TileDisplayQualityRank(requestedZ: requestedZ, sourceZ: parentZ, tier: .parentFallback)
+    }
+
+    static let lazy = TileDisplayQualityRank(requestedZ: 0, sourceZ: 0, tier: .lazy)
+    static let transparent = TileDisplayQualityRank(requestedZ: 0, sourceZ: -1, tier: .transparent)
+}
+
+/// Runtime progressive pipeline counters — grep console for **`[TileRuntime]`** / **`[TileQuality]`**.
 enum OverlayTileRuntimeInstrumentation {
     private static let lock = NSLock()
     private static var queueDepthSamples: Int = 0
@@ -114,10 +174,13 @@ enum OverlayTileRuntimeInstrumentation {
     private static var tileInvalidationCount = 0
     private static var fallbackToExactCount = 0
     private static var exactToFallbackRegressions = 0
+    private static var qualityRegressionPreventedCount = 0
+    private static var qualityUpgradeCount = 0
     private static var sessionCacheEvictionCount = 0
     private static var memoryWarningCount = 0
     private static var memoryWarningTimestamps: [String] = []
     private static var lastServedKindByTile: [String: String] = [:]
+    private static var lastDisplayedQualityByTile: [String: TileDisplayQualityRank] = [:]
 
     static func recordQueueSample(pending: Int, activeOutput: Int, activeChunks: Int, inFlightTiles: Int, inFlightChunks: Int) {
         lock.lock()
@@ -164,12 +227,91 @@ enum OverlayTileRuntimeInstrumentation {
         print("[TileRuntime] overlay.reload id=\(overlayID.uuidString.prefix(8)) total=\(count)")
     }
 
-    static func recordTileInvalidation(overlayID: UUID, z: Int, x: Int, y: Int) {
+    static func recordTileInvalidation(
+        overlayID: UUID,
+        z: Int,
+        x: Int,
+        y: Int,
+        priorDisplayedQuality: TileDisplayQualityRank? = nil
+    ) {
         lock.lock()
         tileInvalidationCount += 1
         let count = tileInvalidationCount
         lock.unlock()
-        print("[TileRuntime] tile.invalidate id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) total=\(count)")
+        if let priorDisplayedQuality {
+            print("[TileQuality] invalidate id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) displayed=\(priorDisplayedQuality) total=\(count)")
+        } else {
+            print("[TileRuntime] tile.invalidate id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) total=\(count)")
+        }
+    }
+
+    static func recordTileQualityServe(
+        overlayID: UUID,
+        z: Int,
+        x: Int,
+        y: Int,
+        scale100: Int,
+        displayedQuality: TileDisplayQualityRank,
+        replacementSource: String,
+        replacementReason: String,
+        proposedQuality: TileDisplayQualityRank?
+    ) {
+        let key = tileKey(overlayID: overlayID, z: z, x: x, y: y)
+        lock.lock()
+        let priorQuality = lastDisplayedQualityByTile[key]
+        lastDisplayedQualityByTile[key] = displayedQuality
+        lock.unlock()
+
+        print(
+            "[TileQuality] displayed id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) scale=\(String(format: "%.2f", CGFloat(scale100) / 100)) quality=\(displayedQuality) source=\(replacementSource) reason=\(replacementReason)"
+        )
+
+        if let priorQuality, displayedQuality > priorQuality,
+           (displayedQuality.sourceZ > priorQuality.sourceZ
+            || displayedQuality.tier.rawValue > priorQuality.tier.rawValue) {
+            lock.lock()
+            qualityUpgradeCount += 1
+            lock.unlock()
+            print("[TileQuality] upgrade id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) from=\(priorQuality) to=\(displayedQuality) reason=\(replacementReason)")
+        }
+
+        if let proposedQuality, let priorQuality, proposedQuality < priorQuality {
+            lock.lock()
+            qualityRegressionPreventedCount += 1
+            let prevented = qualityRegressionPreventedCount
+            lock.unlock()
+            print(
+                "[TileQuality] regressionPrevented id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) displayed=\(priorQuality) proposed=\(proposedQuality) proposedSource=\(replacementSource) fallbackDelta=\(proposedQuality.fallbackDelta) total=\(prevented)"
+            )
+        }
+
+        if let priorQuality,
+           (priorQuality.tier == .exact || priorQuality.tier == .remappedDisk),
+           displayedQuality.tier == .parentFallback || displayedQuality.tier == .lazy {
+            lock.lock()
+            exactToFallbackRegressions += 1
+            let regressions = exactToFallbackRegressions
+            lock.unlock()
+            print(
+                "[TileQuality] exactToFallbackRegression id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) from=\(priorQuality) to=\(displayedQuality) source=\(replacementSource) fallbackDelta=\(displayedQuality.fallbackDelta) total=\(regressions)"
+            )
+        }
+
+        recordTileServed(overlayID: overlayID, z: z, x: x, y: y, kind: replacementSource)
+    }
+
+    static func recordDisplayCacheEviction(overlayID: UUID, tileLabel: String, quality: TileDisplayQualityRank) {
+        print("[TileQuality] displayCache.evict id=\(overlayID.uuidString.prefix(8)) tile=\(tileLabel) quality=\(quality)")
+    }
+
+    static func recordChunkEvictionAffectingTile(
+        overlayID: UUID,
+        z: Int,
+        x: Int,
+        y: Int,
+        reason: String
+    ) {
+        print("[TileQuality] chunkEviction.affectsTile id=\(overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) reason=\(reason)")
     }
 
     static func recordMemoryWarning() {
@@ -219,11 +361,13 @@ enum OverlayTileRuntimeInstrumentation {
         let reloads = overlayReloadCount
         let invalidations = tileInvalidationCount
         let regressions = exactToFallbackRegressions
+        let prevented = qualityRegressionPreventedCount
+        let upgrades = qualityUpgradeCount
         let memWarnings = memoryWarningCount
         let evictions = sessionCacheEvictionCount
         lock.unlock()
         guard shouldLog else { return }
-        print("[TileRuntime] heartbeat pending=\(pending) activeOut=\(activeOutput) activeChunk=\(activeChunks) inFlightTiles=\(inFlightTiles) inFlightChunks=\(inFlightChunks) reloads=\(reloads) invalidations=\(invalidations) regressions=\(regressions) memWarnings=\(memWarnings) sessionEvictions=\(evictions)")
+        print("[TileRuntime] heartbeat pending=\(pending) activeOut=\(activeOutput) activeChunk=\(activeChunks) inFlightTiles=\(inFlightTiles) inFlightChunks=\(inFlightChunks) reloads=\(reloads) invalidations=\(invalidations) regressions=\(regressions) prevented=\(prevented) upgrades=\(upgrades) memWarnings=\(memWarnings) sessionEvictions=\(evictions)")
     }
 
     private static func tileKey(overlayID: UUID, z: Int, x: Int, y: Int) -> String {

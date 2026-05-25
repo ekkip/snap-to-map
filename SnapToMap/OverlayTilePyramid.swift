@@ -1506,8 +1506,10 @@ final class OverlayTileRuntimeScheduler {
         zc: Int,
         maxEnqueue: Int?
     ) -> Int {
+        let startWarmZ = zc + 1
+        guard startWarmZ <= targetWarmZ else { return 0 }
         var enqueued = 0
-        chunkLoop: for warmZ in (zc + 1)...targetWarmZ {
+        chunkLoop: for warmZ in startWarmZ...targetWarmZ {
             let chunkKeys = sourceChunkKeysForMapRect(
                 overlayPrewarm,
                 z: warmZ,
@@ -1558,6 +1560,13 @@ final class OverlayTileRuntimeScheduler {
             guard let ctx = contexts[overlayID] else { return }
             let zc = Int(floor(viewport.currentZoom))
             let targetWarmZ = min(zc + ctx.config.prewarmLookaheadZooms, ctx.maxZ)
+            guard zc + 1 <= targetWarmZ else {
+                saveTransitionPrewarmRecovery.removeValue(forKey: overlayID)
+                print("[TileProg] saveTransition.prewarmPhase complete id=\(overlayID.uuidString.prefix(8)) atMaxZ z_c=\(zc) targetWarmZ=\(targetWarmZ)")
+                schedulePrewarmJobs(overlayID: overlayID, viewport: viewport)
+                drainQueueIfNeeded()
+                return
+            }
             let overlayPrewarm = expandedMapRect(
                 viewport.visibleMapRect,
                 marginScreens: ctx.config.prewarmMarginScreens
@@ -2007,14 +2016,23 @@ final class OverlayTileRuntimeScheduler {
                     sourceZ: z
                 )
                 guard let data = OverlayTileRenderer.mercatorTileHEIFData(from: request)
-                        ?? OverlayTileRenderer.mercatorTileHEIFDataFromBakedFallback(
-                            bakedFallbackCG: bakedCG,
-                            tileRect: tileRect,
-                            bbox: ctx.bbox,
-                            clipped: clipped,
-                            tileSize: OverlayLibrary.logicalTileSize,
-                            scale: contentScale
-                        ) else {
+                        ?? {
+                            OverlayTileRuntimeInstrumentation.recordChunkEvictionAffectingTile(
+                                overlayID: ctx.overlayID,
+                                z: z,
+                                x: x,
+                                y: y,
+                                reason: "metalRenderNil.usedBakedFallback"
+                            )
+                            return OverlayTileRenderer.mercatorTileHEIFDataFromBakedFallback(
+                                bakedFallbackCG: bakedCG,
+                                tileRect: tileRect,
+                                bbox: ctx.bbox,
+                                clipped: clipped,
+                                tileSize: OverlayLibrary.logicalTileSize,
+                                scale: contentScale
+                            )
+                        }() else {
                     self.queue.async {
                         self.inFlightOutputTiles.remove(tileKey)
                         self.tileStates[tileKey] = .failed

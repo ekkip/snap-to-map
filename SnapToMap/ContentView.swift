@@ -715,8 +715,10 @@ struct ContentView: View {
 
         Task {
             SnapMemoryInstrumentation.checkpoint("saveDraft.Task.begin overlayID=\(overlayID.uuidString.prefix(8))…")
-            let rasterBytesForBake = preservedPick ?? editingOverlayBackup?.sourceRasterData
-            let rasterBytes = preservedPick ?? editingOverlayBackup?.sourceRasterData
+            let rasterBytesForBake = preservedPick
+                ?? editingOverlayBackup?.sourceRasterData
+                ?? OverlayLibrary.persistedSourceRasterData(overlayID: overlayID)
+            let rasterBytes = rasterBytesForBake
             let intrinsicPixels: Int64 = {
                 if let rasterBytes, let px = UIImage.rasterPixelCount(forCompressedImageData: rasterBytes) {
                     return px
@@ -919,7 +921,9 @@ struct ContentView: View {
             return
         }
 
-        draftSourceFileData = overlay.preservedSourceFileData ?? overlay.sourceRasterData
+        draftSourceFileData = overlay.preservedSourceFileData
+            ?? overlay.sourceRasterData
+            ?? OverlayLibrary.persistedSourceRasterData(overlayID: overlay.id)
         draftSourceExceedsLargeOverlayThreshold = overlay.usesTiledMapPresentation
         draftAnchoredToMap = true
         draftGeoCorners = overlay.corners

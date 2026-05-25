@@ -204,7 +204,7 @@ enum OverlayLibrary {
     private static let metadataFilename = "saved-overlays.json"
     private static let imagesDirectoryName = "overlay-images"
     private static let bakedImagesDirectoryName = "derived-baked-images"
-    private static let sourceImageStagingDirectoryName = "persisted-source-staging"
+    private static let sourceImagesDirectoryName = "persisted-source-images"
     private static let bakedTileCacheDirectoryName = "snap-to-map-tile-cache"
     private static let overlayTilePyramidsDirectoryName = "overlay-tile-pyramids"
     private static let workingImagesDirectoryName = "snap-to-map-working-images"
@@ -472,7 +472,7 @@ enum OverlayLibrary {
                 fr.fetchLimit = 1
                 fr.predicate = NSPredicate(format: "uuid == %@", overlayID as CVarArg)
                 guard let row = try? context.fetch(fr).first,
-                      let source = row.sourceImageData,
+                      let source = persistedSourceImageData(row: row, overlayID: overlayID),
                       let corners = decodeCorners(from: row.cornersJSON ?? ""),
                       corners.count == 4,
                       let bakedBlob = bakedImageDataFromDisk(id: overlayID),
@@ -649,18 +649,34 @@ enum OverlayLibrary {
             guard let uuid = row.uuid,
                   let corners = decodeCorners(from: row.cornersJSON ?? ""),
                   corners.count == 4,
-                  let sourceData = row.sourceImageData else {
+                  hasPersistedSource(row: row, overlayID: uuid) else {
                 continue
             }
-            let sourcePixels = UIImage.rasterPixelCount(forCompressedImageData: sourceData)
-                ?? Int64.max
+            let inlineSource = row.sourceImageData
+            let fileBackedSource = sourceImageExistsOnDisk(id: uuid)
+            let sourcePixels: Int64 = {
+                if let cached = inlineSource.flatMap({ UIImage.rasterPixelCount(forCompressedImageData: $0) }) {
+                    return cached
+                }
+                if fileBackedSource,
+                   let mapped = sourceImageDataFromDisk(id: uuid),
+                   let px = UIImage.rasterPixelCount(forCompressedImageData: mapped) {
+                    return px
+                }
+                return Int64.max
+            }()
             let isHeavy = sourcePixels > largeRasterOverlayPixelThresholdExclusive
+            let sourceDataForItem: Data? = {
+                if isHeavy, fileBackedSource { return nil }
+                if let inlineSource, !inlineSource.isEmpty { return inlineSource }
+                return sourceImageDataFromDisk(id: uuid)
+            }()
 
             let sourceImage: UIImage
             if isHeavy {
                 sourceImage = OverlayItem.browseSourceMemoryPlaceholder()
             } else {
-                guard let decoded = UIImage(data: sourceData) else { continue }
+                guard let sourceData = sourceDataForItem, let decoded = UIImage(data: sourceData) else { continue }
                 sourceImage = decoded
             }
 
@@ -678,7 +694,8 @@ enum OverlayLibrary {
                 }()
                 if let bakedOK {
                     mapDisplay = bakedOK
-                } else if let full = UIImage(data: sourceData) {
+                } else if let diskBytes = fileBackedSource ? sourceImageDataFromDisk(id: uuid) : sourceDataForItem,
+                          let full = UIImage(data: diskBytes) {
                     mapDisplay = OverlayMapBake.bakeMercatorDisplayTextureForBrowse(source: full, corners: corners) ?? full
                 } else {
                     continue
@@ -715,7 +732,9 @@ enum OverlayLibrary {
                     corners: corners,
                     placementCamera: placement,
                     preservedSourceFileData: nil,
-                    sourceRasterData: sourceData,
+                    sourceImagePreWrittenToDisk: fileBackedSource,
+                    cachedSourceRasterPixels: fileBackedSource ? sourcePixels : nil,
+                    sourceRasterData: sourceDataForItem,
                     tilePyramid: tilePyramidRuntime
                 )
             )
@@ -773,8 +792,12 @@ enum OverlayLibrary {
                     print("[TileDiag] persistedSourceAudit[\(index)] id=nil sortOrder=\(row.sortOrder) skipped=missingUUID")
                     continue
                 }
-                guard let sourceData = row.sourceImageData else {
-                    print("[TileDiag] persistedSourceAudit[\(index)] id=\(idLabel) sortOrder=\(row.sortOrder) skipped=missingSource")
+                guard hasPersistedSource(row: row, overlayID: id) else {
+                    print("[TileDiag] persistedSourceAudit[\(index)] id=\(idLabel) sortOrder=\(row.sortOrder) skipped=missingSource onDisk=\(row.sourceImageOnDisk)")
+                    continue
+                }
+                guard let sourceData = persistedSourceImageData(row: row, overlayID: id) else {
+                    print("[TileDiag] persistedSourceAudit[\(index)] id=\(idLabel) sortOrder=\(row.sortOrder) skipped=missingSourceBytes onDisk=\(row.sourceImageOnDisk)")
                     continue
                 }
                 guard let sourcePixels = UIImage.logRasterPixelCount(forCompressedImageData: sourceData) else {
@@ -825,7 +848,7 @@ enum OverlayLibrary {
                 }
                 let hasValidRange = row.tileMaximumZoomFull > row.tileMaximumZoom
                 let hasRevision = row.tilePyramidRevision > 0
-                let hasSource = row.sourceImageData != nil
+                let hasSource = hasPersistedSource(row: row, overlayID: id)
                 let hasCorners = decodeCorners(from: row.cornersJSON ?? "")?.count == 4
                 let hasBaked = bakedImageDataFromDisk(id: id) != nil
                 if hasValidRange, hasRevision, hasSource, hasCorners, hasBaked {
@@ -865,7 +888,7 @@ enum OverlayLibrary {
             var pyramidJobs: [UUID: Int64] = [:]
             for row in rows {
                 guard let id = row.uuid,
-                      let source = row.sourceImageData,
+                      let source = persistedSourceImageData(row: row, overlayID: id),
                       let corners = decodeCorners(from: row.cornersJSON ?? ""),
                       corners.count == 4,
                       bakedImageDataFromDisk(id: id) != nil else { continue }
@@ -942,9 +965,6 @@ enum OverlayLibrary {
                 SnapMemoryInstrumentation.checkpoint("persist.bg.beforeContextSave pyramidJobKeys=\(pyramidJobs.count)")
                 try context.save()
                 success = true
-                for overlay in snapshot where overlay.sourceImagePreWrittenToDisk {
-                    removeStagedSourceImageFromDisk(id: overlay.id)
-                }
                 context.reset()
                 SnapMemoryInstrumentation.checkpoint("persist.bg.afterContextSave pyramidJobKeys=\(pyramidJobs.count)")
 
@@ -984,13 +1004,78 @@ enum OverlayLibrary {
         try encodeBakedImage(image)
     }
 
-    /// Stage source bytes on disk during save draft so **`persist`** does not hold a second in-memory copy alongside **`OverlayItem.sourceRasterData`**.
+    /// Writes source bytes to Application Support during save draft; **`persist`** sets metadata only (no Core Data blob).
     static func persistSourceImageToDiskDuringSaveDraft(_ data: Data, overlayID: UUID) -> Bool {
         guard !data.isEmpty else { return false }
         return (try? autoreleasepool {
-            try writeStagedSourceImageDataToDisk(data, id: overlayID)
-            return stagedSourceImageExistsOnDisk(id: overlayID)
+            try writeSourceImageDataToDisk(data, id: overlayID)
+            return sourceImageExistsOnDisk(id: overlayID)
         }) ?? false
+    }
+
+    /// Heavy overlays: memory-mapped source bytes from Application Support (fallback when **`OverlayItem.sourceRasterData`** is nil).
+    static func persistedSourceRasterData(overlayID: UUID) -> Data? {
+        guard sourceImageExistsOnDisk(id: overlayID) else { return nil }
+        return sourceImageDataFromDisk(id: overlayID)
+    }
+
+    private static func hasPersistedSource(row: StoredMapOverlay, overlayID: UUID) -> Bool {
+        if sourceImageExistsOnDisk(id: overlayID) { return true }
+        if let data = row.sourceImageData, !data.isEmpty { return true }
+        return false
+    }
+
+    private static func persistedSourceImageData(row: StoredMapOverlay, overlayID: UUID) -> Data? {
+        if row.sourceImageOnDisk, let disk = sourceImageDataFromDisk(id: overlayID) {
+            return disk
+        }
+        if let inline = row.sourceImageData, !inline.isEmpty {
+            return inline
+        }
+        return sourceImageDataFromDisk(id: overlayID)
+    }
+
+    private static func persistSourceImage(for overlay: OverlayItem, to row: StoredMapOverlay) throws {
+        let id = overlay.id
+            if overlay.sourceImagePreWrittenToDisk, sourceImageExistsOnDisk(id: id) {
+                row.sourceImageOnDisk = true
+                row.sourceImageData = nil
+                print("[TileDiag] persist.sourceFileBacked id=\(id.uuidString.prefix(8)) preWritten=true")
+                return
+            }
+
+            if sourceImageExistsOnDisk(id: id), overlay.sourceRasterData == nil, overlay.cachedSourceRasterPixels != nil {
+                row.sourceImageOnDisk = true
+                row.sourceImageData = nil
+                print("[TileDiag] persist.sourceFileBacked id=\(id.uuidString.prefix(8)) existingDisk=true")
+                return
+            }
+
+        let bytes: Data
+        if let preserved = overlay.preservedSourceFileData {
+            bytes = preserved
+        } else if let rd = overlay.sourceRasterData, !rd.isEmpty {
+            bytes = rd
+        } else {
+            bytes = try autoreleasepool {
+                try Self.encodeSourceImage(overlay.sourceImage)
+            }
+        }
+
+        let pixelCount = overlay.cachedSourceRasterPixels
+            ?? UIImage.rasterPixelCount(forCompressedImageData: bytes)
+            ?? 0
+        let fileBacked = pixelCount > largeRasterOverlayPixelThresholdExclusive
+
+        if fileBacked {
+            try writeSourceImageDataToDisk(bytes, id: id)
+            row.sourceImageOnDisk = true
+            row.sourceImageData = nil
+            print("[TileDiag] persist.sourceFileBacked id=\(id.uuidString.prefix(8)) bytes=\(bytes.count)")
+        } else {
+            row.sourceImageOnDisk = false
+            row.sourceImageData = bytes
+        }
     }
 
     /// Bake + encode + disk write on a background thread during save draft; returns **`true`** when readable on disk.
@@ -1145,7 +1230,7 @@ enum OverlayLibrary {
         for row in existing {
             guard let id = row.uuid, !active.contains(id) else { continue }
             removeBakedImageFromDisk(id: id)
-            removeStagedSourceImageFromDisk(id: id)
+            removeSourceImageFromDisk(id: id)
             removeTilePyramidFolderFromDisk(id: id)
             context.delete(row)
             byId.removeValue(forKey: id)
@@ -1179,50 +1264,24 @@ enum OverlayLibrary {
 
             // Source bytes only when missing or forced — **not** when only corners/camera change (_pixels unchanged).
             // Baked mercator texture depends on **quad corners** only; **`placementCamera`** is map framing metadata and must not force a baked HEIC re-encode (that was making “cancel” / placement-only saves as slow as a full bake).
-            let needsSourceWrite = forceRewriteSource || row.sourceImageData == nil
+            let needsSourceWrite = forceRewriteSource || !hasPersistedSource(row: row, overlayID: o.id)
             let bakedContentChanged = forceRewriteBaked || cornersChanged || !bakedImageExistsOnDisk(id: o.id)
             let needsBakedWrite = bakedContentChanged && !o.bakedImagePreWrittenToDisk
 
-            let sourceBlob: Data?
             let bakedBlob: Data?
             switch (needsSourceWrite, needsBakedWrite) {
             case (true, true):
-                if o.sourceImagePreWrittenToDisk, let staged = stagedSourceImageDataFromDisk(id: o.id) {
-                    sourceBlob = staged
-                } else if let preserved = o.preservedSourceFileData {
-                    sourceBlob = preserved
-                } else if let rd = o.sourceRasterData, !rd.isEmpty {
-                    sourceBlob = rd
-                } else {
-                    sourceBlob = try autoreleasepool {
-                        try Self.encodeSourceImage(o.sourceImage)
-                    }
-                }
+                try persistSourceImage(for: o, to: row)
                 bakedBlob = try bakedBlobForPersist(from: o)
             case (true, false):
-                if o.sourceImagePreWrittenToDisk, let staged = stagedSourceImageDataFromDisk(id: o.id) {
-                    sourceBlob = staged
-                } else if let preserved = o.preservedSourceFileData {
-                    sourceBlob = preserved
-                } else if let rd = o.sourceRasterData, !rd.isEmpty {
-                    sourceBlob = rd
-                } else {
-                    sourceBlob = try autoreleasepool {
-                        try Self.encodeSourceImage(o.sourceImage)
-                    }
-                }
+                try persistSourceImage(for: o, to: row)
                 bakedBlob = nil
             case (false, true):
-                sourceBlob = nil
                 bakedBlob = try bakedBlobForPersist(from: o)
             case (false, false):
-                sourceBlob = nil
                 bakedBlob = nil
             }
 
-            if let sourceBlob {
-                row.sourceImageData = sourceBlob
-            }
             if let bakedBlob {
                 writeBakedImageDataToDisk(bakedBlob, id: o.id)
             }
@@ -1267,7 +1326,7 @@ enum OverlayLibrary {
                 guard let id = row.uuid,
                       row.tilePyramidRevision > 0,
                       !row.tileRefinementInProgress,
-                      let source = row.sourceImageData,
+                      let source = persistedSourceImageData(row: row, overlayID: id),
                       let corners = decodeCorners(from: row.cornersJSON ?? ""),
                       corners.count == 4,
                       let bakedBlob = bakedImageDataFromDisk(id: id),
@@ -1336,7 +1395,7 @@ enum OverlayLibrary {
                     OverlaySaveTransitionLog.stage("minZ.generation.aborted", overlayID: overlayID, extra: "revisionMismatch")
                     return
                 }
-                guard let source = row.sourceImageData else {
+                guard let source = persistedSourceImageData(row: row, overlayID: overlayID) else {
                     OverlaySaveTransitionLog.stage("minZ.generation.aborted", overlayID: overlayID, extra: "missingSource")
                     return
                 }
@@ -1406,7 +1465,7 @@ enum OverlayLibrary {
                         )
                         return
                     }
-                    guard let source = row.sourceImageData else {
+                    guard let source = persistedSourceImageData(row: row, overlayID: job.id) else {
                         print("[TileDiag] pyramid.skipRefine id=\(job.id.uuidString.prefix(8))… rev=\(job.revision) reason=missingSource")
                         return
                     }
@@ -1472,7 +1531,7 @@ enum OverlayLibrary {
                     fr.predicate = NSPredicate(format: "uuid == %@", job.id as CVarArg)
                     guard let row = try? context.fetch(fr).first,
                           row.tilePyramidRevision == job.revision,
-                          let source = row.sourceImageData,
+                          let source = persistedSourceImageData(row: row, overlayID: job.id),
                           let corners = decodeCorners(from: row.cornersJSON ?? ""),
                           corners.count == 4,
                           let bakedBlob = bakedImageDataFromDisk(id: job.id),
@@ -1593,32 +1652,32 @@ enum OverlayLibrary {
         try? FileManager.default.removeItem(at: url)
     }
 
-    private static func stagedSourceImagesDirectoryURL() -> URL {
+    private static func sourceImagesDirectoryURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent(sourceImageStagingDirectoryName, isDirectory: true)
+        return base.appendingPathComponent(sourceImagesDirectoryName, isDirectory: true)
     }
 
-    private static func stagedSourceImageFileURL(id: UUID) -> URL {
-        stagedSourceImagesDirectoryURL().appendingPathComponent("\(id.uuidString).bin", isDirectory: false)
+    private static func sourceImageFileURL(id: UUID) -> URL {
+        sourceImagesDirectoryURL().appendingPathComponent("\(id.uuidString).bin", isDirectory: false)
     }
 
-    private static func stagedSourceImageDataFromDisk(id: UUID) -> Data? {
-        try? Data(contentsOf: stagedSourceImageFileURL(id: id), options: .mappedIfSafe)
+    private static func sourceImageDataFromDisk(id: UUID) -> Data? {
+        try? Data(contentsOf: sourceImageFileURL(id: id), options: .mappedIfSafe)
     }
 
-    private static func stagedSourceImageExistsOnDisk(id: UUID) -> Bool {
-        FileManager.default.fileExists(atPath: stagedSourceImageFileURL(id: id).path)
+    private static func sourceImageExistsOnDisk(id: UUID) -> Bool {
+        FileManager.default.fileExists(atPath: sourceImageFileURL(id: id).path)
     }
 
-    private static func writeStagedSourceImageDataToDisk(_ data: Data, id: UUID) throws {
+    private static func writeSourceImageDataToDisk(_ data: Data, id: UUID) throws {
         let fm = FileManager.default
-        let dir = stagedSourceImagesDirectoryURL()
+        let dir = sourceImagesDirectoryURL()
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        try data.write(to: stagedSourceImageFileURL(id: id), options: .atomic)
+        try data.write(to: sourceImageFileURL(id: id), options: .atomic)
     }
 
-    private static func removeStagedSourceImageFromDisk(id: UUID) {
-        let url = stagedSourceImageFileURL(id: id)
+    private static func removeSourceImageFromDisk(id: UUID) {
+        let url = sourceImageFileURL(id: id)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         try? FileManager.default.removeItem(at: url)
     }
