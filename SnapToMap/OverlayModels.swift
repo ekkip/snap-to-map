@@ -80,6 +80,10 @@ struct OverlayItem: Identifiable {
     var preservedSourceFileData: Data?
     /// Set when save draft already wrote derived baked HEIC to disk; **`persist`** skips re-encode.
     var bakedImagePreWrittenToDisk: Bool = false
+    /// Set when save draft staged source bytes on disk; **`persist`** reads staging and **`sourceRasterData`** may be **`nil`** to avoid duplicate RSS during **`context.save()`**.
+    var sourceImagePreWrittenToDisk: Bool = false
+    /// Pixel count when **`sourceRasterData`** is omitted after staging (heavy overlay save draft).
+    let cachedSourceRasterPixels: Int64?
     /// Compressed source raster (**JPEG** / **HEIC** …) for **`ImageIO`** subsampled tile draws on huge overlays; avoids decoding the full bitmap while zoomed in.
     let sourceRasterData: Data?
     /// Present after **`OverlayTilePyramidBuilder`** completes; **`nil`** uses lazy **`TileCache`** rasterizing until pyramid metadata arrives from persistence reload.
@@ -93,6 +97,8 @@ struct OverlayItem: Identifiable {
         placementCamera: PersistedMapCamera?,
         preservedSourceFileData: Data? = nil,
         bakedImagePreWrittenToDisk: Bool = false,
+        sourceImagePreWrittenToDisk: Bool = false,
+        cachedSourceRasterPixels: Int64? = nil,
         sourceRasterData: Data? = nil,
         tilePyramid: OverlayTilePyramidRuntimeInfo? = nil
     ) {
@@ -100,7 +106,10 @@ struct OverlayItem: Identifiable {
         self.sourceImage = sourceImage
         self.mapDisplayImage = mapDisplayImage
         self.bakedImagePreWrittenToDisk = bakedImagePreWrittenToDisk
+        self.sourceImagePreWrittenToDisk = sourceImagePreWrittenToDisk
+        self.cachedSourceRasterPixels = cachedSourceRasterPixels
         let tiledPixels: Int64 = {
+            if let cachedSourceRasterPixels { return cachedSourceRasterPixels }
             if let data = sourceRasterData, !data.isEmpty,
                let n = UIImage.rasterPixelCount(forCompressedImageData: data) {
                 return n

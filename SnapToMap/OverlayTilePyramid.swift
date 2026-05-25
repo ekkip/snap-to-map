@@ -121,6 +121,9 @@ enum OverlayTilePyramidBuilder {
         }
     }
 
+    /// Extra minZ cells written around the bbox intersection so first mount at overview zoom avoids MapKit neighbor misses.
+    private static let minZOverviewNeighborhoodPadTiles = 1
+
     /// Builds **only** the minZ overview tile, persists progressive pyramid metadata, and returns quickly.
     static func buildMinZOverviewAndPersistRow(
         overlayID: UUID,
@@ -196,18 +199,20 @@ enum OverlayTilePyramidBuilder {
             mapBoundingRect: bbox,
             z: minZ,
             geometryFlipped: geometryFlipped,
-            padTiles: 0
+            padTiles: minZOverviewNeighborhoodPadTiles
         ) else {
             print("[TileDiag] build.minZ.abort id=\(overlayTag) no intersecting cell at minZ=\(minZ)")
             return
         }
 
-        for x in xy.x0...xy.x1 {
-            let dir = OverlayLibrary.tileDataFileURL(
-                pyramidRoot: root,
-                path: MKTileOverlayPath(x: x, y: xy.y0, z: minZ, contentScaleFactor: normalizedContentScale)
-            ).deletingLastPathComponent()
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        for y in xy.y0...xy.y1 {
+            for x in xy.x0...xy.x1 {
+                let dir = OverlayLibrary.tileDataFileURL(
+                    pyramidRoot: root,
+                    path: MKTileOverlayPath(x: x, y: y, z: minZ, contentScaleFactor: normalizedContentScale)
+                ).deletingLastPathComponent()
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
         }
 
         var written = 0
@@ -222,8 +227,18 @@ enum OverlayTilePyramidBuilder {
                     let path = MKTileOverlayPath(x: x, y: y, z: minZ, contentScaleFactor: normalizedContentScale)
                     let tileRect = BakedImageMapTileOverlay.mercatorMapRectForOfflinePyramid(path: path, geometryFlipped: geometryFlipped)
                     let clipped = bbox.intersection(tileRect)
-                    guard !clipped.isNull, !clipped.isEmpty else { return }
                     let url = OverlayLibrary.tileDataFileURL(pyramidRoot: root, path: path)
+
+                    if clipped.isNull || clipped.isEmpty {
+                        guard let data = OverlayLibrary.transparentTileHEIFData(
+                            logicalTileSize: tileSize,
+                            contentScale: normalizedContentScale
+                        ) else { return }
+                        try OverlayLibrary.atomicWriteTileData(data, to: url)
+                        written += 1
+                        print("[TileDiag] build.minZ.transparentNeighbor id=\(overlayTag) z=\(minZ) x=\(x) y=\(y)")
+                        return
+                    }
 
                     // minZ overview: baked mercator is sufficient and avoids a full intrinsic Metal session.
                     if let data = OverlayTileRenderer.mercatorTileHEIFDataFromBakedFallback(
@@ -285,7 +300,7 @@ enum OverlayTilePyramidBuilder {
 
         print("[TileDiag] build.minZ.end id=\(overlayTag) rev=\(revision) minZ=\(minZ) maxZ=\(maxZ) written=\(written)")
         OverlaySaveTransitionLog.stage("minZ.build.end", overlayID: overlayID, extra: "written=\(written)")
-        notifyPyramidAvailability(overlayID: overlayID)
+        // Save transition UI listens to `.overlayTilePyramidMinZReady` only — skip refinement notification to avoid double `loadOverlays`.
         DispatchQueue.main.async {
             NotificationCenter.default.post(
                 name: .overlayTilePyramidMinZReady,
@@ -1070,6 +1085,9 @@ final class OverlayTileRuntimeScheduler {
     }
     private var saveTransitionPrewarmRecovery: [UUID: SaveTransitionPrewarmRecovery] = [:]
     private static let saveTransitionChunkPrewarmCap = 6
+    private static let normalPrewarmPendingQueueCap = 72
+    private static let bakedFallbackMaxZOffsetFromMinZ = 1
+    private static let saveTransitionBakedFallbackMaxZOffsetFromMinZ = 2
     /// Tracks overlays that had active work so we can detect idle transitions.
     private var overlayHadActiveWork: Set<UUID> = []
 
@@ -1367,6 +1385,14 @@ final class OverlayTileRuntimeScheduler {
         let overlayPrewarm = prewarmRect.intersection(ctx.bbox)
         guard !overlayPrewarm.isNull, !overlayPrewarm.isEmpty else { return }
 
+        var prewarmBudget: Int? = recovery == nil
+            ? max(0, Self.normalPrewarmPendingQueueCap - pendingJobs.count)
+            : nil
+        if let prewarmBudget, prewarmBudget == 0 {
+            print("[TileProg] prewarm.queueCap id=\(overlayID.uuidString.prefix(8)) queue=\(pendingJobs.count) cap=\(Self.normalPrewarmPendingQueueCap)")
+            return
+        }
+
         let recoveryLabel = recovery.map { phase -> String in
             switch phase {
             case .outputOnly: return "outputOnly"
@@ -1387,6 +1413,10 @@ final class OverlayTileRuntimeScheduler {
             }
         }()
         if chunkCap != 0 {
+            let chunkLimit: Int? = {
+                if let chunkCap, let prewarmBudget { return min(chunkCap, prewarmBudget) }
+                return chunkCap
+            }()
             let chunksEnqueued = enqueueMissingSourceChunkJobs(
                 overlayID: overlayID,
                 viewport: viewport,
@@ -1394,16 +1424,20 @@ final class OverlayTileRuntimeScheduler {
                 overlayPrewarm: overlayPrewarm,
                 targetWarmZ: targetWarmZ,
                 zc: zc,
-                maxEnqueue: chunkCap
+                maxEnqueue: chunkLimit
             )
+            if prewarmBudget != nil {
+                prewarmBudget = max(0, prewarmBudget! - chunksEnqueued)
+            }
             if recovery == .chunkWaves, chunksEnqueued > 0 {
                 print("[TileProg] saveTransition.chunkWave id=\(overlayID.uuidString.prefix(8)) enqueued=\(chunksEnqueued) cap=\(Self.saveTransitionChunkPrewarmCap)")
             }
         }
 
-        if zc + 1 <= ctx.maxZ {
+        if zc + 1 <= ctx.maxZ, prewarmBudget != 0 {
             let tiles = outputTileCoords(intersecting: overlayPrewarm, z: zc + 1, geometryFlipped: ctx.geometryFlipped)
             for t in tiles {
+                if let prewarmBudget, prewarmBudget <= 0 { break }
                 if tileExists(context: ctx, z: zc + 1, x: t.x, y: t.y) { continue }
                 let scale100 = Int((ctx.tileContentScale * 100).rounded())
                 let key = OverlayTileCoordinateKey(
@@ -1422,13 +1456,18 @@ final class OverlayTileRuntimeScheduler {
                     kind: .outputTile(z: zc + 1, x: t.x, y: t.y, scale100: Int((ctx.tileContentScale * 100).rounded())),
                     viewportEpoch: viewport.epoch
                 ))
+                if prewarmBudget != nil {
+                    prewarmBudget! -= 1
+                }
             }
         }
 
         guard recovery == nil else { return }
+        if prewarmBudget == 0 { return }
 
         let comfortDepth = ctx.config.earlyComfortDepth
         for dz in 1...comfortDepth {
+            if prewarmBudget == 0 { break }
             let z = zc + dz
             guard z <= ctx.maxZ else { break }
             let cells = outputTileCoords(intersecting: ctx.bbox, z: z, geometryFlipped: ctx.geometryFlipped)
@@ -1441,8 +1480,20 @@ final class OverlayTileRuntimeScheduler {
                     kind: .cheapFullLevel(z: z),
                     viewportEpoch: viewport.epoch
                 ))
+                if prewarmBudget != nil {
+                    prewarmBudget! -= 1
+                }
             }
         }
+    }
+
+    private func preferBakedFallbackFirst(for ctx: OverlayContext, z: Int) -> Bool {
+        if z <= ctx.minZ + Self.bakedFallbackMaxZOffsetFromMinZ { return true }
+        if saveTransitionPrewarmRecovery[ctx.overlayID] != nil,
+           z <= ctx.minZ + Self.saveTransitionBakedFallbackMaxZOffsetFromMinZ {
+            return true
+        }
+        return false
     }
 
     @discardableResult
@@ -1760,6 +1811,7 @@ final class OverlayTileRuntimeScheduler {
                 y: y,
                 contentScale: scale,
                 priority: job.priority,
+                preferBakedFallbackFirst: preferBakedFallbackFirst(for: ctx, z: z),
                 completion: finish
             )
         case let .cheapFullLevel(z):
@@ -1815,7 +1867,8 @@ final class OverlayTileRuntimeScheduler {
                     x: cell.x,
                     y: cell.y,
                     contentScale: ctx.tileContentScale,
-                    priority: .cheapFullLevel
+                    priority: .cheapFullLevel,
+                    preferBakedFallbackFirst: self.preferBakedFallbackFirst(for: ctx, z: z)
                 ) { sem.signal() }
                 sem.wait()
             }
@@ -1830,6 +1883,7 @@ final class OverlayTileRuntimeScheduler {
         y: Int,
         contentScale: CGFloat,
         priority: JobPriority,
+        preferBakedFallbackFirst: Bool = false,
         completion: @escaping () -> Void
     ) {
         DispatchQueue.global(qos: priority == .visibleExactTile ? .userInitiated : .utility).async {
@@ -1856,6 +1910,51 @@ final class OverlayTileRuntimeScheduler {
                         self.tileStates[tileKey] = .failed
                     }
                     print("[TileProg] tileGen.emptyClip id=\(ctx.overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y)")
+                    return
+                }
+
+                let bakedCG = OverlayMapBake.normalizedCGImage(from: ctx.bakedFallback)
+                if preferBakedFallbackFirst,
+                   let data = OverlayTileRenderer.mercatorTileHEIFDataFromBakedFallback(
+                    bakedFallbackCG: bakedCG,
+                    tileRect: tileRect,
+                    bbox: ctx.bbox,
+                    clipped: clipped,
+                    tileSize: OverlayLibrary.logicalTileSize,
+                    scale: contentScale
+                   ) {
+                    let url = OverlayLibrary.tileDataFileURL(pyramidRoot: ctx.pyramidRoot, path: path)
+                    do {
+                        try OverlayLibrary.atomicWriteTileData(data, to: url)
+                    } catch {
+                        self.queue.async {
+                            self.inFlightOutputTiles.remove(tileKey)
+                            self.tileStates[tileKey] = .failed
+                        }
+                        print("[TileProg] tileGen.writeFail id=\(ctx.overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) error=\(error)")
+                        return
+                    }
+                    let elapsed = CFAbsoluteTimeGetCurrent() - started
+                    print("[TileProg] tileGen.bakedFallback id=\(ctx.overlayID.uuidString.prefix(8)) z=\(z) x=\(x) y=\(y) duration=\(String(format: "%.2f", elapsed))s")
+                    self.queue.async {
+                        self.inFlightOutputTiles.remove(tileKey)
+                        self.tileStates[tileKey] = .ready
+                    }
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(
+                            name: .overlayProgressiveTilesDidUpdate,
+                            object: nil,
+                            userInfo: [
+                                "overlayID": ctx.overlayID.uuidString,
+                                "revision": ctx.revision,
+                                "z": z,
+                                "x": x,
+                                "y": y,
+                                "scale100": tileKey.scale100,
+                                "queueIdle": false,
+                            ]
+                        )
+                    }
                     return
                 }
 
@@ -1892,7 +1991,6 @@ final class OverlayTileRuntimeScheduler {
                     return
                 }
 
-                let bakedCG = OverlayMapBake.normalizedCGImage(from: ctx.bakedFallback)
                 let request = OverlayTileRenderer.SourceTileRequest(
                     sourceRaster: ctx.sourceRaster,
                     corners: ctx.corners,

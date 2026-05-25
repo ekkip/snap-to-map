@@ -37,6 +37,8 @@ struct ContentView: View {
     @State private var draftSourceExceedsLargeOverlayThreshold = false
     /// Nested saves bump this (e.g. rapid actions); indicator stays until all complete.
     @State private var overlayPersistenceInFlight: Int = 0
+    /// Coalesces back-to-back `restorePersistedOverlay()` calls (e.g. refinement + minZ notifications).
+    @State private var restorePersistedOverlayToken: UInt64 = 0
     /// Debug-only current pyramid iteration z while background build is running.
     @State private var debugPyramidIterationZoomLevel: Int?
     /// Debug-only in-level progress x/L for current pyramid zoom level.
@@ -222,7 +224,7 @@ struct ContentView: View {
                 guard let idString = note.userInfo?["overlayID"] as? String,
                       let id = UUID(uuidString: idString),
                       let mapView = mapBridge.mapView else { return }
-                restorePersistedOverlay()
+                loadOverlaysFromStoreSync()
                 guard let item = overlays.first(where: { $0.id == id }) else { return }
                 OverlaySaveTransitionLog.stage("overlay.displayed", overlayID: id)
                 let targetRect = mapRect(for: item.corners)
@@ -714,6 +716,13 @@ struct ContentView: View {
         Task {
             SnapMemoryInstrumentation.checkpoint("saveDraft.Task.begin overlayID=\(overlayID.uuidString.prefix(8))…")
             let rasterBytesForBake = preservedPick ?? editingOverlayBackup?.sourceRasterData
+            let rasterBytes = preservedPick ?? editingOverlayBackup?.sourceRasterData
+            let intrinsicPixels: Int64 = {
+                if let rasterBytes, let px = UIImage.rasterPixelCount(forCompressedImageData: rasterBytes) {
+                    return px
+                }
+                return draftImage.rasterPixelCount()
+            }()
             let bakedPreWritten = await Task.detached(priority: .userInitiated) {
                 let mapDisplayImage: UIImage
                 if let rasterBytesForBake,
@@ -726,7 +735,14 @@ struct ContentView: View {
                 }
                 return OverlayLibrary.persistBakedImageToDiskDuringSaveDraft(mapDisplayImage, overlayID: overlayID)
             }.value
-            SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))… preWritten=\(bakedPreWritten)")
+            let sourcePreWritten: Bool = {
+                guard let rasterBytes, !rasterBytes.isEmpty else { return false }
+                return OverlayLibrary.persistSourceImageToDiskDuringSaveDraft(rasterBytes, overlayID: overlayID)
+            }()
+            SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))… preWritten=\(bakedPreWritten) sourcePreWritten=\(sourcePreWritten)")
+            let sourceImageForModel = intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive && rasterBytes != nil
+                ? OverlayItem.browseSourceMemoryPlaceholder()
+                : draftImage
             await MainActor.run {
                 self.warpedDraftUpdateTask?.cancel()
                 self.warpedDraftCGImage = nil
@@ -742,16 +758,6 @@ struct ContentView: View {
                 OverlayMetalTilePipeline.clearSessionCache()
             }
             let placementCamera = await MainActor.run { persistMapCameraSnapshot() }
-            let rasterBytes = preservedPick ?? editingOverlayBackup?.sourceRasterData
-            let intrinsicPixels: Int64 = {
-                if let rasterBytes, let px = UIImage.rasterPixelCount(forCompressedImageData: rasterBytes) {
-                    return px
-                }
-                return draftImage.rasterPixelCount()
-            }()
-            let sourceImageForModel = intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive && rasterBytes != nil
-                ? OverlayItem.browseSourceMemoryPlaceholder()
-                : draftImage
             let pendingPyramid: OverlayTilePyramidRuntimeInfo? =
                 intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive
                 ? OverlayTilePyramidRuntimeInfo(
@@ -781,7 +787,9 @@ struct ContentView: View {
                         placementCamera: placementCamera,
                         preservedSourceFileData: preservedPick,
                         bakedImagePreWrittenToDisk: bakedPreWritten,
-                        sourceRasterData: rasterBytes,
+                        sourceImagePreWrittenToDisk: sourcePreWritten,
+                        cachedSourceRasterPixels: sourcePreWritten ? intrinsicPixels : nil,
+                        sourceRasterData: sourcePreWritten ? nil : rasterBytes,
                         tilePyramid: pendingPyramid
                     )
                 )
@@ -975,12 +983,22 @@ struct ContentView: View {
         }
     }
 
-    private func restorePersistedOverlay() {
+    private func loadOverlaysFromStoreSync() {
         isEditing = false
         do {
             overlays = try OverlayLibrary.loadOverlays(viewContext: persistence.container.viewContext)
         } catch {
             overlays = []
+        }
+    }
+
+    private func restorePersistedOverlay() {
+        restorePersistedOverlayToken &+= 1
+        let token = restorePersistedOverlayToken
+        Task { @MainActor in
+            await Task.yield()
+            guard token == restorePersistedOverlayToken else { return }
+            loadOverlaysFromStoreSync()
         }
     }
 
