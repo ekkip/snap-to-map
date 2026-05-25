@@ -121,9 +121,6 @@ enum OverlayTilePyramidBuilder {
         }
     }
 
-    /// Extra minZ cells written around the bbox intersection so first mount at overview zoom avoids MapKit neighbor misses.
-    private static let minZOverviewNeighborhoodPadTiles = 1
-
     /// Builds **only** the minZ overview tile, persists progressive pyramid metadata, and returns quickly.
     static func buildMinZOverviewAndPersistRow(
         overlayID: UUID,
@@ -195,94 +192,83 @@ enum OverlayTilePyramidBuilder {
         OverlaySaveTransitionLog.stage("minZ.build.begin", overlayID: overlayID, extra: "minZ=\(minZ) maxZ=\(maxZ)")
 
         let tileSize = OverlayLibrary.logicalTileSize
-        guard let xy = intersectingTileIndexBounds(
+        let minZCells = contentBearingTileCells(
             mapBoundingRect: bbox,
             z: minZ,
-            geometryFlipped: geometryFlipped,
-            padTiles: minZOverviewNeighborhoodPadTiles
-        ) else {
+            geometryFlipped: geometryFlipped
+        )
+        guard !minZCells.isEmpty else {
             print("[TileDiag] build.minZ.abort id=\(overlayTag) no intersecting cell at minZ=\(minZ)")
             return
         }
 
-        for y in xy.y0...xy.y1 {
-            for x in xy.x0...xy.x1 {
-                let dir = OverlayLibrary.tileDataFileURL(
-                    pyramidRoot: root,
-                    path: MKTileOverlayPath(x: x, y: y, z: minZ, contentScaleFactor: normalizedContentScale)
-                ).deletingLastPathComponent()
-                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            }
+        for cell in minZCells {
+            let dir = OverlayLibrary.tileDataFileURL(
+                pyramidRoot: root,
+                path: MKTileOverlayPath(x: cell.x, y: cell.y, z: minZ, contentScaleFactor: normalizedContentScale)
+            ).deletingLastPathComponent()
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
 
         var written = 0
         var buildAborted = false
-        outer: for y in xy.y0...xy.y1 {
-            for x in xy.x0...xy.x1 {
-                guard OverlayLibrary.isCurrentPyramidBuildRevision(overlayID, revision: revision) else {
-                    buildAborted = true
-                    break outer
-                }
-                try autoreleasepool {
-                    let path = MKTileOverlayPath(x: x, y: y, z: minZ, contentScaleFactor: normalizedContentScale)
-                    let tileRect = BakedImageMapTileOverlay.mercatorMapRectForOfflinePyramid(path: path, geometryFlipped: geometryFlipped)
-                    let clipped = bbox.intersection(tileRect)
-                    let url = OverlayLibrary.tileDataFileURL(pyramidRoot: root, path: path)
+        for cell in minZCells {
+            guard OverlayLibrary.isCurrentPyramidBuildRevision(overlayID, revision: revision) else {
+                buildAborted = true
+                break
+            }
+            let x = cell.x
+            let y = cell.y
+            try autoreleasepool {
+                let path = MKTileOverlayPath(x: x, y: y, z: minZ, contentScaleFactor: normalizedContentScale)
+                let tileRect = BakedImageMapTileOverlay.mercatorMapRectForOfflinePyramid(path: path, geometryFlipped: geometryFlipped)
+                let clipped = bbox.intersection(tileRect)
+                let url = OverlayLibrary.tileDataFileURL(pyramidRoot: root, path: path)
 
-                    if clipped.isNull || clipped.isEmpty {
-                        guard let data = OverlayLibrary.transparentTileHEIFData(
-                            logicalTileSize: tileSize,
-                            contentScale: normalizedContentScale
-                        ) else { return }
-                        try OverlayLibrary.atomicWriteTileData(data, to: url)
-                        written += 1
-                        print("[TileDiag] build.minZ.transparentNeighbor id=\(overlayTag) z=\(minZ) x=\(x) y=\(y)")
-                        return
-                    }
+                guard !clipped.isNull, !clipped.isEmpty else { return }
 
-                    // minZ overview: baked mercator is sufficient and avoids a full intrinsic Metal session.
-                    if let data = OverlayTileRenderer.mercatorTileHEIFDataFromBakedFallback(
-                        bakedFallbackCG: bakedFallbackCG,
-                        tileRect: tileRect,
-                        bbox: bbox,
-                        clipped: clipped,
-                        tileSize: tileSize,
-                        scale: normalizedContentScale
-                    ) {
-                        try OverlayLibrary.atomicWriteTileData(data, to: url)
-                        written += 1
-                        print("[TileDiag] build.minZ.bakedFallback id=\(overlayTag) z=\(minZ) x=\(x) y=\(y)")
-                        return
-                    }
-
-                    print("[TileDiag] build.minZ.metalFallback id=\(overlayTag) z=\(minZ) x=\(x) y=\(y)")
-                    let metalSourceSession = try OverlayMetalTilePipeline.sourceSession(
-                        sourceRaster: sourceRaster,
-                        corners: corners,
-                        mercatorPixelWidth: intrinsic.width,
-                        mercatorPixelHeight: intrinsic.height,
-                        cacheScope: thumbnailCacheScope
-                    )
-                    let sourceRequest = OverlayTileRenderer.SourceTileRequest(
-                        sourceRaster: sourceRaster,
-                        corners: corners,
-                        mercatorPixelWidth: intrinsic.width,
-                        mercatorPixelHeight: intrinsic.height,
-                        tileRect: tileRect,
-                        bbox: bbox,
-                        clipped: clipped,
-                        tileSize: tileSize,
-                        contentScale: normalizedContentScale,
-                        thumbnailCacheScope: thumbnailCacheScope,
-                        metalSourceSession: metalSourceSession,
-                        requestedZ: minZ,
-                        sourceZ: minZ
-                    )
-                    guard let data = OverlayTileRenderer.mercatorTileHEIFData(from: sourceRequest) else { return }
+                // minZ overview: baked mercator is sufficient and avoids a full intrinsic Metal session.
+                if let data = OverlayTileRenderer.mercatorTileHEIFDataFromBakedFallback(
+                    bakedFallbackCG: bakedFallbackCG,
+                    tileRect: tileRect,
+                    bbox: bbox,
+                    clipped: clipped,
+                    tileSize: tileSize,
+                    scale: normalizedContentScale
+                ) {
                     try OverlayLibrary.atomicWriteTileData(data, to: url)
                     written += 1
-                    OverlayMetalTilePipeline.clearSessionCache()
+                    print("[TileDiag] build.minZ.bakedFallback id=\(overlayTag) z=\(minZ) x=\(x) y=\(y)")
+                    return
                 }
+
+                print("[TileDiag] build.minZ.metalFallback id=\(overlayTag) z=\(minZ) x=\(x) y=\(y)")
+                let metalSourceSession = try OverlayMetalTilePipeline.sourceSession(
+                    sourceRaster: sourceRaster,
+                    corners: corners,
+                    mercatorPixelWidth: intrinsic.width,
+                    mercatorPixelHeight: intrinsic.height,
+                    cacheScope: thumbnailCacheScope
+                )
+                let sourceRequest = OverlayTileRenderer.SourceTileRequest(
+                    sourceRaster: sourceRaster,
+                    corners: corners,
+                    mercatorPixelWidth: intrinsic.width,
+                    mercatorPixelHeight: intrinsic.height,
+                    tileRect: tileRect,
+                    bbox: bbox,
+                    clipped: clipped,
+                    tileSize: tileSize,
+                    contentScale: normalizedContentScale,
+                    thumbnailCacheScope: thumbnailCacheScope,
+                    metalSourceSession: metalSourceSession,
+                    requestedZ: minZ,
+                    sourceZ: minZ
+                )
+                guard let data = OverlayTileRenderer.mercatorTileHEIFData(from: sourceRequest) else { return }
+                try OverlayLibrary.atomicWriteTileData(data, to: url)
+                written += 1
+                OverlayMetalTilePipeline.clearSessionCache()
             }
         }
         if buildAborted { return }
@@ -894,19 +880,47 @@ enum OverlayTilePyramidBuilder {
         return highest
     }
 
-    /// Inclusive tile cell count intersecting **`mapBoundingRect`** at zoom **`z`**.
+    /// Inclusive tile cell count with **non-empty** mercator intersection (ignores index-only boundary grazes).
     static func intersectingTileCellCount(
         mapBoundingRect bbox: MKMapRect,
         z: Int,
         geometryFlipped: Bool
     ) -> Int {
+        contentBearingTileCells(
+            mapBoundingRect: bbox,
+            z: z,
+            geometryFlipped: geometryFlipped
+        ).count
+    }
+
+    /// Tile **`(x,y)`** indices whose mercator cell intersects **`bbox`** with non-empty area.
+    static func contentBearingTileCells(
+        mapBoundingRect bbox: MKMapRect,
+        z: Int,
+        geometryFlipped: Bool
+    ) -> [(x: Int, y: Int)] {
         guard let xy = intersectingTileIndexBounds(
             mapBoundingRect: bbox,
             z: z,
             geometryFlipped: geometryFlipped,
             padTiles: 0
-        ) else { return 0 }
-        return (xy.x1 - xy.x0 + 1) * (xy.y1 - xy.y0 + 1)
+        ) else { return [] }
+        var cells: [(x: Int, y: Int)] = []
+        cells.reserveCapacity(max(1, (xy.x1 - xy.x0 + 1) * (xy.y1 - xy.y0 + 1)))
+        for y in xy.y0...xy.y1 {
+            for x in xy.x0...xy.x1 {
+                let path = MKTileOverlayPath(x: x, y: y, z: z, contentScaleFactor: 1)
+                let tileRect = BakedImageMapTileOverlay.mercatorMapRectForOfflinePyramid(
+                    path: path,
+                    geometryFlipped: geometryFlipped
+                )
+                let clipped = bbox.intersection(tileRect)
+                if !clipped.isNull, !clipped.isEmpty {
+                    cells.append((x: x, y: y))
+                }
+            }
+        }
+        return cells
     }
 
     private static func intrinsicPixelSize(from data: Data) -> (width: Int, height: Int)? {
@@ -1282,6 +1296,10 @@ final class OverlayTileRuntimeScheduler {
     ) {
         queue.async { [weak self] in
             guard let self, let ctx = self.contexts[overlayID] else { return }
+            guard path.z >= ctx.minZ else {
+                print("[TileProg] enqueue.belowMinZ id=\(overlayID.uuidString.prefix(8)) z=\(path.z) minZ=\(ctx.minZ)")
+                return
+            }
             let scale100 = Int((path.contentScaleFactor * 100).rounded())
             let key = OverlayTileCoordinateKey(
                 overlayID: overlayID,
@@ -1434,7 +1452,7 @@ final class OverlayTileRuntimeScheduler {
             }
         }
 
-        if zc + 1 <= ctx.maxZ, prewarmBudget != 0 {
+        if zc + 1 <= ctx.maxZ, zc + 1 >= ctx.minZ, prewarmBudget != 0 {
             let tiles = outputTileCoords(intersecting: overlayPrewarm, z: zc + 1, geometryFlipped: ctx.geometryFlipped)
             for t in tiles {
                 if let prewarmBudget, prewarmBudget <= 0 { break }
@@ -1469,7 +1487,7 @@ final class OverlayTileRuntimeScheduler {
         for dz in 1...comfortDepth {
             if prewarmBudget == 0 { break }
             let z = zc + dz
-            guard z <= ctx.maxZ else { break }
+            guard z <= ctx.maxZ, z >= ctx.minZ else { break }
             let cells = outputTileCoords(intersecting: ctx.bbox, z: z, geometryFlipped: ctx.geometryFlipped)
             if cells.count <= ctx.config.cheapLevelTileLimit {
                 if completedCheapLevels[overlayID]?.contains(z) == true { continue }
@@ -1842,6 +1860,10 @@ final class OverlayTileRuntimeScheduler {
         cells: [(x: Int, y: Int)],
         completion: @escaping () -> Void
     ) {
+        guard z >= ctx.minZ else {
+            completion()
+            return
+        }
         DispatchQueue.global(qos: .utility).async {
             defer { completion() }
             for cell in cells {
@@ -1898,6 +1920,10 @@ final class OverlayTileRuntimeScheduler {
         DispatchQueue.global(qos: priority == .visibleExactTile ? .userInitiated : .utility).async {
             defer { completion() }
             autoreleasepool {
+                guard z >= ctx.minZ else {
+                    print("[TileProg] tileGen.belowMinZ id=\(ctx.overlayID.uuidString.prefix(8)) z=\(z) minZ=\(ctx.minZ)")
+                    return
+                }
                 let started = CFAbsoluteTimeGetCurrent()
                 let path = MKTileOverlayPath(x: x, y: y, z: z, contentScaleFactor: contentScale)
                 if self.tileExists(context: ctx, z: z, x: x, y: y) {
