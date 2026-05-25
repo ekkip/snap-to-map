@@ -717,7 +717,7 @@ struct ContentView: View {
             SnapMemoryInstrumentation.checkpoint("saveDraft.Task.begin overlayID=\(overlayID.uuidString.prefix(8))…")
             let rasterBytesForBake = preservedPick
                 ?? editingOverlayBackup?.sourceRasterData
-                ?? OverlayLibrary.persistedSourceRasterData(overlayID: overlayID)
+                ?? OverlayLibrary.persistedSourceRasterData(overlayID: overlayID, container: persistence.container)
             let rasterBytes = rasterBytesForBake
             let intrinsicPixels: Int64 = {
                 if let rasterBytes, let px = UIImage.rasterPixelCount(forCompressedImageData: rasterBytes) {
@@ -737,11 +737,7 @@ struct ContentView: View {
                 }
                 return OverlayLibrary.persistBakedImageToDiskDuringSaveDraft(mapDisplayImage, overlayID: overlayID)
             }.value
-            let sourcePreWritten: Bool = {
-                guard let rasterBytes, !rasterBytes.isEmpty else { return false }
-                return OverlayLibrary.persistSourceImageToDiskDuringSaveDraft(rasterBytes, overlayID: overlayID)
-            }()
-            SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))… preWritten=\(bakedPreWritten) sourcePreWritten=\(sourcePreWritten)")
+            SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))… preWritten=\(bakedPreWritten)")
             let sourceImageForModel = intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive && rasterBytes != nil
                 ? OverlayItem.browseSourceMemoryPlaceholder()
                 : draftImage
@@ -789,9 +785,8 @@ struct ContentView: View {
                         placementCamera: placementCamera,
                         preservedSourceFileData: preservedPick,
                         bakedImagePreWrittenToDisk: bakedPreWritten,
-                        sourceImagePreWrittenToDisk: sourcePreWritten,
-                        cachedSourceRasterPixels: sourcePreWritten ? intrinsicPixels : nil,
-                        sourceRasterData: sourcePreWritten ? nil : rasterBytes,
+                        cachedSourceRasterPixels: rasterBytes.flatMap { UIImage.rasterPixelCount(forCompressedImageData: $0) },
+                        sourceRasterData: rasterBytes,
                         tilePyramid: pendingPyramid
                     )
                 )
@@ -812,6 +807,9 @@ struct ContentView: View {
                                 overlayID: overlayID,
                                 container: persistence.container
                             )
+                            restorePersistedOverlay()
+                        } else {
+                            print("[Overlay] saveDraft failed id=\(overlayID.uuidString.prefix(8))…")
                         }
                         overlayPersistenceInFlight = max(0, overlayPersistenceInFlight - 1)
                     }
@@ -923,7 +921,7 @@ struct ContentView: View {
 
         draftSourceFileData = overlay.preservedSourceFileData
             ?? overlay.sourceRasterData
-            ?? OverlayLibrary.persistedSourceRasterData(overlayID: overlay.id)
+            ?? OverlayLibrary.persistedSourceRasterData(overlayID: overlay.id, container: persistence.container)
         draftSourceExceedsLargeOverlayThreshold = overlay.usesTiledMapPresentation
         draftAnchoredToMap = true
         draftGeoCorners = overlay.corners
@@ -989,9 +987,12 @@ struct ContentView: View {
 
     private func loadOverlaysFromStoreSync() {
         isEditing = false
+        let viewContext = persistence.container.viewContext
+        viewContext.processPendingChanges()
         do {
-            overlays = try OverlayLibrary.loadOverlays(viewContext: persistence.container.viewContext)
+            overlays = try OverlayLibrary.loadOverlays(viewContext: viewContext)
         } catch {
+            print("[Overlay] loadOverlays failed: \(error)")
             overlays = []
         }
     }

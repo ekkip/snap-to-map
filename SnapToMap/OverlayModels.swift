@@ -80,7 +80,7 @@ struct OverlayItem: Identifiable {
     var preservedSourceFileData: Data?
     /// Set when save draft already wrote derived baked HEIC to disk; **`persist`** skips re-encode.
     var bakedImagePreWrittenToDisk: Bool = false
-    /// Set when save draft wrote source bytes to Application Support; **`persist`** sets **`sourceImageOnDisk`** metadata only and **`sourceRasterData`** may be **`nil`** to avoid duplicate RSS during **`context.save()`**.
+    /// Legacy only: **`true`** when source bytes exist only under Application Support, not yet in **`sourceImageData`**.
     var sourceImagePreWrittenToDisk: Bool = false
     /// Pixel count when **`sourceRasterData`** is omitted after disk pre-write (heavy overlay save draft).
     let cachedSourceRasterPixels: Int64?

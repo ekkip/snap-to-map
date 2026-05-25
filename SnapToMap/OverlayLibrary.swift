@@ -667,7 +667,6 @@ enum OverlayLibrary {
             }()
             let isHeavy = sourcePixels > largeRasterOverlayPixelThresholdExclusive
             let sourceDataForItem: Data? = {
-                if isHeavy, fileBackedSource { return nil }
                 if let inlineSource, !inlineSource.isEmpty { return inlineSource }
                 return sourceImageDataFromDisk(id: uuid)
             }()
@@ -732,7 +731,7 @@ enum OverlayLibrary {
                     corners: corners,
                     placementCamera: placement,
                     preservedSourceFileData: nil,
-                    sourceImagePreWrittenToDisk: fileBackedSource,
+                    sourceImagePreWrittenToDisk: fileBackedSource && (inlineSource?.isEmpty ?? true),
                     cachedSourceRasterPixels: fileBackedSource ? sourcePixels : nil,
                     sourceRasterData: sourceDataForItem,
                     tilePyramid: tilePyramidRuntime
@@ -990,9 +989,7 @@ enum OverlayLibrary {
                     }
                 }
             } catch {
-                #if DEBUG
-                print("OverlayLibrary save failed: \(error)")
-                #endif
+                print("[Overlay] saveOverlays failed: \(error)")
             }
         }
     }
@@ -1004,78 +1001,63 @@ enum OverlayLibrary {
         try encodeBakedImage(image)
     }
 
-    /// Writes source bytes to Application Support during save draft; **`persist`** sets metadata only (no Core Data blob).
-    static func persistSourceImageToDiskDuringSaveDraft(_ data: Data, overlayID: UUID) -> Bool {
-        guard !data.isEmpty else { return false }
-        return (try? autoreleasepool {
-            try writeSourceImageDataToDisk(data, id: overlayID)
-            return sourceImageExistsOnDisk(id: overlayID)
-        }) ?? false
-    }
-
-    /// Heavy overlays: memory-mapped source bytes from Application Support (fallback when **`OverlayItem.sourceRasterData`** is nil).
-    static func persistedSourceRasterData(overlayID: UUID) -> Data? {
+    /// Source bytes from Core Data (**`sourceImageData`**, external HEIC storage) with legacy Application Support fallback.
+    static func persistedSourceRasterData(overlayID: UUID, container: NSPersistentContainer? = nil) -> Data? {
+        if let container {
+            var fromStore: Data?
+            container.viewContext.performAndWait {
+                let fr = StoredMapOverlay.fetchRequest()
+                fr.fetchLimit = 1
+                fr.predicate = NSPredicate(format: "uuid == %@", overlayID as CVarArg)
+                guard let row = try? container.viewContext.fetch(fr).first else { return }
+                fromStore = persistedSourceImageData(row: row, overlayID: overlayID)
+            }
+            if let fromStore, !fromStore.isEmpty { return fromStore }
+        }
         guard sourceImageExistsOnDisk(id: overlayID) else { return nil }
         return sourceImageDataFromDisk(id: overlayID)
     }
 
+    private static func hasSourceImageInDatabase(row: StoredMapOverlay) -> Bool {
+        guard let data = row.sourceImageData else { return false }
+        return !data.isEmpty
+    }
+
     private static func hasPersistedSource(row: StoredMapOverlay, overlayID: UUID) -> Bool {
+        if hasSourceImageInDatabase(row: row) { return true }
+        // Legacy: source staged on disk before a Core Data write (pre file-backed regression).
         if sourceImageExistsOnDisk(id: overlayID) { return true }
-        if let data = row.sourceImageData, !data.isEmpty { return true }
         return false
     }
 
     private static func persistedSourceImageData(row: StoredMapOverlay, overlayID: UUID) -> Data? {
-        if row.sourceImageOnDisk, let disk = sourceImageDataFromDisk(id: overlayID) {
-            return disk
-        }
         if let inline = row.sourceImageData, !inline.isEmpty {
             return inline
+        }
+        if row.sourceImageOnDisk, let disk = sourceImageDataFromDisk(id: overlayID) {
+            return disk
         }
         return sourceImageDataFromDisk(id: overlayID)
     }
 
     private static func persistSourceImage(for overlay: OverlayItem, to row: StoredMapOverlay) throws {
         let id = overlay.id
-            if overlay.sourceImagePreWrittenToDisk, sourceImageExistsOnDisk(id: id) {
-                row.sourceImageOnDisk = true
-                row.sourceImageData = nil
-                print("[TileDiag] persist.sourceFileBacked id=\(id.uuidString.prefix(8)) preWritten=true")
-                return
-            }
-
-            if sourceImageExistsOnDisk(id: id), overlay.sourceRasterData == nil, overlay.cachedSourceRasterPixels != nil {
-                row.sourceImageOnDisk = true
-                row.sourceImageData = nil
-                print("[TileDiag] persist.sourceFileBacked id=\(id.uuidString.prefix(8)) existingDisk=true")
-                return
-            }
-
         let bytes: Data
-        if let preserved = overlay.preservedSourceFileData {
+        if let preserved = overlay.preservedSourceFileData, !preserved.isEmpty {
             bytes = preserved
         } else if let rd = overlay.sourceRasterData, !rd.isEmpty {
             bytes = rd
+        } else if let legacyDisk = sourceImageDataFromDisk(id: id), !legacyDisk.isEmpty {
+            bytes = legacyDisk
         } else {
             bytes = try autoreleasepool {
                 try Self.encodeSourceImage(overlay.sourceImage)
             }
         }
-
-        let pixelCount = overlay.cachedSourceRasterPixels
-            ?? UIImage.rasterPixelCount(forCompressedImageData: bytes)
-            ?? 0
-        let fileBacked = pixelCount > largeRasterOverlayPixelThresholdExclusive
-
-        if fileBacked {
-            try writeSourceImageDataToDisk(bytes, id: id)
-            row.sourceImageOnDisk = true
-            row.sourceImageData = nil
-            print("[TileDiag] persist.sourceFileBacked id=\(id.uuidString.prefix(8)) bytes=\(bytes.count)")
-        } else {
-            row.sourceImageOnDisk = false
-            row.sourceImageData = bytes
-        }
+        row.sourceImageOnDisk = false
+        row.sourceImageData = bytes
+        removeSourceImageFromDisk(id: id)
+        print("[TileDiag] persist.sourceDatabase id=\(id.uuidString.prefix(8)) bytes=\(bytes.count)")
     }
 
     /// Bake + encode + disk write on a background thread during save draft; returns **`true`** when readable on disk.
@@ -1264,7 +1246,7 @@ enum OverlayLibrary {
 
             // Source bytes only when missing or forced — **not** when only corners/camera change (_pixels unchanged).
             // Baked mercator texture depends on **quad corners** only; **`placementCamera`** is map framing metadata and must not force a baked HEIC re-encode (that was making “cancel” / placement-only saves as slow as a full bake).
-            let needsSourceWrite = forceRewriteSource || !hasPersistedSource(row: row, overlayID: o.id)
+            let needsSourceWrite = forceRewriteSource || !hasSourceImageInDatabase(row: row)
             let bakedContentChanged = forceRewriteBaked || cornersChanged || !bakedImageExistsOnDisk(id: o.id)
             let needsBakedWrite = bakedContentChanged && !o.bakedImagePreWrittenToDisk
 
