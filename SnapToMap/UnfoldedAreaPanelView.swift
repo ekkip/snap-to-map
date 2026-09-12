@@ -147,7 +147,7 @@ struct UnfoldedAreaPanelView: View {
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.top, 8)
             Text("This area")
-                .font(.system(size: 22, weight: .regular))
+                .font(.system(size: 22, weight: .medium))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .padding(.horizontal, metrics.horizontalPadding)

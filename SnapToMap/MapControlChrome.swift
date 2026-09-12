@@ -73,6 +73,26 @@ enum MapControlChrome {
         }
     }
 
+    /// Capsule chrome sized to its content width (e.g. labeled add button).
+    @ViewBuilder
+    static func intrinsicGlassCapsule<Content: View>(height: CGFloat, @ViewBuilder content: () -> Content) -> some View {
+        Group {
+            if #available(iOS 26.0, *) {
+                content()
+                    .frame(height: height)
+                    .clipShape(Capsule())
+                    .glassEffect(.regular, in: Capsule())
+            } else {
+                content()
+                    .frame(height: height)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(
+                        Capsule().strokeBorder(Color.primary.opacity(0.16), lineWidth: 1)
+                    )
+            }
+        }
+    }
+
     // MARK: - Private builders
 
     @ViewBuilder

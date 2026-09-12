@@ -522,7 +522,7 @@ struct ContentView: View {
             openAreaPanel()
         } label: {
             MapControlChrome.circularControl(.standard, diameter: MapControlChrome.bottomBaseDimension) {
-                Image(systemName: "photo.on.rectangle.angled")
+                Image(systemName: "square.grid.2x2.fill")
                     .font(.system(size: 22, weight: .regular))
                     .foregroundStyle(.primary)
             }
@@ -1381,6 +1381,8 @@ private struct BrowseAddControl: View {
 
     private var dimension: CGFloat { MapControlChrome.bottomBaseDimension }
 
+    private var labeledContentInset: CGFloat { 20 }
+
     var body: some View {
         PhotosPicker(selection: $selectedItem, matching: .images) {
             pickerLabel
@@ -1394,18 +1396,16 @@ private struct BrowseAddControl: View {
     private var pickerLabel: some View {
         switch presentation {
         case .labeled:
-            MapControlChrome.glassCapsuleFrame(
-                width: min(maxLabelWidth, 220),
-                height: dimension
-            ) {
-                HStack(spacing: 10) {
+            MapControlChrome.intrinsicGlassCapsule(height: dimension) {
+                HStack(spacing: 9) {
                     Text("Add image")
-                        .font(.system(size: 20, weight: .regular))
+                        .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(MapControlChrome.accentColor)
                     browseAddIcon
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, labeledContentInset)
             }
+            .frame(maxWidth: min(maxLabelWidth, 220))
             .matchedGeometryEffect(id: "browseAddChrome", in: namespace)
         case .iconOnly:
             MapControlChrome.circularControl(.standard, diameter: dimension) {
