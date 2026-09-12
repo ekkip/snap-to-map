@@ -1,0 +1,85 @@
+---
+description: Revised rules for iOS Metal raster tile generation with chunked source textures and physical tile pixels
+globs:
+  - "**/*.swift"
+  - "**/*.metal"
+alwaysApply: false
+---
+
+# Revised iOS Raster Tile Pipeline Rules
+
+## Points vs Pixels
+
+- `MKTileOverlay.tileSize` is in points (**512 pt** in this app).
+- Generated tile images must be physical pixels: **`512 × tileContentScale`** (e.g. **1536 px @3×**).
+- Single source of truth: **`OverlayLibrary.tileContentScaleForCurrentDevice()`** — use for z_max, Metal output size, HEIF encode, and pyramid metadata.
+- Do not re-read `UIScreen.main.scale` separately for encoding vs z_max in the same build.
+
+## z_min / z_max
+
+- `z_min` is the highest zoom where the whole overlay fits in one tile.
+- `z_max` is the highest zoom where physical tile resolution does not exceed source resolution.
+- Generate only `z_min ... z_max`.
+- Underzoom below `z_min` by scaling the z_min tile down.
+- Overzoom above `z_max` by scaling z_max tiles up.
+- Do not rely solely on MapKit `minimumZ` / `maximumZ` for underzoom/overzoom behavior.
+
+## Texture Limits
+
+- Do not upload a source image larger than the device max texture size as one texture.
+- Do not rely on single giant source texture if source dimensions exceed 16384 px.
+- For large sources, split into source chunks.
+- Start with 4096×4096 chunks.
+- Consider 8192×8192 only after profiling.
+- Avoid 16384 chunks for v1.
+
+## Chunk Model
+
+- Keep all geometry in global source pixel coordinates.
+- Convert to chunk-local coordinates only immediately before sampling.
+- Each chunk should have its own Metal texture and mip chain.
+- Mipmaps are per source chunk, not one global source texture.
+
+## Shader Rules
+
+- Use explicit destination basis vectors:
+  - `destStepX`
+  - `destStepY`
+- Do not use a single `destPixelStep`.
+- The shader should:
+  1. compute destination coordinate,
+  2. inverse-transform to global source pixel coordinate,
+  3. check source bounds,
+  4. check current chunk bounds,
+  5. convert to chunk-local UV,
+  6. sample chunk texture,
+  7. write output tile pixel.
+
+## Mipmap Rules
+
+- `sourcePixel` is always full-resolution original source coordinate.
+- `chunkPixel = sourcePixel - chunkOrigin`.
+- `uv = chunkPixel / chunkSize`.
+- Changing mip level must only affect sharpness, never placement or scale.
+
+## Debugging
+
+Log per tile:
+
+- requested z,
+- clamped source z,
+- physical tile size,
+- source footprint,
+- overlapping chunks,
+- estimated source pixels per output pixel,
+- chosen mip level,
+- output HEIF dimensions.
+
+## Avoid
+
+- Do not generate output tiles from other output tiles.
+- Do not create a giant warped intermediate image.
+- Do not pad a giant warped intermediate image.
+- Do not crop from a giant intermediate image.
+- Do not let source upload silently downscale.
+- Do not compute z_max from logical point size.

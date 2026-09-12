@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="24837" systemVersion="25D125" minimumToolsVersion="Automatic" sourceLanguage="Swift" userDefinedModelVersionIdentifier="">
+    <entity name="StoredMapOverlay" representedClassName="StoredMapOverlay" syncable="YES" codeGenerationType="class">
+        <attribute name="bboxMaxX" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES"/>
+        <attribute name="bboxMaxY" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES"/>
+        <attribute name="bboxMinX" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES"/>
+        <attribute name="bboxMinY" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES"/>
+        <attribute name="cornersJSON" attributeType="String"/>
+        <attribute name="createdAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="displayName" optional="YES" attributeType="String"/>
+        <attribute name="hasBoundingBox" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="modifiedAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="notes" optional="YES" attributeType="String"/>
+        <attribute name="placementCameraJSON" optional="YES" attributeType="String"/>
+        <attribute name="schemaVersion" attributeType="Integer 16" defaultValueString="1" usesScalarValueType="YES"/>
+        <attribute name="sortOrder" attributeType="Integer 32" defaultValueString="0" usesScalarValueType="YES"/>
+        <attribute name="sourceImageData" attributeType="Binary" allowsExternalBinaryDataStorage="YES"/>
+        <attribute name="sourceImageOnDisk" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="tileMaximumZoom" attributeType="Integer 32" defaultValueString="-1" usesScalarValueType="YES"/>
+        <attribute name="tileMaximumZoomFull" attributeType="Integer 32" defaultValueString="-1" usesScalarValueType="YES"/>
+        <attribute name="tileMaximumZoomPreview" attributeType="Integer 32" defaultValueString="-1" usesScalarValueType="YES"/>
+        <attribute name="tileMinimumZoom" attributeType="Integer 32" defaultValueString="-1" usesScalarValueType="YES"/>
+        <attribute name="tilePyramidRevision" attributeType="Integer 64" defaultValueString="0" usesScalarValueType="YES"/>
+        <attribute name="tileRefinementInProgress" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="uuid" attributeType="UUID" usesScalarValueType="NO"/>
+    </entity>
+</model>

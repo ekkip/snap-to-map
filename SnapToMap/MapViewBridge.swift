@@ -29,8 +29,7 @@ final class MapEditHandoff {
         self.fittedQuadScreen = fittedQuadScreen
     }
 }
-/// Raster overlay opacity staging: live drag applies immediately only when `ImageRasterMapOverlay.largeImage == false`;
-/// heavyweight rasters (> 100 MP pixels) consume `committed` until the gesture ends (same repaint trade-off as stacked `MKTileOverlay` tiles).
+/// Raster overlay opacity staging: live drag applies immediately only when **`presentationUsesHeavyOpacityPath == false`** (small **`ImageRasterMapOverlay`**); tiled / large rasters use **`committed`** until the gesture ends.
 final class RasterMapOpacityBag {
     var committed: CGFloat = 1
     var dragging: CGFloat?
@@ -97,26 +96,34 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
 
     let rasterOpacity = RasterMapOpacityBag()
 
-    /// `true` when at least one saved overlay is drawn as an **`ImageRasterMapOverlay`** (zoomed in enough); false when all valid overlays show only **`OverlayMarkerAnnotation`** pins.
+    /// `true` when at least one overlay is drawn as a **`SnapRasterMapOverlay`** (raster or baked tile, zoomed in enough); false when all valid overlays show only **`OverlayMarkerAnnotation`** pins.
     @Published private(set) var isAnyRasterMapOverlayOnMap: Bool = false
 
     func updateRasterTileOverlayPresence(_ anyRasterVisible: Bool) {
-        if isAnyRasterMapOverlayOnMap != anyRasterVisible {
-            isAnyRasterMapOverlayOnMap = anyRasterVisible
+        guard isAnyRasterMapOverlayOnMap != anyRasterVisible else { return }
+        let value = anyRasterVisible
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isAnyRasterMapOverlayOnMap != value else { return }
+            self.isAnyRasterMapOverlayOnMap = value
         }
     }
 
-    /// True when the map has at least one **`ImageRasterMapOverlay`** and every one has **`largeImage == true`**. Drives whether opacity **`DragGesture.onChanged`** may repaint map tiles (false → only **`onEnded`** commits for those rasters).
+    /// True when every visible **`SnapRasterMapOverlay`** uses the heavy opacity path (**`BakedImageMapTileOverlay`** or **`ImageRasterMapOverlay.largeImage`**). Drives whether browse opacity **`DragGesture.onChanged`** may repaint map tiles (false → only **`onEnded`** commits for those).
     @Published private(set) var displayedMapRastersAreAllLargeImage: Bool = false
 
     func updateDisplayedMapRastersAreAllLargeImage(_ allLarge: Bool) {
-        if displayedMapRastersAreAllLargeImage != allLarge {
-            displayedMapRastersAreAllLargeImage = allLarge
+        guard displayedMapRastersAreAllLargeImage != allLarge else { return }
+        let value = allLarge
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.displayedMapRastersAreAllLargeImage != value else { return }
+            self.displayedMapRastersAreAllLargeImage = value
         }
     }
 
     /// Bumped from **`mapView(_:regionDidChangeAnimated:)`** so **`ContentView`** can re-project the draft overlay when it is anchored to the map.
     @Published private(set) var mapLayoutRevision: UInt64 = 0
+    /// Debug-only current zoom level approximation derived from visible map rect.
+    @Published private(set) var currentDebugZoomLevel: Double = 0
 
     /// Bumped after **`MapRegionSettleTiming`** debounce + **two** frozen **`MapVisualState`** samples (same idea as edit handoff) while the draft is stick‑to‑map — **`ContentView`** warps the image and fades it in.
     @Published private(set) var draftStickToMapSettledRevision: UInt64 = 0
@@ -128,7 +135,10 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     private var mapManipulationFromDirectTouches = false
 
     func notifyMapLayoutChanged() {
-        mapLayoutRevision &+= 1
+        DispatchQueue.main.async { [weak self] in
+            self?.updateCurrentDebugZoomLevelDeferred()
+            self?.mapLayoutRevision &+= 1
+        }
     }
 
     /// Set when **`armEditTransitionAfterMapSettles`** is waiting on region quiescence; **`ContentView`** applies and clears **`mapEditHandoff`**.
@@ -145,6 +155,13 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
 
     /// Previous **`MapVisualState`** during stability polling; **`nil`** = next tick only seeds the baseline.
     private var editHandoffStabilityPrevious: MapVisualState?
+
+    /// Post-save zoom-to-overlay settle before enabling runtime prewarm.
+    private var pendingPostSavePrewarmOverlayID: UUID?
+    private var pendingPostSaveExpectedVisibleMapRect: MKMapRect?
+    private var postSaveSettleDeadline: Date?
+    private var postSaveSettleStabilityPrevious: MapVisualState?
+    private var postSaveSettleIdleWorkItem: DispatchWorkItem?
 
     private var draftStickSettleIdleWorkItem: DispatchWorkItem?
     private var draftStickSettleStabilityPrevious: MapVisualState?
@@ -170,6 +187,133 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     func noteMapRegionChangedWhileWaitingForEdit() {
         guard pendingFitForEditOverlay != nil else { return }
         scheduleEditHandoffDebounce()
+    }
+
+    /// Called from **`MKMapViewDelegate.mapView(_:regionDidChangeAnimated:)`** during post-save zoom settle.
+    func noteMapRegionChangedWhileWaitingForPostSave() {
+        guard pendingPostSavePrewarmOverlayID != nil else { return }
+        schedulePostSaveSettleDebounce()
+    }
+
+    func armPostSavePrewarmAfterZoomSettles(overlayID: UUID, expectedVisibleMapRect: MKMapRect) {
+        pendingPostSavePrewarmOverlayID = overlayID
+        pendingPostSaveExpectedVisibleMapRect = expectedVisibleMapRect
+        postSaveSettleDeadline = Date().addingTimeInterval(MapRegionSettleTiming.maxWait)
+        postSaveSettleStabilityPrevious = nil
+        OverlaySaveTransitionLog.stage("zoom.animation.started", overlayID: overlayID)
+        schedulePostSaveSettleDebounce()
+    }
+
+    func cancelPendingPostSavePrewarm() {
+        postSaveSettleIdleWorkItem?.cancel()
+        postSaveSettleIdleWorkItem = nil
+        postSaveSettleStabilityPrevious = nil
+        pendingPostSavePrewarmOverlayID = nil
+        pendingPostSaveExpectedVisibleMapRect = nil
+        postSaveSettleDeadline = nil
+    }
+
+    private func schedulePostSaveSettleDebounce() {
+        postSaveSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.evaluatePostSaveSettleIfMapMatchesExpectedFit()
+        }
+        postSaveSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.debounceAfterLastChange, execute: work)
+    }
+
+    private func schedulePostSaveSettleRetryPoll() {
+        postSaveSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.evaluatePostSaveSettleIfMapMatchesExpectedFit()
+        }
+        postSaveSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + editHandoffRetryInterval, execute: work)
+    }
+
+    private func schedulePostSaveSettleStabilityTick() {
+        postSaveSettleIdleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.tickPostSaveSettleStabilityPoll()
+        }
+        postSaveSettleIdleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + MapRegionSettleTiming.stabilityPollInterval, execute: work)
+    }
+
+    private func evaluatePostSaveSettleIfMapMatchesExpectedFit() {
+        postSaveSettleIdleWorkItem = nil
+        guard let overlayID = pendingPostSavePrewarmOverlayID, let mapView else {
+            clearPendingPostSavePrewarmOnly()
+            return
+        }
+
+        let timedOut = Date() >= (postSaveSettleDeadline ?? .distantFuture)
+        let matches = postSaveExpectedFitMatches(mapView)
+
+        if timedOut {
+            deliverPostSaveZoomSettled(overlayID: overlayID)
+        } else if matches {
+            postSaveSettleStabilityPrevious = nil
+            schedulePostSaveSettleStabilityTick()
+        } else {
+            postSaveSettleStabilityPrevious = nil
+            schedulePostSaveSettleRetryPoll()
+        }
+    }
+
+    private func tickPostSaveSettleStabilityPoll() {
+        postSaveSettleIdleWorkItem = nil
+        guard let overlayID = pendingPostSavePrewarmOverlayID, let mapView else {
+            clearPendingPostSavePrewarmOnly()
+            return
+        }
+
+        let timedOut = Date() >= (postSaveSettleDeadline ?? .distantFuture)
+        if timedOut {
+            deliverPostSaveZoomSettled(overlayID: overlayID)
+            return
+        }
+
+        guard postSaveExpectedFitMatches(mapView) else {
+            postSaveSettleStabilityPrevious = nil
+            schedulePostSaveSettleRetryPoll()
+            return
+        }
+
+        let now = MapVisualState(mapView)
+        if let prev = postSaveSettleStabilityPrevious, prev.isNearlyFrozen(comparedTo: now) {
+            deliverPostSaveZoomSettled(overlayID: overlayID)
+            return
+        }
+
+        postSaveSettleStabilityPrevious = now
+        schedulePostSaveSettleStabilityTick()
+    }
+
+    private func postSaveExpectedFitMatches(_ mapView: MKMapView) -> Bool {
+        guard let expected = pendingPostSaveExpectedVisibleMapRect else { return true }
+        return Self.visibleMapRectApproximatelyEqual(
+            mapView.visibleMapRect,
+            expected,
+            relativeTolerance: editHandoffRectRelativeTolerance
+        )
+    }
+
+    private func deliverPostSaveZoomSettled(overlayID: UUID) {
+        clearPendingPostSavePrewarmOnly()
+        OverlaySaveTransitionLog.stage("zoom.animation.finished", overlayID: overlayID)
+        NotificationCenter.default.post(
+            name: .overlaySaveTransitionZoomDidSettle,
+            object: nil,
+            userInfo: ["overlayID": overlayID.uuidString]
+        )
+    }
+
+    private func clearPendingPostSavePrewarmOnly() {
+        postSaveSettleStabilityPrevious = nil
+        pendingPostSavePrewarmOverlayID = nil
+        pendingPostSaveExpectedVisibleMapRect = nil
+        postSaveSettleDeadline = nil
     }
 
     private func scheduleEditHandoffDebounce() {
@@ -461,13 +605,19 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         return true
     }
 
-    /// Updates each raster renderer’s compositing **`alpha`** from **`RasterMapOpacityBag`** (per-overlay **`largeImage` / committed / dragging** rules). MapKit applies this **without** necessarily invoking **`draw(_:zoomScale:in:)`** again, so browse-mode opacity tracks the slider smoothly (edit mode uses SwiftUI opacity on a separate layer).
+    /// Updates each raster / tile overlay renderer’s **`alpha`** from **`RasterMapOpacityBag`** (per-overlay heavy-path rules). MapKit can apply this without redrawing every tile / `draw(_:)` pass.
     func applyRasterOverlayRendererAlphas() {
         guard let mapView else { return }
-        for case let overlay as ImageRasterMapOverlay in mapView.overlays {
-            guard let renderer = mapView.renderer(for: overlay) else { continue }
-            let alpha = overlay.opacityBag?.resolvedAlpha(isLargeImage: overlay.largeImage) ?? 1
-            renderer.alpha = CGFloat(alpha)
+        for overlay in mapView.overlays {
+            if let raster = overlay as? ImageRasterMapOverlay {
+                guard let renderer = mapView.renderer(for: raster) else { continue }
+                let alpha = raster.opacityBag?.resolvedAlpha(isLargeImage: raster.largeImage) ?? 1
+                renderer.alpha = CGFloat(alpha)
+            } else if let tile = overlay as? BakedImageMapTileOverlay {
+                guard let renderer = mapView.renderer(for: tile) as? MKTileOverlayRenderer else { continue }
+                let alpha = tile.opacityBag?.resolvedAlpha(isLargeImage: true) ?? 1
+                renderer.alpha = CGFloat(alpha)
+            }
         }
     }
 
@@ -476,14 +626,60 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
     func attach(mapView: MKMapView) {
         self.mapView = mapView
         self.locationManager.delegate = self
+        updateCurrentDebugZoomLevelDeferred()
+    }
+
+    func zoomIn(animated: Bool = true) {
+        zoomVisibleMapRect(by: 0.5, animated: animated)
+    }
+
+    func zoomOut(animated: Bool = true) {
+        zoomVisibleMapRect(by: 2.0, animated: animated)
+    }
+
+    private func zoomVisibleMapRect(by factor: Double, animated: Bool) {
+        guard let mapView, factor.isFinite, factor > 0 else { return }
+        let visible = mapView.visibleMapRect
+        guard visible.size.width > 0, visible.size.height > 0 else { return }
+        let target = MKMapRect(
+            x: visible.midX - (visible.size.width * factor) / 2,
+            y: visible.midY - (visible.size.height * factor) / 2,
+            width: visible.size.width * factor,
+            height: visible.size.height * factor
+        ).intersection(MKMapRect.world)
+        guard !target.isNull, !target.isEmpty else { return }
+        mapView.setVisibleMapRect(target, animated: animated)
+    }
+
+    private func updateCurrentDebugZoomLevelDeferred() {
+        DispatchQueue.main.async { [weak self] in
+            self?.updateCurrentDebugZoomLevelNow()
+        }
+    }
+
+    private func updateCurrentDebugZoomLevelNow() {
+        guard let mapView else { return }
+        let worldWidth = max(MKMapRect.world.size.width, 1)
+        let visibleWidthMapPoints = max(mapView.visibleMapRect.size.width, 1)
+        let zoom = log2(worldWidth / visibleWidthMapPoints)
+        guard zoom.isFinite else { return }
+        if abs(currentDebugZoomLevel - zoom) > 0.0001 {
+            currentDebugZoomLevel = zoom
+        }
     }
 
     /// Ensures the system can show the user-location annotation on `MKMapView` (`showsUserLocation`).
     /// The result of the authorization request is handled asynchronously by the delegate callback.
     func requestLocationAuthorizationIfNeeded() {
-        guard CLLocationManager.locationServicesEnabled() else { return }
-        // Request authorization asynchronously; delegate will handle status changes.
-        locationManager.requestWhenInUseAuthorization()
+        switch locationManager.authorizationStatus {
+        case .notDetermined:
+            // Keep this non-blocking on the main thread by relying on auth status only.
+            locationManager.requestWhenInUseAuthorization()
+        case .restricted, .denied, .authorizedAlways, .authorizedWhenInUse:
+            break
+        @unknown default:
+            break
+        }
     }
 
     func centerOnUserLocation(animated: Bool = true) {
@@ -502,6 +698,7 @@ final class MapViewBridge: NSObject, ObservableObject, CLLocationManagerDelegate
         pendingEditExpectedVisibleMapRect = nil
         editHandoffDeadline = nil
         mapEditHandoff = nil
+        cancelPendingPostSavePrewarm()
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

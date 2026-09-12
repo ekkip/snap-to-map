@@ -1,0 +1,19 @@
+---
+description: Preserve developer-added print(); consult before removal; comment out only with justification when spam hurts UI.
+alwaysApply: true
+---
+
+# Debug `print()` statements
+
+The developer often adds `print(...)` calls manually for debugging. Treat them as intentional instrumentation unless explicitly asked to clean logging.
+
+## Before changing them
+
+1. **Do not delete or remove** `print` calls without checking with the developer first (unless they explicitly requested a logging cleanup).
+2. If you have **strong evidence** that a `print` runs on an extremely hot path (e.g. per-frame, tight SwiftUI body recomputation, or thousands of times per gesture) and is materially harming responsiveness or flooding the console, you **may** comment out that specific line **without** prior consultation—but **leave the code in place** as a comment and add **one short line** above explaining why (e.g. `// Commented: called every layout pass — restores UX`).
+3. Do **not** assume a `print` is the bottleneck without that kind of evidence; mention suspected hotspots and propose commenting-out rather than silently removing.
+
+## Preferred wording when proposing changes
+
+- Ask: “OK to remove or `#if DEBUG`-guard this print?”
+- Prefer **`#if DEBUG`** wrappers only when the developer agrees—still preserve their logging intent in Debug builds.

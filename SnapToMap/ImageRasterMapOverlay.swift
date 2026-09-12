@@ -1,5 +1,5 @@
 import CoreGraphics
-import CoreLocation
+import ImageIO
 import MapKit
 import UIKit
 
@@ -17,23 +17,47 @@ extension UIImage {
     /// Total pixel count of the raster.
     func rasterPixelCount() -> Int64 {
         let d = rasterPixelDimensions()
+		print("\(#function) – \(d.width) × \(d.height) = \(d.width * d.height)")
         return d.width * d.height
     }
 
-    /// True when **`width × height` > 100_000_000** (more than ~100 MP); used like a heavyweight **`MKTileOverlay`** stack for opacity repaint.
-    static let largeRasterOverlayPixelThresholdExclusive: Int64 = 100_000_000
-
     var rasterExceedsLargeOverlayPixelThreshold: Bool {
-        rasterPixelCount() > Self.largeRasterOverlayPixelThresholdExclusive
+        rasterPixelCount() > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive
+    }
+
+    /// Pixel count from container metadata (**ImageIO**) without decoding the full bitmap — required for huge sources.
+    static func rasterPixelCount(forCompressedImageData data: Data) -> Int64? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? NSNumber,
+              let h = props[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return nil
+        }
+        return Int64(w.intValue) * Int64(h.intValue)
+    }
+
+    /// Same **`rasterPixelCount() – W × H = N`** line as the instance method, from compressed bytes (**ImageIO** metadata only).
+    @discardableResult
+    static func logRasterPixelCount(forCompressedImageData data: Data) -> Int64? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? NSNumber,
+              let h = props[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return nil
+        }
+        let width = Int64(w.intValue)
+        let height = Int64(h.intValue)
+        print("rasterPixelCount() – \(width) × \(height) = \(width * height)")
+        return width * height
     }
 }
 
-/// Georeferenced **pre-baked** bitmap via `MKOverlay` / `MKOverlayRenderer` — browse mode draws **`image`** axis-aligned on **`boundingMapRect`** only (no realtime projective work).
+/// Georeferenced image via `MKOverlay` / `MKOverlayRenderer`. Heavy sources use **`OverlayMapPresentation`** → **`BakedImageMapTileOverlay`** (see **`sourceImage.rasterExceedsLargeOverlayPixelThreshold`**).
 final class ImageRasterMapOverlay: NSObject, MKOverlay {
     let overlayID: UUID
     let image: UIImage
 
-    /// `true` when the **display** bitmap spans more than **100 megapixels** (see `UIImage.rasterExceedsLargeOverlayPixelThreshold`).
+    /// `true` when the source bitmap spans more than **100 megapixels** (see `UIImage.rasterExceedsLargeOverlayPixelThreshold`).
     let largeImage: Bool
 
     private let mapBoundingRect: MKMapRect
@@ -64,11 +88,10 @@ final class ImageRasterMapOverlay: NSObject, MKOverlay {
 final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
     override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in ctx: CGContext) {
         guard let overlay = overlay as? ImageRasterMapOverlay else { return }
-        guard let cgImage = Self.normalizedCGImage(from: overlay.image) else { return }
-
         let bbox = overlay.boundingMapRect
         let clipped = bbox.intersection(mapRect)
         guard !clipped.isNull, !clipped.isEmpty, clipped.size.width > 0, clipped.size.height > 0 else { return }
+        guard let cgImage = Self.normalizedCGImage(from: overlay.image) else { return }
 
         let destRect = rect(for: clipped)
 
@@ -92,10 +115,13 @@ final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
 
         ctx.saveGState()
         defer { ctx.restoreGState() }
+        // Opacity is applied via **`MKOverlayRenderer.alpha`** (see **`MapViewBridge.applyRasterOverlayRendererAlphas`**) so slider changes
+        // composite smoothly without re-running this heavyweight draw on every drag frame (unlike SwiftUI `.opacity` on the edit overlay).
         ctx.interpolationQuality = .high
         ctx.translateBy(x: destRect.minX, y: destRect.maxY)
         ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(cropped, in: CGRect(origin: .zero, size: destRect.size))
+        let localDest = CGRect(origin: .zero, size: destRect.size)
+        ctx.draw(cropped, in: localDest)
     }
 
     /// Renders UIImage with `.up` orientation so sampling matches geographic top/bottom.
@@ -103,7 +129,6 @@ final class ImageRasterMapOverlayRenderer: MKOverlayRenderer {
         if image.imageOrientation == .up, let cg = image.cgImage { return cg }
         let format = UIGraphicsImageRendererFormat()
         format.scale = image.scale
-        format.opaque = false
         let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
         let drawn = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
         return drawn.cgImage

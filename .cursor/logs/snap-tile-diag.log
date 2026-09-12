@@ -1,0 +1,110 @@
+=== session 2026-05-15 16:44:37 +0000 ===
+[TileDiagFile] request id=179E53DD n=1 z=11 x=1036 y=702 scale=3.0
+[TileDiagFile] request id=179E53DD n=2 z=11 x=1036 y=704 scale=3.0
+[TileDiagFile] request id=179E53DD n=3 z=11 x=1036 y=703 scale=3.0
+[TileDiagFile] request id=179E53DD n=4 z=11 x=1036 y=705 scale=3.0
+[TileDiagFile] request id=179E53DD n=5 z=11 x=1036 y=706 scale=3.0
+[TileDiagFile] request id=179E53DD n=6 z=11 x=1037 y=703 scale=3.0
+[TileDiagFile] request id=179E53DD n=7 z=11 x=1037 y=702 scale=3.0
+[TileDiagFile] request id=179E53DD n=8 z=11 x=1037 y=704 scale=3.0
+[TileDiagFile] request id=179E53DD n=9 z=11 x=1039 y=706 scale=3.0
+[TileDiagFile] miss id=179E53DD n=1 z=11 x=1036 y=702 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] request id=179E53DD n=10 z=11 x=1038 y=705 scale=3.0
+[TileDiagFile] request id=179E53DD n=11 z=11 x=1037 y=705 scale=3.0
+[TileDiagFile] request id=179E53DD n=12 z=11 x=1037 y=706 scale=3.0
+[TileDiagFile] request id=179E53DD n=13 z=11 x=1037 y=707 scale=3.0
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=11 x=1036 y=704 scale=3.0 bytes=498387 sample=1
+[TileDiagFile] request id=179E53DD n=14 z=11 x=1038 y=702 scale=3.0
+[TileDiagFile] request id=179E53DD n=15 z=11 x=1038 y=707 scale=3.0
+[TileDiagFile] request id=179E53DD n=16 z=11 x=1039 y=703 scale=3.0
+[TileDiagFile] request id=179E53DD n=17 z=11 x=1038 y=703 scale=3.0
+[TileDiagFile] request id=179E53DD n=18 z=11 x=1038 y=704 scale=3.0
+[TileDiagFile] request id=179E53DD n=19 z=11 x=1039 y=702 scale=3.0
+[TileDiagFile] miss id=179E53DD n=2 z=11 x=1036 y=703 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] request id=179E53DD n=20 z=11 x=1039 y=705 scale=3.0
+[TileDiagFile] request id=179E53DD n=21 z=11 x=1038 y=706 scale=3.0
+[TileDiagFile] request id=179E53DD n=22 z=11 x=1036 y=707 scale=3.0
+[TileDiagFile] request id=179E53DD n=23 z=11 x=1039 y=704 scale=3.0
+[TileDiagFile] request id=179E53DD n=24 z=11 x=1039 y=707 scale=3.0
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=11 x=1036 y=705 scale=3.0 bytes=13109 sample=2
+[TileDiagFile] miss id=179E53DD n=3 z=11 x=1036 y=706 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=4 z=11 x=1037 y=703 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=5 z=11 x=1037 y=702 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=11 x=1037 y=704 scale=3.0 bytes=996485 sample=3
+[TileDiagFile] miss id=179E53DD n=6 z=11 x=1039 y=706 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=7 z=11 x=1038 y=705 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=11 x=1037 y=705 scale=3.0 bytes=16215 sample=4
+[TileDiagFile] miss id=179E53DD n=8 z=11 x=1037 y=706 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=9 z=11 x=1037 y=707 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=10 z=11 x=1038 y=702 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=11 z=11 x=1038 y=707 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=12 z=11 x=1039 y=703 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=13 z=11 x=1038 y=703 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=14 z=11 x=1038 y=704 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=15 z=11 x=1039 y=702 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=16 z=11 x=1039 y=705 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=17 z=11 x=1038 y=706 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=18 z=11 x=1036 y=707 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=19 z=11 x=1039 y=704 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=20 z=11 x=1039 y=707 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] request id=179E53DD n=25 z=12 x=2075 y=1410 scale=3.0
+[TileDiagFile] request id=179E53DD n=26 z=12 x=2075 y=1411 scale=3.0
+[TileDiagFile] request id=179E53DD n=27 z=12 x=2075 y=1408 scale=3.0
+[TileDiagFile] request id=179E53DD n=28 z=12 x=2075 y=1406 scale=3.0
+[TileDiagFile] request id=179E53DD n=29 z=12 x=2074 y=1408 scale=3.0
+[TileDiagFile] request id=179E53DD n=30 z=12 x=2072 y=1406 scale=3.0
+[TileDiagFile] request id=179E53DD n=31 z=12 x=2072 y=1408 scale=3.0
+[TileDiagFile] request id=179E53DD n=32 z=12 x=2072 y=1407 scale=3.0
+[TileDiagFile] request id=179E53DD n=33 z=12 x=2072 y=1409 scale=3.0
+[TileDiagFile] request id=179E53DD n=34 z=12 x=2073 y=1406 scale=3.0
+[TileDiagFile] request id=179E53DD n=35 z=12 x=2072 y=1410 scale=3.0
+[TileDiagFile] request id=179E53DD n=36 z=12 x=2072 y=1411 scale=3.0
+[TileDiagFile] request id=179E53DD n=37 z=12 x=2073 y=1409 scale=3.0
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2075 y=1410 scale=3.0 bytes=18850 sample=5
+[TileDiagFile] request id=179E53DD n=38 z=12 x=2073 y=1410 scale=3.0
+[TileDiagFile] request id=179E53DD n=39 z=12 x=2075 y=1407 scale=3.0
+[TileDiagFile] request id=179E53DD n=40 z=12 x=2073 y=1407 scale=3.0
+[TileDiagFile] request id=179E53DD n=41 z=12 x=2074 y=1411 scale=3.0
+[TileDiagFile] request id=179E53DD n=42 z=12 x=2073 y=1411 scale=3.0
+[TileDiagFile] request id=179E53DD n=43 z=12 x=2074 y=1406 scale=3.0
+[TileDiagFile] request id=179E53DD n=44 z=12 x=2074 y=1407 scale=3.0
+[TileDiagFile] miss id=179E53DD n=21 z=12 x=2075 y=1411 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] request id=179E53DD n=45 z=12 x=2074 y=1409 scale=3.0
+[TileDiagFile] request id=179E53DD n=46 z=12 x=2073 y=1408 scale=3.0
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2075 y=1408 scale=3.0 bytes=707730 sample=6
+[TileDiagFile] request id=179E53DD n=47 z=12 x=2074 y=1410 scale=3.0
+[TileDiagFile] request id=179E53DD n=48 z=12 x=2075 y=1409 scale=3.0
+[TileDiagFile] miss id=179E53DD n=22 z=12 x=2075 y=1406 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2074 y=1408 scale=3.0 bytes=1006329 sample=7
+[TileDiagFile] miss id=179E53DD n=23 z=12 x=2072 y=1406 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=24 z=12 x=2072 y=1408 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2073 y=1409 scale=3.0 bytes=1027740 sample=8
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2073 y=1410 scale=3.0 bytes=18383 sample=9
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2074 y=1409 scale=3.0 bytes=1254794 sample=10
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2073 y=1408 scale=3.0 bytes=804729 sample=11
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2074 y=1410 scale=3.0 bytes=18697 sample=12
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=12 x=2075 y=1409 scale=3.0 bytes=939027 sample=13
+[TileDiagFile] request id=179E53DD n=49 z=11 x=1036 y=700 scale=3.0
+[TileDiagFile] request id=179E53DD n=50 z=11 x=1037 y=700 scale=3.0
+[TileDiagFile] request id=179E53DD n=51 z=11 x=1037 y=701 scale=3.0
+[TileDiagFile] request id=179E53DD n=52 z=11 x=1038 y=700 scale=3.0
+[TileDiagFile] request id=179E53DD n=53 z=11 x=1038 y=701 scale=3.0
+[TileDiagFile] request id=179E53DD n=54 z=11 x=1036 y=701 scale=3.0
+[TileDiagFile] request id=179E53DD n=55 z=11 x=1039 y=700 scale=3.0
+[TileDiagFile] request id=179E53DD n=56 z=11 x=1039 y=701 scale=3.0
+[TileDiagFile] request id=179E53DD n=57 z=11 x=1034 y=703 scale=3.0
+[TileDiagFile] request id=179E53DD n=58 z=11 x=1034 y=705 scale=3.0
+[TileDiagFile] request id=179E53DD n=59 z=11 x=1035 y=705 scale=3.0
+[TileDiagFile] request id=179E53DD n=60 z=11 x=1035 y=704 scale=3.0
+[TileDiagFile] request id=179E53DD n=61 z=11 x=1035 y=700 scale=3.0
+[TileDiagFile] request id=179E53DD n=62 z=11 x=1035 y=703 scale=3.0
+[TileDiagFile] request id=179E53DD n=63 z=11 x=1034 y=701 scale=3.0
+[TileDiagFile] request id=179E53DD n=64 z=11 x=1034 y=702 scale=3.0
+[TileDiagFile] miss id=179E53DD n=64 z=10 x=519 y=351 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=10 x=518 y=352 scale=3.0 bytes=392602 sample=14
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=9 x=259 y=176 scale=3.0 bytes=114895 sample=15
+[TileDiagFile] miss id=179E53DD n=128 z=9 x=257 y=177 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] load kind=pyramid.diskRead.xyzTopDown id=179E53DD z=8 x=129 y=88 scale=3.0 bytes=39552 sample=16
+[TileDiagFile] request id=179E53DD n=200 z=12 x=2073 y=1404 scale=3.0
+[TileDiagFile] miss id=179E53DD n=192 z=12 x=2077 y=1409 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
+[TileDiagFile] miss id=179E53DD n=256 z=11 x=1034 y=702 scale=3.0 mode=xyzTopDown preferredExists=false fallbackExists=false
