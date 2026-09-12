@@ -55,10 +55,12 @@ final class MapInteractionMapView: MKMapView, UIGestureRecognizerDelegate {
 
 struct MapViewRepresentable: UIViewRepresentable {
     @Binding var overlays: [OverlayItem]
+    @Binding var requestedActivationOverlayID: UUID?
     var isEditing: Bool
     /// Browsing slider unfolded: map taps / pans / pinches finalize opacity and collapse the slider.
     var browsingOpacitySliderExpanded: Bool = false
     var onRequestDismissBrowsingOpacitySlider: () -> Void = {}
+    var onActivatedOverlayChanged: (UUID?) -> Void = { _ in }
 
     @ObservedObject var bridge: MapViewBridge
     var onLongPressOverlay: (UUID) -> Void
@@ -100,8 +102,15 @@ struct MapViewRepresentable: UIViewRepresentable {
         context.coordinator.mapBridge = bridge
         context.coordinator.onLongPressOverlay = onLongPressOverlay
         context.coordinator.onRequestDismissBrowsingOpacitySlider = onRequestDismissBrowsingOpacitySlider
+        context.coordinator.onActivatedOverlayChanged = onActivatedOverlayChanged
         context.coordinator.updateBrowsingDismissGesturesEnabled(browsingOpacitySliderExpanded)
+        context.coordinator.requestManualActivation(requestedActivationOverlayID)
         context.coordinator.syncMapObjectsFromBindingUpdate(on: mapView, overlays: overlays)
+        if requestedActivationOverlayID != nil {
+            DispatchQueue.main.async {
+                requestedActivationOverlayID = nil
+            }
+        }
         context.coordinator.excludedManipulationTrackingGestureIds = [
             ObjectIdentifier(longPress),
             ObjectIdentifier(dismissTap),
@@ -119,8 +128,15 @@ struct MapViewRepresentable: UIViewRepresentable {
         context.coordinator.mapBridge = bridge
         context.coordinator.onLongPressOverlay = onLongPressOverlay
         context.coordinator.onRequestDismissBrowsingOpacitySlider = onRequestDismissBrowsingOpacitySlider
+        context.coordinator.onActivatedOverlayChanged = onActivatedOverlayChanged
         context.coordinator.updateBrowsingDismissGesturesEnabled(browsingOpacitySliderExpanded)
+        context.coordinator.requestManualActivation(requestedActivationOverlayID)
         context.coordinator.syncMapObjectsFromBindingUpdate(on: uiView, overlays: overlays)
+        if requestedActivationOverlayID != nil {
+            DispatchQueue.main.async {
+                requestedActivationOverlayID = nil
+            }
+        }
         context.coordinator.installMapInteractionTrackingIfNeeded(on: uiView)
     }
 
@@ -129,10 +145,23 @@ struct MapViewRepresentable: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate, UIGestureRecognizerDelegate, MapInteractionMapViewTouchDelegate {
+        private enum AnnotationStyle {
+            static let overlayMarkerReuseIdentifier = "OverlayMarker"
+            static let overlayClusterReuseIdentifier = "OverlayCluster"
+            static let overlayMarkerClusteringIdentifier = "OverlayMarkerCluster"
+        }
+
+        private struct OverlayMountContext {
+            let item: OverlayItem
+            let boundingMapRect: MKMapRect
+            let polygon: [MKMapPoint]
+        }
+
         weak var mapBridge: MapViewBridge?
 
         var onLongPressOverlay: ((UUID) -> Void)?
         var onRequestDismissBrowsingOpacitySlider: (() -> Void)?
+        var onActivatedOverlayChanged: ((UUID?) -> Void)?
         var browsingDismissTapGesture: UITapGestureRecognizer?
         var browsingDismissPanGesture: UIPanGestureRecognizer?
         var browsingDismissPinchGesture: UIPinchGestureRecognizer?
@@ -150,6 +179,11 @@ struct MapViewRepresentable: UIViewRepresentable {
         /// Suppresses redundant scheduler viewport updates when MapKit emits micro region jitter while idle.
         private var lastSchedulerViewportRect: MKMapRect?
         private var lastSchedulerViewportZoom: Double?
+        private var activeOverlayIDs = Set<UUID>()
+        private var manuallyActivatedOverlayID: UUID?
+        private var manualActivationNeedsFirstSync = false
+        private var manualActivationIgnoresZoomUntilUserGesture = false
+        private var lastNotifiedActivatedOverlayID: UUID?
 
         override init() {
             super.init()
@@ -277,6 +311,13 @@ struct MapViewRepresentable: UIViewRepresentable {
             applySyncMapObjects(on: mapView, overlays: overlays)
         }
 
+        func requestManualActivation(_ overlayID: UUID?) {
+            guard let overlayID else { return }
+            manuallyActivatedOverlayID = overlayID
+            manualActivationNeedsFirstSync = true
+            manualActivationIgnoresZoomUntilUserGesture = true
+        }
+
         private func deferSyncMapObjectsAfterRegionChange(on mapView: MKMapView) {
             deferredRegionSyncWorkItem?.cancel()
             let work = DispatchWorkItem { [weak self] in
@@ -294,6 +335,9 @@ struct MapViewRepresentable: UIViewRepresentable {
         }
 
         func mapInteractionMapView(_ mapView: MapInteractionMapView, directTouchesDownChanged touchesDown: Bool) {
+            if touchesDown {
+                manualActivationIgnoresZoomUntilUserGesture = false
+            }
             mapBridge?.setMapManipulationFromDirectTouches(touchesDown)
         }
 
@@ -343,6 +387,7 @@ struct MapViewRepresentable: UIViewRepresentable {
             let id = ObjectIdentifier(gr)
             switch gr.state {
             case .began, .changed:
+                manualActivationIgnoresZoomUntilUserGesture = false
                 mapDirectManipRecognizerActiveIds.insert(id)
             default:
                 mapDirectManipRecognizerActiveIds.remove(id)
@@ -375,9 +420,17 @@ struct MapViewRepresentable: UIViewRepresentable {
             currentOverlays = overlays
             let quadItems = overlays.filter { $0.corners.count == 4 }
             let cullViewport = expandedVisibleMapRectForCulling(on: mapView)
-            let itemsToMount = quadItems.filter { mapRect(for: $0.corners).intersects(cullViewport) }
+            let contextsToMount = quadItems.compactMap { item -> OverlayMountContext? in
+                let bbox = mapRect(for: item.corners)
+                guard bbox.intersects(cullViewport) else { return nil }
+                return OverlayMountContext(
+                    item: item,
+                    boundingMapRect: bbox,
+                    polygon: item.corners.map { MKMapPoint($0) }
+                )
+            }
             SnapMemoryInstrumentation.checkpoint(
-                "map.sync applySync quad=\(quadItems.count) mount=\(itemsToMount.count) tiledInMount=\(itemsToMount.filter(\.usesTiledMapPresentation).count)"
+                "map.sync applySync quad=\(quadItems.count) mount=\(contextsToMount.count) tiledInMount=\(contextsToMount.filter(\.item.usesTiledMapPresentation).count)"
             )
 
             let existingRasterByID = Dictionary(uniqueKeysWithValues: mapView.overlays.compactMap { overlay -> (UUID, SnapRasterMapOverlay)? in
@@ -389,11 +442,11 @@ struct MapViewRepresentable: UIViewRepresentable {
                 return (marker.overlayID, marker)
             })
 
-            let desiredIDs = Set(itemsToMount.map(\.id))
-            let desiredRasterIDs = Set(itemsToMount.compactMap { item -> UUID? in
-                let bbox = mapRect(for: item.corners)
-                return shouldDisplayAsMarker(item: item, bbox: bbox, on: mapView) ? nil : item.id
-            })
+            let contextByID = Dictionary(uniqueKeysWithValues: contextsToMount.map { ($0.item.id, $0) })
+            let desiredIDs = Set(contextsToMount.map(\.item.id))
+            let desiredRasterIDs = activatedOverlayIDs(from: contextsToMount, contextByID: contextByID, on: mapView)
+            activeOverlayIDs = desiredRasterIDs
+            notifyActivatedOverlayChanged(focusedActivatedOverlayID(from: desiredRasterIDs, contextByID: contextByID, on: mapView))
             let desiredMarkerIDs = desiredIDs.subtracting(desiredRasterIDs)
 
             for (id, existing) in existingRasterByID where !desiredRasterIDs.contains(id) {
@@ -404,10 +457,11 @@ struct MapViewRepresentable: UIViewRepresentable {
             }
 
             var anyRasterTileOnMap = false
-            for item in itemsToMount {
-                let bbox = mapRect(for: item.corners)
-                let displayAsMarker = shouldDisplayAsMarker(item: item, bbox: bbox, on: mapView)
-                if displayAsMarker {
+            for context in contextsToMount {
+                let item = context.item
+                let bbox = context.boundingMapRect
+                let shouldActivate = desiredRasterIDs.contains(item.id)
+                if !shouldActivate {
                     if let existingOverlay = existingRasterByID[item.id] {
                         mapView.removeOverlay(existingOverlay)
                     }
@@ -468,6 +522,136 @@ struct MapViewRepresentable: UIViewRepresentable {
             }
         }
 
+        private func activatedOverlayIDs(
+            from contexts: [OverlayMountContext],
+            contextByID: [UUID: OverlayMountContext],
+            on mapView: MKMapView
+        ) -> Set<UUID> {
+            let visibleMapRect = mapView.visibleMapRect
+            var activeIDs = activeOverlayIDs.filter { id in
+                guard let context = contextByID[id] else { return false }
+                return shouldKeepActivated(context, visibleMapRect: visibleMapRect, on: mapView)
+            }
+
+            if let manualID = manuallyActivatedOverlayID {
+                if let manualContext = contextByID[manualID] {
+                    let manualIntersectsVisible = polygon(manualContext.polygon, intersects: visibleMapRect)
+                    let shouldKeepManual = manualActivationNeedsFirstSync ||
+                        (manualActivationIgnoresZoomUntilUserGesture && manualIntersectsVisible) ||
+                        shouldKeepActivated(manualContext, visibleMapRect: visibleMapRect, on: mapView)
+                    if shouldKeepManual {
+                        activeIDs = activeIDs.filter { activeID in
+                            guard let activeContext = contextByID[activeID] else { return false }
+                            return activeID == manualID || !overlaysOverlap(manualContext, activeContext)
+                        }
+                        activeIDs.insert(manualID)
+                    } else {
+                        manuallyActivatedOverlayID = nil
+                        manualActivationIgnoresZoomUntilUserGesture = false
+                    }
+                } else {
+                    manuallyActivatedOverlayID = nil
+                    manualActivationIgnoresZoomUntilUserGesture = false
+                }
+            }
+            manualActivationNeedsFirstSync = false
+
+            let autoCandidates = contexts.filter { context in
+                !activeIDs.contains(context.item.id) &&
+                isEligibleForAutoActivation(context, visibleMapRect: visibleMapRect, on: mapView)
+            }
+            let autoCandidateIDs = autoActivatedOverlayIDs(from: autoCandidates)
+            for candidateID in autoCandidateIDs {
+                guard let candidateContext = contextByID[candidateID] else { continue }
+                let overlapsCurrentActive = activeIDs.contains { activeID in
+                    guard let activeContext = contextByID[activeID] else { return false }
+                    return overlaysOverlap(candidateContext, activeContext)
+                }
+                if !overlapsCurrentActive {
+                    activeIDs.insert(candidateID)
+                }
+            }
+
+            return activeIDs
+        }
+
+        private func focusedActivatedOverlayID(
+            from activeIDs: Set<UUID>,
+            contextByID: [UUID: OverlayMountContext],
+            on mapView: MKMapView
+        ) -> UUID? {
+            if let manualID = manuallyActivatedOverlayID, activeIDs.contains(manualID) {
+                return manualID
+            }
+            let mapCenter = MKMapPoint(mapView.centerCoordinate)
+            return activeIDs
+                .compactMap { contextByID[$0] }
+                .min { lhs, rhs in
+                    squaredDistance(from: mapCenter, toCenterOf: lhs.boundingMapRect) <
+                        squaredDistance(from: mapCenter, toCenterOf: rhs.boundingMapRect)
+                }?
+                .item
+                .id
+        }
+
+        private func notifyActivatedOverlayChanged(_ overlayID: UUID?) {
+            guard overlayID != lastNotifiedActivatedOverlayID else { return }
+            lastNotifiedActivatedOverlayID = overlayID
+            DispatchQueue.main.async { [onActivatedOverlayChanged] in
+                onActivatedOverlayChanged?(overlayID)
+            }
+        }
+
+        private func squaredDistance(from point: MKMapPoint, toCenterOf rect: MKMapRect) -> Double {
+            let x = rect.origin.x + rect.size.width / 2
+            let y = rect.origin.y + rect.size.height / 2
+            let dx = x - point.x
+            let dy = y - point.y
+            return dx * dx + dy * dy
+        }
+
+        private func isEligibleForAutoActivation(
+            _ context: OverlayMountContext,
+            visibleMapRect: MKMapRect,
+            on mapView: MKMapView
+        ) -> Bool {
+            polygon(context.polygon, isFullyContainedIn: visibleMapRect) &&
+            isZoomedInEnoughForActivation(item: context.item, bbox: context.boundingMapRect, on: mapView)
+        }
+
+        private func shouldKeepActivated(
+            _ context: OverlayMountContext,
+            visibleMapRect: MKMapRect,
+            on mapView: MKMapView
+        ) -> Bool {
+            polygon(context.polygon, intersects: visibleMapRect) &&
+            isZoomedInEnoughForActivation(item: context.item, bbox: context.boundingMapRect, on: mapView)
+        }
+
+        private func autoActivatedOverlayIDs(from candidates: [OverlayMountContext]) -> Set<UUID> {
+            guard candidates.count > 1 else { return Set(candidates.map(\.item.id)) }
+
+            var conflictedIDs = Set<UUID>()
+            for index in candidates.indices {
+                let nextIndex = candidates.index(after: index)
+                guard nextIndex < candidates.endIndex else { continue }
+                for otherIndex in nextIndex..<candidates.endIndex {
+                    let lhs = candidates[index]
+                    let rhs = candidates[otherIndex]
+                    guard overlaysOverlap(lhs, rhs) else { continue }
+                    conflictedIDs.insert(lhs.item.id)
+                    conflictedIDs.insert(rhs.item.id)
+                }
+            }
+
+            return Set(candidates.map(\.item.id)).subtracting(conflictedIDs)
+        }
+
+        private func overlaysOverlap(_ lhs: OverlayMountContext, _ rhs: OverlayMountContext) -> Bool {
+            lhs.boundingMapRect.intersects(rhs.boundingMapRect) &&
+            polygonsOverlap(lhs.polygon, rhs.polygon)
+        }
+
         private func overlayMatches(item: OverlayItem, bbox: MKMapRect, existing: SnapRasterMapOverlay) -> Bool {
             guard existing.boundingMapRect == bbox else { return false }
             if item.usesTiledMapPresentation {
@@ -509,6 +693,92 @@ struct MapViewRepresentable: UIViewRepresentable {
             )
         }
 
+        private func polygonsOverlap(_ lhs: [MKMapPoint], _ rhs: [MKMapPoint]) -> Bool {
+            guard lhs.count >= 3, rhs.count >= 3 else { return false }
+            for lhsIndex in lhs.indices {
+                let lhsNext = lhs.index(after: lhsIndex) == lhs.endIndex ? lhs.startIndex : lhs.index(after: lhsIndex)
+                for rhsIndex in rhs.indices {
+                    let rhsNext = rhs.index(after: rhsIndex) == rhs.endIndex ? rhs.startIndex : rhs.index(after: rhsIndex)
+                    if segmentsIntersect(lhs[lhsIndex], lhs[lhsNext], rhs[rhsIndex], rhs[rhsNext]) {
+                        return true
+                    }
+                }
+            }
+            return polygon(lhs, contains: rhs[0]) || polygon(rhs, contains: lhs[0])
+        }
+
+        private func segmentsIntersect(_ a: MKMapPoint, _ b: MKMapPoint, _ c: MKMapPoint, _ d: MKMapPoint) -> Bool {
+            let abc = cross(a, b, c)
+            let abd = cross(a, b, d)
+            let cda = cross(c, d, a)
+            let cdb = cross(c, d, b)
+
+            if ((abc > 0 && abd < 0) || (abc < 0 && abd > 0)) &&
+                ((cda > 0 && cdb < 0) || (cda < 0 && cdb > 0)) {
+                return true
+            }
+
+            return point(c, isOnSegmentFrom: a, to: b, cross: abc) ||
+                point(d, isOnSegmentFrom: a, to: b, cross: abd) ||
+                point(a, isOnSegmentFrom: c, to: d, cross: cda) ||
+                point(b, isOnSegmentFrom: c, to: d, cross: cdb)
+        }
+
+        private func cross(_ a: MKMapPoint, _ b: MKMapPoint, _ c: MKMapPoint) -> Double {
+            (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+        }
+
+        private func point(_ point: MKMapPoint, isOnSegmentFrom start: MKMapPoint, to end: MKMapPoint, cross: Double) -> Bool {
+            guard abs(cross) < 0.000001 else { return false }
+            return point.x >= min(start.x, end.x) && point.x <= max(start.x, end.x) &&
+                point.y >= min(start.y, end.y) && point.y <= max(start.y, end.y)
+        }
+
+        private func polygon(_ polygon: [MKMapPoint], contains point: MKMapPoint) -> Bool {
+            var isInside = false
+            var previousIndex = polygon.count - 1
+            for index in polygon.indices {
+                let a = polygon[index]
+                let b = polygon[previousIndex]
+                let denominator = (b.y - a.y == 0) ? Double.leastNonzeroMagnitude : (b.y - a.y)
+                let intersects = ((a.y > point.y) != (b.y > point.y)) &&
+                    (point.x < (b.x - a.x) * (point.y - a.y) / denominator + a.x)
+                if intersects { isInside.toggle() }
+                previousIndex = index
+            }
+            return isInside
+        }
+
+        private func polygon(_ polygon: [MKMapPoint], intersects rect: MKMapRect) -> Bool {
+            guard !rect.isNull, !rect.isEmpty else { return false }
+            let rectPolygon = [
+                MKMapPoint(x: rect.minX, y: rect.minY),
+                MKMapPoint(x: rect.maxX, y: rect.minY),
+                MKMapPoint(x: rect.maxX, y: rect.maxY),
+                MKMapPoint(x: rect.minX, y: rect.maxY),
+            ]
+            return polygonsOverlap(polygon, rectPolygon)
+        }
+
+        private func polygon(_ polygon: [MKMapPoint], isFullyContainedIn rect: MKMapRect) -> Bool {
+            guard !rect.isNull, !rect.isEmpty, !polygon.isEmpty else { return false }
+            return polygon.allSatisfy { point in
+                point.x >= rect.minX && point.x <= rect.maxX &&
+                point.y >= rect.minY && point.y <= rect.maxY
+            }
+        }
+
+        private func mapRect(for markers: [OverlayMarkerAnnotation]) -> MKMapRect {
+            let overlayByID = Dictionary(uniqueKeysWithValues: currentOverlays.map { ($0.id, $0) })
+            return markers.reduce(MKMapRect.null) { partial, marker in
+                if let item = overlayByID[marker.overlayID], item.corners.count == 4 {
+                    return partial.union(mapRect(for: item.corners))
+                }
+                let point = MKMapPoint(marker.coordinate)
+                return partial.union(MKMapRect(x: point.x, y: point.y, width: 1, height: 1))
+            }
+        }
+
         /// Padded visible rect for deciding which overlays get **`MKOverlay`** / marker attachments. Avoids mounting every persisted overlay on every sync (SwiftUI often re-enters **`updateUIView`** without the map moving).
         private func expandedVisibleMapRectForCulling(on mapView: MKMapView) -> MKMapRect {
             let v = mapView.visibleMapRect
@@ -523,6 +793,10 @@ struct MapViewRepresentable: UIViewRepresentable {
                 size: MKMapSize(width: w + 2 * mx, height: h + 2 * my)
             )
             return expanded.intersection(MKMapRect.world)
+        }
+
+        private func isZoomedInEnoughForActivation(item: OverlayItem, bbox: MKMapRect, on mapView: MKMapView) -> Bool {
+            !shouldDisplayAsMarker(item: item, bbox: bbox, on: mapView)
         }
 
         private func shouldDisplayAsMarker(item: OverlayItem, bbox: MKMapRect, on mapView: MKMapView) -> Bool {
@@ -561,19 +835,78 @@ struct MapViewRepresentable: UIViewRepresentable {
         }
 
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            if let cluster = annotation as? MKClusterAnnotation {
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: AnnotationStyle.overlayClusterReuseIdentifier) ?? MKAnnotationView(
+                    annotation: cluster,
+                    reuseIdentifier: AnnotationStyle.overlayClusterReuseIdentifier
+                )
+                view.annotation = cluster
+                configureClusterAnnotationView(view, count: cluster.memberAnnotations.count)
+                return view
+            }
+
             guard let marker = annotation as? OverlayMarkerAnnotation else { return nil }
-            let identifier = "OverlayMarker"
-            let view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier) ?? MKAnnotationView(annotation: marker, reuseIdentifier: identifier)
+            let view = mapView.dequeueReusableAnnotationView(withIdentifier: AnnotationStyle.overlayMarkerReuseIdentifier) ?? MKAnnotationView(
+                annotation: marker,
+                reuseIdentifier: AnnotationStyle.overlayMarkerReuseIdentifier
+            )
             view.annotation = marker
+            configureOverlayMarkerAnnotationView(view)
+            return view
+        }
+
+        private func configureOverlayMarkerAnnotationView(_ view: MKAnnotationView) {
             view.frame = CGRect(x: 0, y: 0, width: 16, height: 16)
             view.layer.cornerRadius = 8
             view.layer.backgroundColor = UIColor.systemOrange.cgColor
             view.layer.borderColor = UIColor.white.cgColor
             view.layer.borderWidth = 1.5
-            return view
+            view.clusteringIdentifier = AnnotationStyle.overlayMarkerClusteringIdentifier
+            view.collisionMode = .circle
+            view.displayPriority = .defaultLow
+            view.subviews.forEach { $0.removeFromSuperview() }
+        }
+
+        private func configureClusterAnnotationView(_ view: MKAnnotationView, count: Int) {
+            view.frame = CGRect(x: 0, y: 0, width: 32, height: 32)
+            view.layer.cornerRadius = 16
+            view.layer.backgroundColor = UIColor.systemOrange.cgColor
+            view.layer.borderColor = UIColor.white.cgColor
+            view.layer.borderWidth = 2
+            view.clusteringIdentifier = nil
+            view.collisionMode = .circle
+            view.displayPriority = .defaultHigh
+
+            let label: UILabel
+            if let existingLabel = view.subviews.compactMap({ $0 as? UILabel }).first {
+                label = existingLabel
+            } else {
+                label = UILabel(frame: view.bounds)
+                label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                label.textAlignment = .center
+                label.textColor = .white
+                label.font = .systemFont(ofSize: 14, weight: .bold)
+                label.adjustsFontSizeToFitWidth = true
+                label.minimumScaleFactor = 0.65
+                view.addSubview(label)
+            }
+            label.frame = view.bounds
+            label.text = count > 99 ? "99+" : "\(count)"
+            view.accessibilityLabel = "\(count) overlay markers"
         }
 
         func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
+            if let cluster = view.annotation as? MKClusterAnnotation {
+                let markers = cluster.memberAnnotations.compactMap { $0 as? OverlayMarkerAnnotation }
+                let targetRect = mapRect(for: markers)
+                if !targetRect.isNull, !targetRect.isEmpty {
+                    let padding = UIEdgeInsets(top: 100, left: 60, bottom: 120, right: 60)
+                    mapView.setVisibleMapRect(targetRect, edgePadding: padding, animated: true)
+                }
+                mapView.deselectAnnotation(cluster, animated: false)
+                return
+            }
+
             guard let marker = view.annotation as? OverlayMarkerAnnotation,
                   let item = currentOverlays.first(where: { $0.id == marker.overlayID }) else {
                 return
@@ -581,8 +914,10 @@ struct MapViewRepresentable: UIViewRepresentable {
 
             let targetRect = mapRect(for: item.corners)
             let padding = UIEdgeInsets(top: 100, left: 60, bottom: 120, right: 60)
-            mapView.setVisibleMapRect(targetRect, edgePadding: padding, animated: true)
             mapView.deselectAnnotation(marker, animated: false)
+            requestManualActivation(marker.overlayID)
+            applySyncMapObjects(on: mapView, overlays: currentOverlays)
+            mapView.setVisibleMapRect(targetRect, edgePadding: padding, animated: true)
         }
 
         /// Fires when the user **starts** panning/zooming; **`regionDidChangeAnimated`** alone is often too late to hide the stick-to-map draft during the gesture.

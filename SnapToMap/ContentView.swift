@@ -29,6 +29,13 @@ struct ContentView: View {
     /// Browsing-drag staging: pass **`liveDragging`** from the gesture so the bridge updates in the same run loop (SwiftUI `@State` from the binding is not updated yet when `onChanged` returns).
     @State private var mapRasterOpacityDragging: Double?
     @State private var browserOpacitySliderCollapsed: Bool = true
+    @State private var activatedOverlayID: UUID?
+    @State private var requestedActivationOverlayID: UUID?
+    @State private var areaPanelExpanded: Bool = false
+    @State private var areaPanelUnfoldedDetent: UnfoldedAreaPanelView.Detent = .basic
+    @State private var areaPanelSnapshot: [OverlayItem] = []
+    @Namespace private var areaPanelNamespace
+    @Namespace private var browseAddNamespace
     @State private var warpedDraftCGImage: CGImage?
     @State private var primaryCTAShowsActivity: Bool = false
     /// Bytes from **`PhotosPicker`** (`Data.self`); copied into Core Data on first save without recompression.
@@ -65,9 +72,16 @@ struct ContentView: View {
             ZStack(alignment: .topTrailing) {
                 MapViewRepresentable(
                     overlays: $overlays,
+                    requestedActivationOverlayID: $requestedActivationOverlayID,
                     isEditing: isEditing,
                     browsingOpacitySliderExpanded: !browserOpacitySliderCollapsed && !isEditing,
                     onRequestDismissBrowsingOpacitySlider: collapseBrowsingOpacitySliderIfNeeded,
+                    onActivatedOverlayChanged: { overlayID in
+                        activatedOverlayID = overlayID
+                        if overlayID == nil {
+                            closeAreaPanel()
+                        }
+                    },
                     bridge: mapBridge,
                     onLongPressOverlay: { overlayID in
                         beginEditingOverlay(id: overlayID)
@@ -85,6 +99,7 @@ struct ContentView: View {
             }
             .onChange(of: isEditing) { _, editing in
                 if editing {
+                    closeAreaPanel()
                     updateWarpedDraftCache(canvas: geometry.size)
                 } else {
                     warpedDraftCGImage = nil
@@ -137,35 +152,26 @@ struct ContentView: View {
             .overlay(alignment: .bottom) {
                 bottomCenterControl(bottomInset: geometry.safeAreaInsets.bottom)
             }
-            .overlay(alignment: .bottomLeading) {
-                if isEditing || mapBridge.isAnyRasterMapOverlayOnMap {
-                    OverlayOpacitySlider(
-                        isEditing: isEditing,
-                        browserCollapsed: $browserOpacitySliderCollapsed,
-                        draftOpacityCommitted: $draftOverlayOpacityCommitted,
-                        draftOpacityDragging: $draftOverlayOpacityDragging,
-                        finalizeDraftDraggingIntoCommitted: finalizeDraftRasterOpacityGestureEnd,
-                        mapOpacityCommitted: $mapRasterOpacityCommitted,
-                        mapOpacityLive: $mapRasterOpacityDragging,
-                        redrawBrowsingMapRaster: { alpha in
-                            browsingRasterOpacitySyncBagAndRedraw(liveDragging: alpha, duringLiveDragOnChanged: true)
-                        },
-                        finalizeBrowsingOpacity: finalizeBrowsingRasterOpacityInteraction
-                    )
-                    .padding(.leading, 16)
-                    .padding(.bottom, geometry.safeAreaInsets.bottom + 8)
-                }
+            .overlay(alignment: .bottom) {
+                browseBottomOverlay(
+                    bottomInset: geometry.safeAreaInsets.bottom,
+                    canvasSize: geometry.size,
+                    topInset: geometry.safeAreaInsets.top
+                )
             }
-            /// **`bottomLeading`** (opacity) is applied **before** this overlay so the trailing edit column stays **above** it in hit‑testing / drawing order.
-            .overlay(alignment: .bottomTrailing) {
-                bottomTrailingChrome(canvas: geometry.size, bottomInset: geometry.safeAreaInsets.bottom)
-                    .zIndex(10)
-            }
+            .animation(Self.browseChromeAnimation, value: areaPanelMode)
+            .animation(Self.browseChromeAnimation, value: areaPanelUnfoldedDetent)
+            .animation(Self.browseChromeAnimation, value: browseAddPresentation)
             .animation(.easeInOut(duration: 0.2), value: isEditing)
             .animation(.easeInOut(duration: 0.2), value: mapBridge.isAnyRasterMapOverlayOnMap)
             .onChange(of: mapBridge.isAnyRasterMapOverlayOnMap) { _, hasRaster in
                 if !hasRaster, !isEditing {
                     collapseBrowsingOpacitySliderIfNeeded()
+                }
+            }
+            .onChange(of: mapBridge.mapScrollUserGesturePhysicallyActive) { _, active in
+                if active {
+                    closeAreaPanel()
                 }
             }
             .onChange(of: overlayPersistenceInFlight) { _, inFlight in
@@ -292,89 +298,398 @@ struct ContentView: View {
                     updateWarpedDraftCache(canvas: geometry.size)
                 }
             }
+            /// Bottom overlays anchor to the physical scene bottom; `safeAreaInsets.bottom` padding lifts them once (~34 pt on home-indicator iPhones). Without this, SwiftUI already insets to the safe area and the padding stacks (~68 pt).
+            .ignoresSafeArea(.container, edges: .bottom)
         }
     }
 
-    /// Center: `.primaryCTA` for Add / Done; uses `MapControlChrome.Appearance.primaryCTA`.
+    /// Center: edit-mode Done only (`BrowseAddControl` handles browse add).
+    @ViewBuilder
     private func bottomCenterControl(bottomInset: CGFloat) -> some View {
-        let d = MapControlChrome.diameter
-        let tap = d + 2
-        return ZStack(alignment: .bottom) {
-            Circle()
-                .fill(Color.clear)
-                .frame(width: tap, height: tap)
-                .contentShape(Circle())
-            Group {
-                if isEditing {
-                    if primaryCTAShowsActivity {
-                        MapControlChrome.circularControl(.primaryCTA) {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .tint(.white)
-                        }
-                    } else {
-                        MapControlChrome.primaryCTAButton(icon: "checkmark", fontSize: 20) {
-                            collapseBrowsingOpacitySliderIfNeeded()
-                            saveDraftAsOverlay()
-                        }
+        if isEditing {
+            let d = MapControlChrome.bottomBaseDimension
+            let tap = d + 2
+            ZStack(alignment: .bottom) {
+                Circle()
+                    .fill(Color.clear)
+                    .frame(width: tap, height: tap)
+                    .contentShape(Circle())
+                if primaryCTAShowsActivity {
+                    MapControlChrome.circularControl(.primaryCTA, diameter: d) {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .tint(.white)
                     }
                 } else {
-                    PhotosPicker(selection: $selectedItem, matching: .images) {
-                        MapControlChrome.circularControl(.primaryCTA) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 24, weight: .regular))
-                        }
+                    MapControlChrome.primaryCTAButton(icon: "checkmark", fontSize: 22, diameter: d) {
+                        collapseBrowsingOpacitySliderIfNeeded()
+                        saveDraftAsOverlay()
                     }
-                    .buttonStyle(.plain)
-                    .simultaneousGesture(TapGesture().onEnded { collapseBrowsingOpacitySliderIfNeeded() })
                 }
             }
+            .frame(width: tap, height: tap, alignment: .bottom)
+            .padding(.bottom, bottomInset)
         }
-        .frame(width: tap, height: tap, alignment: .bottom)
-        .padding(.bottom, bottomInset + 8)
+    }
+
+    /// Unfolded browse area panel, description name row, or leading symbol launcher.
+    private enum AreaPanelMode: Equatable {
+        case hidden
+        case symbol
+        case description(name: String, overlayID: UUID)
+        case unfolded
+    }
+
+    private var areaPanelMode: AreaPanelMode {
+        if isEditing { return .hidden }
+        if areaPanelExpanded { return .unfolded }
+        if mapBridge.isAnyRasterMapOverlayOnMap, let active = activatedOverlay {
+            return .description(name: active.resolvedDisplayName, overlayID: active.id)
+        }
+        if !overlays.isEmpty,
+           !mapBridge.isAnyRasterMapOverlayOnMap,
+           !visibleAreaOverlaysSorted().isEmpty {
+            return .symbol
+        }
+        return .hidden
+    }
+
+    /// Centered labeled pill vs trailing icon-only add.
+    private enum BrowseAddPresentation: Equatable {
+        case hidden
+        case labeled
+        case iconOnly
+    }
+
+    private var browseAddPresentation: BrowseAddPresentation {
+        if isEditing { return .hidden }
+        if mapBridge.isAnyRasterMapOverlayOnMap { return .iconOnly }
+        return .labeled
+    }
+
+    private static let browseChromeAnimation = Animation.easeInOut(duration: 0.28)
+
+    private func centeredBrowseAddMaxWidth(canvasWidth: CGFloat) -> CGFloat {
+        let reservedLeading: CGFloat
+        if case .symbol = areaPanelMode {
+            reservedLeading = MapControlChrome.bottomHorizontalInset
+                + MapControlChrome.bottomBaseDimension
+                + MapControlChrome.bottomAdjacentControlGap
+        } else {
+            reservedLeading = MapControlChrome.bottomHorizontalInset
+        }
+        return canvasWidth - reservedLeading - MapControlChrome.bottomHorizontalInset
+    }
+
+    @ViewBuilder
+    private func browseBottomOverlay(bottomInset: CGFloat, canvasSize: CGSize, topInset: CGFloat) -> some View {
+        let canvasWidth = canvasSize.width
+        ZStack(alignment: .bottom) {
+            if !areaPanelExpanded {
+                HStack(alignment: .bottom, spacing: MapControlChrome.bottomAdjacentControlGap) {
+                    if isEditing || mapBridge.isAnyRasterMapOverlayOnMap {
+                        OverlayOpacitySlider(
+                            isEditing: isEditing,
+                            browserCollapsed: $browserOpacitySliderCollapsed,
+                            draftOpacityCommitted: $draftOverlayOpacityCommitted,
+                            draftOpacityDragging: $draftOverlayOpacityDragging,
+                            finalizeDraftDraggingIntoCommitted: finalizeDraftRasterOpacityGestureEnd,
+                            mapOpacityCommitted: $mapRasterOpacityCommitted,
+                            mapOpacityLive: $mapRasterOpacityDragging,
+                            redrawBrowsingMapRaster: { alpha in
+                                browsingRasterOpacitySyncBagAndRedraw(liveDragging: alpha, duringLiveDragOnChanged: true)
+                            },
+                            finalizeBrowsingOpacity: finalizeBrowsingRasterOpacityInteraction
+                        )
+                    } else if areaPanelMode == .symbol {
+                        symbolCollapsedAreaPanel(bottomInset: 0)
+                    }
+
+                    if case .description(let name, let overlayID) = areaPanelMode {
+                        descriptionCollapsedAreaPanel(name: name, overlayID: overlayID, bottomInset: 0)
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Spacer(minLength: 0)
+                    }
+
+                    if browseAddPresentation == .iconOnly {
+                        browseAddControl(
+                            bottomInset: 0,
+                            canvasWidth: canvasWidth,
+                            presentation: .iconOnly
+                        )
+                    }
+
+                    bottomTrailingChromeStack(canvas: CGSize(width: canvasWidth, height: 0))
+                }
+                .padding(.horizontal, MapControlChrome.bottomHorizontalInset)
+                .padding(.bottom, bottomInset)
+                .zIndex(1)
+
+                if browseAddPresentation == .labeled {
+                    browseAddControl(
+                        bottomInset: bottomInset,
+                        canvasWidth: canvasWidth,
+                        presentation: .labeled
+                    )
+                    .zIndex(1)
+                }
+            }
+
+            if !isEditing, areaPanelExpanded {
+                UnfoldedAreaPanelView(
+                    items: areaPanelSnapshot.isEmpty ? visibleAreaOverlaysSorted() : areaPanelSnapshot,
+                    screenSize: canvasSize,
+                    topSafeInset: topInset,
+                    bottomSafeInset: bottomInset,
+                    detent: $areaPanelUnfoldedDetent,
+                    activatedOverlayID: activatedOverlayID,
+                    namespace: areaPanelNamespace,
+                    onActivate: activateAreaOverlay,
+                    onCollapseToDescription: collapseAreaPanelToDescription
+                )
+                .frame(maxWidth: .infinity, alignment: .bottom)
+                .zIndex(10)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func browseAddControl(
+        bottomInset: CGFloat,
+        canvasWidth: CGFloat,
+        presentation: BrowseAddControl.Presentation
+    ) -> some View {
+        BrowseAddControl(
+            presentation: presentation,
+            maxLabelWidth: centeredBrowseAddMaxWidth(canvasWidth: canvasWidth),
+            bottomInset: bottomInset,
+            selectedItem: $selectedItem,
+            namespace: browseAddNamespace,
+            onInteraction: {
+                collapseBrowsingOpacitySliderIfNeeded()
+                closeAreaPanel()
+            }
+        )
     }
 
     /// Bottom-trailing: persistence spinner, then reset-distort above cancel when editing.
     @ViewBuilder
-    private func bottomTrailingChrome(canvas: CGSize, bottomInset: CGFloat) -> some View {
-        if overlayPersistenceInFlight > 0 || hasRefiningPyramids || isEditing {
-            VStack(alignment: .trailing, spacing: 8) {
-                let shouldShowSyncIndicator = hasRefiningPyramids || overlayPersistenceInFlight > 0
-                if shouldShowSyncIndicator {
-                    overlayPersistenceSavingIndicator
+    private func bottomTrailingChromeStack(canvas: CGSize) -> some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            let shouldShowSyncIndicator = hasRefiningPyramids || overlayPersistenceInFlight > 0
+            if shouldShowSyncIndicator {
+                overlayPersistenceSavingIndicator
+            }
+            if isEditing {
+                if hasCornerEdits {
+                    chromeIconButton(icon: "arrow.counterclockwise", fontSize: 20, hitFlushAlignment: .trailing) {
+                        collapseBrowsingOpacitySliderIfNeeded()
+                        resetDraftQuad(for: canvas)
+                    }
                 }
-                if isEditing {
-                    if hasCornerEdits {
-                        chromeIconButton(icon: "arrow.counterclockwise", fontSize: 20, hitFlushAlignment: .trailing) {
-                            collapseBrowsingOpacitySliderIfNeeded()
-                            resetDraftQuad(for: canvas)
-                        }
+                chromeIconButton(icon: draftAnchoredToMap ? "lock.fill" : "lock.open.fill", fontSize: 20, hitFlushAlignment: .trailing) {
+                    collapseBrowsingOpacitySliderIfNeeded()
+                    draftAnchoredToMap.toggle()
+                    if !draftAnchoredToMap {
+                        cancelDraftMapMotionSettledDebounce()
+                        resetDraftMapMotionFadeState()
                     }
-                    chromeIconButton(icon: draftAnchoredToMap ? "lock.fill" : "lock.open.fill", fontSize: 20, hitFlushAlignment: .trailing) {
-                        collapseBrowsingOpacitySliderIfNeeded()
-                        draftAnchoredToMap.toggle()
-                        if !draftAnchoredToMap {
-                            cancelDraftMapMotionSettledDebounce()
-                            resetDraftMapMotionFadeState()
-                        }
-                        if draftAnchoredToMap {
-                            syncDraftGeoFromScreenQuad(canvas: canvas)
-                            syncDraftQuadFromGeo(canvas: canvas)
-                        } else {
-                            syncDraftQuadFromGeo(canvas: canvas)
-                        }
-                        updateWarpedDraftCache(canvas: canvas)
+                    if draftAnchoredToMap {
+                        syncDraftGeoFromScreenQuad(canvas: canvas)
+                        syncDraftQuadFromGeo(canvas: canvas)
+                    } else {
+                        syncDraftQuadFromGeo(canvas: canvas)
                     }
-                    chromeIconButton(icon: "xmark", fontSize: 20, hitFlushAlignment: .trailing) {
-                        collapseBrowsingOpacitySliderIfNeeded()
-                        cancelEditing()
-                    }
+                    updateWarpedDraftCache(canvas: canvas)
+                }
+                chromeIconButton(icon: "xmark", fontSize: 20, hitFlushAlignment: .trailing) {
+                    collapseBrowsingOpacitySliderIfNeeded()
+                    cancelEditing()
                 }
             }
-            .simultaneousGesture(TapGesture().onEnded { collapseBrowsingOpacitySliderIfNeeded() })
-            .padding(.trailing, 16)
-            .padding(.bottom, bottomInset + 8)
         }
+        .simultaneousGesture(TapGesture().onEnded { collapseBrowsingOpacitySliderIfNeeded() })
+    }
+
+    private var activatedOverlay: OverlayItem? {
+        guard let activatedOverlayID else { return nil }
+        return overlays.first { $0.id == activatedOverlayID }
+    }
+
+    private func symbolCollapsedAreaPanel(bottomInset: CGFloat) -> some View {
+        Button {
+            openAreaPanel()
+        } label: {
+            MapControlChrome.circularControl(.standard, diameter: MapControlChrome.bottomBaseDimension) {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .font(.system(size: 22, weight: .regular))
+                    .foregroundStyle(.primary)
+            }
+            .matchedGeometryEffect(id: "areaPanelSurface", in: areaPanelNamespace)
+        }
+        .buttonStyle(.plain)
+        .padding(.bottom, bottomInset)
+    }
+
+    private func descriptionCollapsedAreaPanel(name: String, overlayID: UUID, bottomInset: CGFloat) -> some View {
+        let cornerRadius = MapControlChrome.bottomBaseDimension / 2
+        return ZStack(alignment: .top) {
+            areaPanelBackground(cornerRadius: cornerRadius)
+                .matchedGeometryEffect(id: "areaPanelSurface", in: areaPanelNamespace)
+            areaPanelGrabber
+                .matchedGeometryEffect(id: "areaPanelGrabber", in: areaPanelNamespace)
+                .padding(.top, 7)
+            Text(name)
+                .font(.system(size: 21, weight: .regular))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+                .padding(.horizontal, 22)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .animation(Self.browseChromeAnimation, value: overlayID)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: MapControlChrome.bottomBaseDimension)
+        .padding(.bottom, bottomInset)
+        .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .onTapGesture {
+            openAreaPanel()
+        }
+        .gesture(
+            DragGesture(minimumDistance: 8)
+                .onEnded { value in
+                    if value.translation.height < -12 {
+                        openAreaPanel()
+                    }
+                }
+        )
+    }
+
+    private var areaPanelGrabber: some View {
+        Capsule()
+            .fill(Color.primary.opacity(0.35))
+            .frame(width: 40, height: 4)
+    }
+
+    @ViewBuilder
+    private func areaPanelBackground(cornerRadius: CGFloat) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if #available(iOS 26.0, *) {
+            shape
+                .fill(Color.clear)
+                .glassEffect(.regular, in: shape)
+        } else {
+            shape
+                .fill(.ultraThinMaterial)
+                .overlay(shape.strokeBorder(Color.primary.opacity(0.16), lineWidth: 1))
+        }
+    }
+
+    private func openAreaPanel() {
+        guard !isEditing else { return }
+        collapseBrowsingOpacitySliderIfNeeded()
+        let visible = visibleAreaOverlaysSorted()
+        withAnimation(Self.browseChromeAnimation) {
+            areaPanelSnapshot = visible.isEmpty ? activatedOverlay.map { [$0] } ?? [] : visible
+            areaPanelUnfoldedDetent = .basic
+            areaPanelExpanded = true
+        }
+    }
+
+    private func collapseAreaPanelToDescription() {
+        guard areaPanelExpanded else { return }
+        withAnimation(Self.browseChromeAnimation) {
+            areaPanelExpanded = false
+            areaPanelUnfoldedDetent = .basic
+        }
+    }
+
+    private func closeAreaPanel() {
+        guard areaPanelExpanded || !areaPanelSnapshot.isEmpty else { return }
+        withAnimation(Self.browseChromeAnimation) {
+            areaPanelExpanded = false
+            areaPanelUnfoldedDetent = .basic
+            areaPanelSnapshot = []
+        }
+    }
+
+    private func activateAreaOverlay(_ item: OverlayItem) {
+        guard !isEditing else { return }
+        collapseBrowsingOpacitySliderIfNeeded()
+        withAnimation(Self.browseChromeAnimation) {
+            activatedOverlayID = item.id
+            requestedActivationOverlayID = item.id
+            areaPanelExpanded = false
+            areaPanelUnfoldedDetent = .basic
+        }
+        zoomToOverlay(item)
+    }
+
+    private func zoomToOverlay(_ item: OverlayItem) {
+        guard let mapView = mapBridge.mapView else { return }
+        let targetRect = mapRect(for: item.corners)
+        let padding = UIEdgeInsets(top: 100, left: 60, bottom: 310, right: 60)
+        mapView.setVisibleMapRect(targetRect, edgePadding: padding, animated: true)
+    }
+
+    private static let areaQueryMinimumExpansionMeters: CLLocationDistance = 2_000
+    private static let areaQueryShortSideExpansionFraction: Double = 0.5
+
+    /// Visible viewport expanded by max(2 km, 50% of its short side) for the "This area" panel.
+    private func areaQueryMapRect(for mapView: MKMapView) -> MKMapRect {
+        let visible = mapView.visibleMapRect
+        let width = visible.size.width
+        let height = visible.size.height
+        guard width.isFinite, height.isFinite, width > 0, height > 0 else { return visible }
+
+        let centerLatitude = MKMapPoint(x: visible.midX, y: visible.midY).coordinate.latitude
+        let minimumExpansion = Self.areaQueryMinimumExpansionMeters * MKMapPointsPerMeterAtLatitude(centerLatitude)
+        let halfShortSide = Self.areaQueryShortSideExpansionFraction * min(width, height)
+        let expansion = max(minimumExpansion, halfShortSide)
+
+        let expanded = MKMapRect(
+            origin: MKMapPoint(x: visible.origin.x - expansion, y: visible.origin.y - expansion),
+            size: MKMapSize(width: width + 2 * expansion, height: height + 2 * expansion)
+        )
+        return expanded.intersection(MKMapRect.world)
+    }
+
+    private func visibleAreaOverlaysSorted() -> [OverlayItem] {
+        guard let mapView = mapBridge.mapView else { return overlays }
+        let areaQuery = areaQueryMapRect(for: mapView)
+        let filtered = overlays.filter { item in
+            guard item.corners.count == 4 else { return false }
+            return mapRect(for: item.corners).intersects(areaQuery)
+        }
+        let sorted = filtered.sorted { lhs, rhs in
+            overlayDistanceSort(lhs, rhs, mapView: mapView)
+        }
+        return areaOverlaysWithActiveFirst(sorted)
+    }
+
+    private func areaOverlaysWithActiveFirst(_ items: [OverlayItem]) -> [OverlayItem] {
+        guard let activatedOverlayID else { return items }
+        guard let activeIndex = items.firstIndex(where: { $0.id == activatedOverlayID }) else { return items }
+        var reordered = items
+        let active = reordered.remove(at: activeIndex)
+        reordered.insert(active, at: 0)
+        return reordered
+    }
+
+    private func overlayDistanceSort(_ lhs: OverlayItem, _ rhs: OverlayItem, mapView: MKMapView) -> Bool {
+        let center = MKMapPoint(mapView.centerCoordinate)
+        return squaredDistance(from: center, toCenterOf: lhs.corners) <
+            squaredDistance(from: center, toCenterOf: rhs.corners)
+    }
+
+    private func squaredDistance(from point: MKMapPoint, toCenterOf corners: [CLLocationCoordinate2D]) -> Double {
+        let rect = mapRect(for: corners)
+        let x = rect.origin.x + rect.size.width / 2
+        let y = rect.origin.y + rect.size.height / 2
+        let dx = x - point.x
+        let dy = y - point.y
+        return dx * dx + dy * dy
     }
 
     private var overlayPersistenceSavingIndicator: some View {
@@ -706,6 +1021,7 @@ struct ContentView: View {
         }
         let overlayID = editingOverlayBackup?.id ?? UUID()
         let preservedPick = draftSourceFileData
+        let fallbackDisplayName = editingOverlayBackup?.displayName
 
         mapBridge.cancelPendingEditFit()
         finalizeDraftRasterOpacityGestureEnd()
@@ -715,6 +1031,7 @@ struct ContentView: View {
 
         Task {
             SnapMemoryInstrumentation.checkpoint("saveDraft.Task.begin overlayID=\(overlayID.uuidString.prefix(8))…")
+            async let resolvedDisplayName = OverlayNameResolver.displayName(for: corners, fallback: fallbackDisplayName)
             let rasterBytesForBake = preservedPick
                 ?? editingOverlayBackup?.sourceRasterData
                 ?? OverlayLibrary.persistedSourceRasterData(overlayID: overlayID, container: persistence.container)
@@ -737,6 +1054,7 @@ struct ContentView: View {
                 }
                 return OverlayLibrary.persistBakedImageToDiskDuringSaveDraft(mapDisplayImage, overlayID: overlayID)
             }.value
+            let displayName = await resolvedDisplayName
             SnapMemoryInstrumentation.checkpoint("saveDraft.afterBakeMercatorDetached overlayID=\(overlayID.uuidString.prefix(8))… preWritten=\(bakedPreWritten)")
             let sourceImageForModel = intrinsicPixels > OverlayLibrary.largeRasterOverlayPixelThresholdExclusive && rasterBytes != nil
                 ? OverlayItem.browseSourceMemoryPlaceholder()
@@ -779,6 +1097,7 @@ struct ContentView: View {
                 snap.append(
                     OverlayItem(
                         id: overlayID,
+                        displayName: displayName,
                         sourceImage: sourceImageForModel,
                         mapDisplayImage: OverlayItem.browseSourceMemoryPlaceholder(),
                         corners: corners,
@@ -1046,3 +1365,61 @@ struct ContentView: View {
         mapBridge.applyRasterOverlayRendererAlphas()
     }
 }
+
+private struct BrowseAddControl: View {
+    enum Presentation: Equatable {
+        case labeled
+        case iconOnly
+    }
+
+    let presentation: Presentation
+    let maxLabelWidth: CGFloat
+    let bottomInset: CGFloat
+    @Binding var selectedItem: PhotosPickerItem?
+    var namespace: Namespace.ID
+    var onInteraction: () -> Void
+
+    private var dimension: CGFloat { MapControlChrome.bottomBaseDimension }
+
+    var body: some View {
+        PhotosPicker(selection: $selectedItem, matching: .images) {
+            pickerLabel
+        }
+        .buttonStyle(.plain)
+        .simultaneousGesture(TapGesture().onEnded { onInteraction() })
+        .padding(.bottom, bottomInset)
+    }
+
+    @ViewBuilder
+    private var pickerLabel: some View {
+        switch presentation {
+        case .labeled:
+            MapControlChrome.glassCapsuleFrame(
+                width: min(maxLabelWidth, 220),
+                height: dimension
+            ) {
+                HStack(spacing: 10) {
+                    Text("Add image")
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundStyle(MapControlChrome.accentColor)
+                    browseAddIcon
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .matchedGeometryEffect(id: "browseAddChrome", in: namespace)
+        case .iconOnly:
+            MapControlChrome.circularControl(.standard, diameter: dimension) {
+                browseAddIcon
+            }
+            .matchedGeometryEffect(id: "browseAddChrome", in: namespace)
+        }
+    }
+
+    private var browseAddIcon: some View {
+        Image(systemName: "photo.badge.plus")
+            .font(.system(size: 24, weight: .regular))
+            .foregroundStyle(MapControlChrome.accentColor)
+            .matchedGeometryEffect(id: "browseAddIcon", in: namespace)
+    }
+}
+

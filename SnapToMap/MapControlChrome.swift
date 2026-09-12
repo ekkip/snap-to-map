@@ -3,7 +3,18 @@ import UIKit
 
 /// Decorative treatment for circular map-adjacent controls: **standard** (Liquid Glass → material fallback) vs **primary CTA** (blue).
 enum MapControlChrome {
+    static let bottomBaseDimension: CGFloat = 54
     static let diameter: CGFloat = 46
+    /// Primary action glyph colour (add, links).
+    static let accentColor = Color.blue
+    /// Screen-edge inset for bottom chrome controls.
+    static let bottomHorizontalInset: CGFloat = 16
+    /// Gap between the opacity/add controls and the collapsed area panel (was 18 pt).
+    static let bottomAdjacentControlGap: CGFloat = 9
+
+    static var bottomSideInsetForAreaPanel: CGFloat {
+        bottomHorizontalInset + bottomBaseDimension + bottomAdjacentControlGap
+    }
 
     enum Appearance: Equatable {
         /// Liquid Glass on iOS 26+; `ultraThinMaterial` + subtle ring on earlier OS. Uses system glyph colouring.
@@ -15,20 +26,26 @@ enum MapControlChrome {
     @ViewBuilder
     static func circularControl<Content: View>(
         _ appearance: Appearance,
+        diameter: CGFloat = Self.diameter,
         @ViewBuilder content: () -> Content
     ) -> some View {
         switch appearance {
         case .standard:
-            standardChrome(content: content)
+            standardChrome(diameter: diameter, content: content)
         case .primaryCTA:
-            primaryCTAChrome(content: content)
+            primaryCTAChrome(diameter: diameter, content: content)
         }
     }
 
     /// Full `Button` with **primary CTA** chrome (e.g. Done).
-    static func primaryCTAButton(icon: String = "checkmark", fontSize: CGFloat = 20, action: @escaping () -> Void) -> some View {
+    static func primaryCTAButton(
+        icon: String = "checkmark",
+        fontSize: CGFloat = 20,
+        diameter: CGFloat = Self.diameter,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
-            circularControl(.primaryCTA) {
+            circularControl(.primaryCTA, diameter: diameter) {
                 Image(systemName: icon)
                     .font(.system(size: fontSize, weight: .regular))
             }
@@ -59,7 +76,7 @@ enum MapControlChrome {
     // MARK: - Private builders
 
     @ViewBuilder
-    private static func standardChrome<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private static func standardChrome<Content: View>(diameter: CGFloat, @ViewBuilder content: () -> Content) -> some View {
         Group {
             if #available(iOS 26.0, *) {
                 content()
@@ -77,7 +94,7 @@ enum MapControlChrome {
     }
 
     @ViewBuilder
-    private static func primaryCTAChrome<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private static func primaryCTAChrome<Content: View>(diameter: CGFloat, @ViewBuilder content: () -> Content) -> some View {
         content()
             .foregroundStyle(.white)
             .frame(width: diameter, height: diameter)
@@ -109,7 +126,7 @@ struct OverlayOpacitySlider: View {
 
     /// `(capsuleWidth - handleDiameter) / 2` — reused as vertical end padding so handle travel stays centered.
     private var lateralInset: CGFloat {
-        max(0, (MapControlChrome.diameter - handleDiameter) / 2)
+        max(0, (MapControlChrome.bottomBaseDimension - handleDiameter) / 2)
     }
 
     /// Icon size aligned with **`chromeIconButton(..., fontSize: 22)`** on the collapsed chip.
@@ -122,7 +139,7 @@ struct OverlayOpacitySlider: View {
     /// Unfolded track vs collapsed chip: same width; height animates between **`diameter`** and **`expandedHeight`**.
     private var capsuleHeight: CGFloat {
         if isEditing { return Self.expandedHeight }
-        return browserCollapsed ? MapControlChrome.diameter : Self.expandedHeight
+        return browserCollapsed ? MapControlChrome.bottomBaseDimension : Self.expandedHeight
     }
 
     private var capsuleAllowsDirectInteraction: Bool {
@@ -131,7 +148,7 @@ struct OverlayOpacitySlider: View {
 
     var body: some View {
         ZStack {
-            MapControlChrome.glassCapsuleFrame(width: MapControlChrome.diameter, height: capsuleHeight) {
+            MapControlChrome.glassCapsuleFrame(width: MapControlChrome.bottomBaseDimension, height: capsuleHeight) {
                 opacityDragSurface(
                     opacity: isEditing ? draftWarpSliderBinding() : browsingOpacityBinding(),
                     onDragChanged: isEditing ? nil : { alpha in redrawBrowsingMapRaster(alpha) },
@@ -148,7 +165,7 @@ struct OverlayOpacitySlider: View {
 
             if !isEditing && browserCollapsed {
                 Color.clear
-                    .frame(width: MapControlChrome.diameter, height: capsuleHeight)
+                    .frame(width: MapControlChrome.bottomBaseDimension, height: capsuleHeight)
                     .contentShape(Rectangle())
                     .onTapGesture {
                         browserCollapsed = false
@@ -225,12 +242,12 @@ struct OverlayOpacitySlider: View {
         onDragEnded: ((Double) -> Void)?
     ) -> some View {
         GeometryReader { geo in
-            let heightRange = Self.expandedHeight - MapControlChrome.diameter
+            let heightRange = Self.expandedHeight - MapControlChrome.bottomBaseDimension
             let progress: CGFloat = heightRange > 0
-                ? min(max((geo.size.height - MapControlChrome.diameter) / heightRange, 0), 1)
+                ? min(max((geo.size.height - MapControlChrome.bottomBaseDimension) / heightRange, 0), 1)
                 : 1
             let inset = lateralInset * progress
-            let handleSize = MapControlChrome.diameter * (1 - progress) + handleDiameter * progress
+            let handleSize = MapControlChrome.bottomBaseDimension * (1 - progress) + handleDiameter * progress
             let visualIconPoints = collapsedChipIconSize * (1 - progress) + unfoldedHandleGlyphSize * progress
             let iconScale = visualIconPoints / collapsedChipIconSize
             let travel = max(0, geo.size.height - handleSize - inset * 2)

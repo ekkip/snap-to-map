@@ -30,6 +30,7 @@
 		D01MAPRES0001BUILD001 /* OverlayMapPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */; };
 		DB4E6DB74BFE6E53EA8D431C /* MapViewRepresentable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC66ABBA91700FEFE4F371C /* MapViewRepresentable.swift */; };
 		E3C3B002F002D002B002C002 /* MapControlChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C2B001F001D001A001B001 /* MapControlChrome.swift */; };
+		A10BBUILDUNFD01 /* UnfoldedAreaPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10FREFUNFD01 /* UnfoldedAreaPanelView.swift */; };
 		E59CACAD388ECE0E6EBF9E77 /* PicToMapApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9498F353B016CE0333FC7F4A /* PicToMapApp.swift */; };
 		F7A7B7C7D7E7F70819293A7B /* OverlayMapBake.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */; };
 /* End PBXBuildFile section */
@@ -61,6 +62,7 @@
 		B199887766554433221100FF /* ImageRasterMapOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageRasterMapOverlay.swift; sourceTree = "<group>"; };
 		D01MAPRES0001FILEREF01 /* OverlayMapPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMapPresentation.swift; sourceTree = "<group>"; };
 		E2C2B001F001D001A001B001 /* MapControlChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapControlChrome.swift; sourceTree = "<group>"; };
+		A10FREFUNFD01 /* UnfoldedAreaPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnfoldedAreaPanelView.swift; sourceTree = "<group>"; };
 		F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BakedHEIFEncoder.swift; sourceTree = "<group>"; };
 		F7A7B7C7D7E7F70819293A7C /* OverlayMapBake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayMapBake.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -83,6 +85,7 @@
 				2B288C6F420232C2216E201E /* Assets.xcassets */,
 				F04EBEEFCAFE0004D0D00004 /* BakedHEIFEncoder.swift */,
 				7644E56B7A369762FE2677EA /* ContentView.swift */,
+				A10FREFUNFD01 /* UnfoldedAreaPanelView.swift */,
 				A10FREFPYR03 /* OverlayTilePyramid.swift */,
 				B199887766554433221100FF /* ImageRasterMapOverlay.swift */,
 				3DDE5DDB3AC19296B55D593C /* Info.plist */,
@@ -231,6 +234,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				3DCCF6C5240F9D01F612BA5A /* ContentView.swift in Sources */,
+				A10BBUILDUNFD01 /* UnfoldedAreaPanelView.swift in Sources */,
 				B04EBEEFCAFE0005D0D00005 /* BakedHEIFEncoder.swift in Sources */,
 				9A5972EAC9706CDA48CB9D9A /* MapViewBridge.swift in Sources */,
 				DB4E6DB74BFE6E53EA8D431C /* MapViewRepresentable.swift in Sources */,

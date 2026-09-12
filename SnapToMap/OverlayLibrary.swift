@@ -374,6 +374,27 @@ enum OverlayLibrary {
         }
     }
 
+    private static let panelThumbnailCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 64
+        return cache
+    }()
+
+    /// Cached subsampled source thumbnail for the browse area panel (import orientation, not mercator-baked).
+    static func panelThumbnail(for overlay: OverlayItem, maxPixelDimension: CGFloat = 256) -> UIImage? {
+        let dimensionKey = Int(maxPixelDimension.rounded(.towardZero))
+        let key = NSString(string: "\(overlay.id.uuidString)-\(dimensionKey)")
+        if let cached = panelThumbnailCache.object(forKey: key) {
+            return cached
+        }
+        guard let image = overlay.panelPreviewUIImage(maxPixelDimension: maxPixelDimension) else {
+            return nil
+        }
+        let cost = Int(image.size.width * image.size.height * 4)
+        panelThumbnailCache.setObject(image, forKey: key, cost: cost)
+        return image
+    }
+
     private static func removeTilePyramidFolderFromDisk(id: UUID) {
         let url = tilePyramidsBaseDirectoryURL().appendingPathComponent(id.uuidString, isDirectory: true)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
@@ -726,6 +747,7 @@ enum OverlayLibrary {
             result.append(
                 OverlayItem(
                     id: uuid,
+                    displayName: row.displayName,
                     sourceImage: sourceImage,
                     mapDisplayImage: mapDisplay,
                     corners: corners,
@@ -1227,6 +1249,7 @@ enum OverlayLibrary {
 
             let row = byId[o.id] ?? StoredMapOverlay(context: context)
             row.uuid = o.id
+            row.displayName = o.displayName
             row.schemaVersion = 2
             row.sortOrder = Int32(index)
 

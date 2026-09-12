@@ -67,6 +67,8 @@ struct OverlayTilePyramidRuntimeInfo: Equatable {
 
 struct OverlayItem: Identifiable {
     let id: UUID
+    /// Concise human label derived from the overlay georect; shown in browse UI.
+    let displayName: String?
     /// Original photo metadata holder for **re‑edit** / persistence; may be **`browseSourceMemoryPlaceholder()`** when **`sourceRasterData`** holds the full raster (**no huge decoded bitmap** in browse).
     let sourceImage: UIImage
     /// Mercator **bounding-box** texture used on the map in browse mode (**`OverlayMapPresentation`**: raster or tiled; see **`OverlayMapBake`**).
@@ -91,6 +93,7 @@ struct OverlayItem: Identifiable {
 
     init(
         id: UUID,
+        displayName: String? = nil,
         sourceImage: UIImage,
         mapDisplayImage: UIImage,
         corners: [CLLocationCoordinate2D],
@@ -103,6 +106,7 @@ struct OverlayItem: Identifiable {
         tilePyramid: OverlayTilePyramidRuntimeInfo? = nil
     ) {
         self.id = id
+        self.displayName = OverlayNameResolver.normalizedDisplayName(displayName)
         self.sourceImage = sourceImage
         self.mapDisplayImage = mapDisplayImage
         self.bakedImagePreWrittenToDisk = bakedImagePreWrittenToDisk
@@ -124,6 +128,10 @@ struct OverlayItem: Identifiable {
         self.tilePyramid = tilePyramid
     }
 
+    var resolvedDisplayName: String {
+        displayName ?? OverlayNameResolver.fallbackDisplayName
+    }
+
     /// Decode path for **edit** UI only — prefer **`ImageIO`** subsampling so **`CIImage`** never sees a 400 MP backing.
     func editingPreviewUIImage(maxPixelDimension: CGFloat = 8192) -> UIImage? {
         if let data = sourceRasterData, !data.isEmpty {
@@ -137,6 +145,22 @@ struct OverlayItem: Identifiable {
                 ?? UIImage(data: data)
         }
         return sourceImage
+    }
+
+    /// Small browse-panel thumbnail in import orientation (**ImageIO** subsample + EXIF transform).
+    func panelPreviewUIImage(maxPixelDimension: CGFloat = 256) -> UIImage? {
+        if let data = sourceRasterData, !data.isEmpty {
+            return OverlayLibrary.uiImageSubsampling(from: data, maxPixelDimension: maxPixelDimension)
+        }
+        if sourceImagePreWrittenToDisk,
+           let data = OverlayLibrary.persistedSourceRasterData(overlayID: id),
+           !data.isEmpty {
+            return OverlayLibrary.uiImageSubsampling(from: data, maxPixelDimension: maxPixelDimension)
+        }
+        if sourceImage.size.width > 1 || sourceImage.size.height > 1 {
+            return sourceImage
+        }
+        return nil
     }
 
     /// Placeholder bitmap for **`sourceImage`** while **`sourceRasterData`** retains the real pixels (**browse** stays memory‑flat).
@@ -153,6 +177,212 @@ struct OverlayItem: Identifiable {
             ctx.fill(CGRect(origin: .zero, size: size))
         }
     }()
+}
+
+enum OverlayNameResolver {
+    static let fallbackDisplayName = "Untitled overlay"
+
+    private static let nominatimEndpoint = URL(string: "https://nominatim.openstreetmap.org/reverse")!
+    private static let posixLocale = Locale(identifier: "en_US_POSIX")
+    private static let nominatimRateLimitLock = NSLock()
+    private static var nominatimNextRequestDate = Date.distantPast
+
+    private enum NominatimLookupResult {
+        case found(String)
+        case retryableMiss
+        case terminalFailure
+    }
+
+    struct Georect {
+        let minLatitude: CLLocationDegrees
+        let maxLatitude: CLLocationDegrees
+        let minLongitude: CLLocationDegrees
+        let maxLongitude: CLLocationDegrees
+
+        var centerLatitude: CLLocationDegrees { (minLatitude + maxLatitude) / 2 }
+        var centerLongitude: CLLocationDegrees { (minLongitude + maxLongitude) / 2 }
+        var maxSpanDegrees: CLLocationDegrees {
+            max(abs(maxLatitude - minLatitude), abs(maxLongitude - minLongitude))
+        }
+    }
+
+    static func displayName(for corners: [CLLocationCoordinate2D], fallback: String? = nil) async -> String? {
+        if let name = await nominatimDisplayName(for: corners) {
+            return name
+        }
+        return normalizedDisplayName(fallback)
+    }
+
+    static func normalizedDisplayName(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == fallbackDisplayName { return nil }
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func georect(for corners: [CLLocationCoordinate2D]) -> Georect? {
+        guard !corners.isEmpty else { return nil }
+        let lats = corners.map(\.latitude)
+        let lons = corners.map(\.longitude)
+        guard let minLat = lats.min(),
+              let maxLat = lats.max(),
+              let minLon = lons.min(),
+              let maxLon = lons.max() else {
+            return nil
+        }
+        return Georect(
+            minLatitude: minLat,
+            maxLatitude: maxLat,
+            minLongitude: minLon,
+            maxLongitude: maxLon
+        )
+    }
+
+    static func nominatimZoom(for georect: Georect) -> Int {
+        switch georect.maxSpanDegrees {
+        case ..<0.002: return 18
+        case ..<0.005: return 17
+        case ..<0.01: return 16
+        case ..<0.025: return 15
+        case ..<0.05: return 14
+        case ..<0.1: return 13
+        case ..<0.25: return 12
+        case ..<0.5: return 11
+        case ..<1: return 10
+        case ..<2: return 9
+        case ..<4: return 8
+        case ..<8: return 7
+        case ..<16: return 6
+        case ..<32: return 5
+        default: return 4
+        }
+    }
+
+    private static func nominatimDisplayName(for corners: [CLLocationCoordinate2D]) async -> String? {
+        guard let georect = georect(for: corners) else { return nil }
+        let primaryZoom = nominatimZoom(for: georect)
+        for zoom in reverseZoomSequence(startingAt: primaryZoom) {
+            switch await requestNominatimDisplayName(for: georect, zoom: zoom) {
+            case .found(let name):
+                return name
+            case .retryableMiss:
+                continue
+            case .terminalFailure:
+                return nil
+            }
+        }
+        return nil
+    }
+
+    private static func requestNominatimDisplayName(for georect: Georect, zoom: Int) async -> NominatimLookupResult {
+        guard var components = URLComponents(url: nominatimEndpoint, resolvingAgainstBaseURL: false) else {
+            return .terminalFailure
+        }
+        components.queryItems = [
+            URLQueryItem(name: "format", value: "jsonv2"),
+            URLQueryItem(name: "lat", value: coordinateQueryValue(georect.centerLatitude)),
+            URLQueryItem(name: "lon", value: coordinateQueryValue(georect.centerLongitude)),
+            URLQueryItem(name: "zoom", value: "\(zoom)"),
+            URLQueryItem(name: "addressdetails", value: "1"),
+            URLQueryItem(name: "namedetails", value: "1"),
+        ]
+        guard let url = components.url else { return .terminalFailure }
+
+        var request = URLRequest(url: url)
+        request.setValue("SnapToMap/1.0 overlay-naming", forHTTPHeaderField: "User-Agent")
+        request.setValue(Locale.preferredLanguages.first ?? "en", forHTTPHeaderField: "Accept-Language")
+        request.timeoutInterval = 12
+
+        do {
+            await waitForNominatimRateLimit()
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                print("[OverlayName] Nominatim lookup failed: non-HTTP response")
+                return .terminalFailure
+            }
+            guard http.statusCode == 200 else {
+                let body = String(data: data.prefix(500), encoding: .utf8) ?? "<\(data.count) bytes>"
+                print("[OverlayName] Nominatim HTTP \(http.statusCode) zoom=\(zoom): \(body)")
+                return (400..<500).contains(http.statusCode) ? .terminalFailure : .retryableMiss
+            }
+            let decoded = try JSONDecoder().decode(NominatimReverseResponse.self, from: data)
+            guard let name = preferredName(from: decoded, zoom: zoom) else {
+                let body = String(data: data.prefix(500), encoding: .utf8) ?? "<\(data.count) bytes>"
+                print("[OverlayName] Nominatim returned no usable name zoom=\(zoom): \(body)")
+                return .retryableMiss
+            }
+            return .found(name)
+        } catch {
+            print("[OverlayName] Nominatim lookup failed: \(error)")
+            return .terminalFailure
+        }
+    }
+
+    private static func coordinateQueryValue(_ value: CLLocationDegrees) -> String {
+        String(format: "%.7f", locale: posixLocale, value)
+    }
+
+    private static func reverseZoomSequence(startingAt zoom: Int) -> [Int] {
+        var seen = Set<Int>()
+        return ([zoom] + [14, 12, 10, 8, 6, 4])
+            .filter { fallback in
+                guard (3...18).contains(fallback), fallback <= zoom, !seen.contains(fallback) else {
+                    return false
+                }
+                seen.insert(fallback)
+                return true
+            }
+    }
+
+    private static func waitForNominatimRateLimit() async {
+        let delay: TimeInterval = {
+            nominatimRateLimitLock.lock()
+            defer { nominatimRateLimitLock.unlock() }
+            let now = Date()
+            let wait = max(0, nominatimNextRequestDate.timeIntervalSince(now))
+            nominatimNextRequestDate = now.addingTimeInterval(wait + 1)
+            return wait
+        }()
+        guard delay > 0 else { return }
+        let nanoseconds = UInt64((delay * 1_000_000_000).rounded())
+        try? await Task.sleep(nanoseconds: nanoseconds)
+    }
+
+    private static func preferredName(from response: NominatimReverseResponse, zoom: Int) -> String? {
+        let addressKeys: [String]
+        if zoom >= 15 {
+            addressKeys = ["road", "neighbourhood", "suburb", "city_district", "quarter", "city", "town", "village"]
+        } else if zoom >= 11 {
+            addressKeys = ["suburb", "city_district", "quarter", "neighbourhood", "city", "town", "village", "municipality"]
+        } else {
+            addressKeys = ["city", "town", "village", "municipality", "county", "state", "country"]
+        }
+
+        let addressCandidates = addressKeys.compactMap { response.address?[$0] }
+        let fallbackCandidates = [
+            response.namedetails?["name"],
+            response.name,
+            response.displayName?.split(separator: ",").first.map(String.init),
+        ]
+        return (addressCandidates + fallbackCandidates.compactMap { $0 })
+            .lazy
+            .compactMap { normalizedDisplayName($0) }
+            .first
+    }
+
+    private struct NominatimReverseResponse: Decodable {
+        let name: String?
+        let displayName: String?
+        let address: [String: String]?
+        let namedetails: [String: String]?
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case displayName = "display_name"
+            case address
+            case namedetails
+        }
+    }
 }
 
 struct PersistedOverlays: Codable {
